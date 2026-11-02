@@ -55,9 +55,9 @@ def attempt():
             try: open(f"{BASE}/after_otp.html", "w").write(page.content())
             except Exception: pass
             pin = page.locator("#pinCode, input[type=password], input[inputmode=numeric]").first
-            for _ in range(20):
+            for _ in range(20):  # page.wait_for_timeout pumps Playwright events; time.sleep does not
                 if verify: break
-                time.sleep(0.5)
+                page.wait_for_timeout(500)
             if verify and not verify.get("success", True):
                 raise Rejected("TOTP rejected by Upstox: " + str(verify.get("error", {}).get("message", ""))[:120])
             try: pin.wait_for(timeout=20000)
