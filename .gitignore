@@ -1,0 +1,6 @@
+token.json
+holdings.json
+login_url.txt
+*.log
+.env
+__pycache__/
