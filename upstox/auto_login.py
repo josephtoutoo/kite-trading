@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Fully automatic Upstox login: mobile -> TOTP -> PIN -> token.json. Never prints secrets."""
+import os, sys, time, json, subprocess, requests, pyotp
+from playwright.sync_api import sync_playwright
+
+BASE = "/workspace/upstox"; TOKEN = f"{BASE}/token.json"; SHOT = f"{BASE}/auto_login_fail.png"
+MOBILE = "9731645757"; SERVER = "http://127.0.0.1:8001"
+
+def server_up():
+    try: requests.get(SERVER + "/", timeout=3); return True
+    except Exception: return False
+
+def ensure_server():
+    if server_up(): return
+    subprocess.Popen(f"nohup python3 {BASE}/login_server.py > {BASE}/server.log 2>&1 &", shell=True)
+    for _ in range(20):
+        time.sleep(0.5)
+        if server_up(): return
+    raise RuntimeError("login server did not start")
+
+def totp_code():
+    t = pyotp.TOTP(os.environ["UPSTOX_TOTP_SECRET"].replace(" ", "").upper())
+    left = 30 - int(time.time()) % 30
+    if left < 5: time.sleep(left + 1)
+    return t.now()
+
+def sms_only(page):
+    txt = page.inner_text("body").lower()
+    return "sms" in txt and "totp" not in txt and "pin" not in txt
+
+def attempt():
+    mtime0 = os.path.getmtime(TOKEN) if os.path.exists(TOKEN) else 0
+    with sync_playwright() as p:
+        b = p.chromium.launch(headless=True); ctx = b.new_context(); page = ctx.new_page()
+        page.set_default_timeout(30000)
+        try:
+            page.goto(SERVER + "/login")
+            page.wait_for_url("**login.upstox.com/**")
+            page.locator("#mobileNum, input[type=tel], input[name*=mobile i]").first.fill(MOBILE)
+            page.get_by_role("button", name="Get OTP").click()
+            otp = page.locator("#otpNum, input[placeholder*='OTP' i]").first
+            otp.wait_for()
+            otp.fill(totp_code())
+            page.get_by_role("button", name="Continue").click()
+            pin = page.locator("#pinCode, input[type=password], input[inputmode=numeric]").first
+            try: pin.wait_for(timeout=20000)
+            except Exception:
+                raise RuntimeError("PIN screen not shown" + (" (SMS-only prompt)" if sms_only(page) else " (TOTP rejected?)"))
+            pin.fill(os.environ["UPSTOX_PIN"])
+            page.get_by_role("button", name="Continue").click()
+            page.wait_for_url("http://127.0.0.1:8001/**", timeout=45000)
+            for _ in range(30):
+                if os.path.exists(TOKEN) and os.path.getmtime(TOKEN) > mtime0: break
+                time.sleep(0.5)
+            else:
+                raise RuntimeError("token.json not updated: " + page.inner_text("body")[:200])
+        except Exception:
+            try: page.screenshot(path=SHOT, full_page=True)
+            except Exception: pass
+            raise
+        finally: b.close()
+    tok = json.load(open(TOKEN))["access_token"]
+    r = requests.get("https://api.upstox.com/v2/user/profile", timeout=15,
+                     headers={"Authorization": "Bearer " + tok, "Accept": "application/json"})
+    r.raise_for_status()
+    return r.json()["data"]["user_id"]
+
+def main():
+    t0 = time.time(); last = None
+    sec = os.environ.get("UPSTOX_TOTP_SECRET", "").replace(" ", "").upper()
+    try: import base64; base64.b32decode(sec + "=" * (-len(sec) % 8)); assert len(sec) >= 16
+    except Exception: print("FAIL: UPSTOX_TOTP_SECRET is not a valid base32 setup key"); sys.exit(3)
+    try: ensure_server()
+    except Exception as e: print(f"FAIL: {e}"); sys.exit(2)
+    for i in range(3):  # 1 try + up to 2 retries
+        try:
+            uid = attempt(); print(f"OK: Upstox logged in as {uid} in {time.time()-t0:.1f}s"); sys.exit(0)
+        except Exception as e:
+            last = str(e).split("\n")[0][:200]; print(f"attempt {i+1} failed: {last}", file=sys.stderr)
+            time.sleep(35)  # new TOTP window
+    print(f"FAIL: {last} (screenshot {SHOT})"); sys.exit(1)
+
+if __name__ == "__main__": main()

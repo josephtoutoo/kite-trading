@@ -4,3 +4,7 @@ login_url.txt
 *.log
 .env
 __pycache__/
+upstox/token.json
+upstox/*.log
+upstox/*.png
+*.env
