@@ -4,7 +4,7 @@ import os, sys, time, json, subprocess, requests, pyotp
 from playwright.sync_api import sync_playwright
 
 BASE = "/workspace/upstox"; TOKEN = f"{BASE}/token.json"; SHOT = f"{BASE}/auto_login_fail.png"
-MOBILE = "9731645757"; SERVER = "http://127.0.0.1:8001"
+MOBILE = os.environ["UPSTOX_MOBILE"]; SERVER = "http://127.0.0.1:8001"
 
 def server_up():
     try: requests.get(SERVER + "/", timeout=3); return True

@@ -11,3 +11,8 @@ upstox/*.png
 *_state.json
 upstox/risk_state.json
 upstox/alert_state.json
+*.bak*
+*.pkl
+venv/
+upstox/*.json
+upstox/*.html
