@@ -14,6 +14,7 @@ MTF_STOCK_CAP=0.10; MTF_TOTAL_CAP=0.50
 INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FINNIFTY":"NSE_INDEX|Nifty Fin Service",
  "MIDCPNIFTY":"NSE_INDEX|NIFTY MID SELECT","NIFTYNXT50":"NSE_INDEX|Nifty Next 50","SENSEX":"BSE_INDEX|SENSEX","BANKEX":"BSE_INDEX|BANKEX"}
 # ---------------- lock (unchanged API) ----------------
+STOCK_OPT_MAX_UND=2
 def today(): return datetime.datetime.now(IST).date()
 def next_trading_day(d):
     d=d+datetime.timedelta(days=1)
@@ -70,6 +71,17 @@ def _ltp(order,positions):
         if isinstance(d,dict):
             for v in d.values(): return float(v.get("last_price") or 0) or None
     return None
+def lot_size(key,sym=""):
+    """lot size from Upstox instrument master (cached daily file)."""
+    import gzip
+    exch="BSE" if (key or "").startswith("BSE") or sym.startswith("SENSEX") or sym.startswith("BANKEX") else "NSE"
+    f=os.path.join(D,f"instruments_{exch}_{datetime.datetime.now(IST).date()}.json.gz")
+    try:
+        if not os.path.exists(f):
+            urllib.request.urlretrieve(f"https://assets.upstox.com/market-quote/instruments/exchange/{exch}.json.gz",f)
+        if f not in _cache: _cache[f]={x["instrument_key"]:int(x.get("lot_size") or 0) for x in json.load(gzip.open(f)) if x.get("segment","").endswith("_FO")}
+        return _cache[f].get(key) or None
+    except Exception: return None
 # ---------------- rules ----------------
 def check_order(order):
     """-> (allowed: bool, reasons: list[str], adjusted_qty: int)"""
@@ -129,6 +141,23 @@ def check_order(order):
             t=_ts(o)
             if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=WINDOW_MIN:
                 block.append(f"R7: {und} exit filled {t:%H:%M} (<30 min ago) - cooldown"); break
+        # rule 11: stock options - max 2 underlyings, max 1 lot per underlying (incl. holdings)
+        if opt and not idx_opt and ((k or "").startswith(("NSE_FO","BSE_FO")) or not k):
+            longs={}
+            for p in pos:
+                sp=sym_of(p); q=int(p.get("quantity") or 0)
+                if q>0 and is_opt(sp) and not is_index(sp):
+                    longs.setdefault(underlying(sp),[]).append(p)
+            others=[u for u in longs if u!=und]
+            if und not in longs and len(others)>=STOCK_OPT_MAX_UND:
+                block.append(f"R11: already long options in {len(others)} stocks ({', '.join(sorted(others))}) - max {STOCK_OPT_MAX_UND}, no third")
+            lot=lot_size(k,sym) if k else None
+            if not lot: block.append("R11: lot size not found for "+(k or sym)+" - cannot verify 1-lot cap")
+            else:
+                have=sum(int(p.get("quantity") or 0) for p in longs.get(und,[]))
+                room=max(lot-have,0)
+                if room<=0: block.append(f"R11: {und} already holds {have} qty (= {have/lot:g} lot, lot {lot}) - cap 1 lot per stock"); adj=0
+                elif adj>room: adj=room; flags.append(f"R11: qty capped to {room} (1 lot {lot} minus held {have})")
         # rule 10
         px=float(order.get("price") or 0) or ltp or 0
         if prod=="MTF":
