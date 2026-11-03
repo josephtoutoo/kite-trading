@@ -3,7 +3,7 @@
 including carry-forward (product D) ones. Keeps a SELL SL at 30% below the highest LTP seen
 (never lowered, floored at seeded min_stop). Target roll-forward (3 Nov): at LTP>=target (start entry*1.20)
 checks underlying trend (index opts 5m, stock opts/futures 15m; CE/FUT need close>EMA20 & ST green, PE need
-close<EMA20 & ST red). Intact -> target += entry*0.20, stop floor = max(prev target, entry). Broken -> LIMIT sell
+close<EMA20 & ST red). Intact -> target += entry*0.20, stop floor = target two steps back (1st roll: entry). Broken -> LIMIT sell
 at LTP*0.995 for live qty. Long futures: 1.5% trail from high, target step +2%.
 Only acts 09:15-15:25 IST Mon-Fri. Cancels leftover SELL SL orders on contracts with no long position.
 --dry-run: read-only, prints intended actions, ignores time window, writes no state."""
@@ -93,7 +93,7 @@ for p in pos:
             r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
             acts.append({"sym":sym,"action":"BOOK_PROFIT_TREND_BROKEN","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"target":s["target"],"trend":why,"pnl_est":round((lim-avg)*q),"resp":r.get("status"),"err":r.get("body")})
             break
-        prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,prev,avg)
+        prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,round(prev-avg*STEP,2),avg)  # stop = target two steps back (1st roll: breakeven)
         acts.append({"sym":sym,"action":"ROLL_TARGET","from":prev,"to":s["target"],"trend":why})
     else:
         stop=tick(max(avg*(1-TRAIL),s["high"]*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
