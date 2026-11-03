@@ -141,7 +141,7 @@ def check_order(order):
             mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
             fno_lim=min(capital*0.5,capital-mtf_total)
             fno_used=sum(float(p.get("average_price") or p.get("buy_price") or 0)*int(p.get("quantity") or 0) for p in pos if int(p.get("quantity") or 0)>0 and (is_opt(sym_of(p)) or sym_of(p).endswith("FUT")))
-            if fno_used+px*qty>fno_lim: block.append(f"R10: F&O deployed Rs {fno_used+px*qty:,.0f} > F&O limit Rs {max(fno_lim,0):,.0f} (50% minus MTF overflow)")
+            if fno_used+px*qty>fno_lim: flags.append(f"R10 WARNING: F&O deployed Rs {fno_used+px*qty:,.0f} > F&O limit Rs {max(fno_lim,0):,.0f} (50% minus MTF overflow)")
     # rule 5
     if opt and ot in("MARKET","SL-M"): block.append(f"R5: {ot} not allowed on options - use LIMIT/SL")
     if side=="SELL":
