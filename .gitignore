@@ -8,3 +8,6 @@ upstox/token.json
 upstox/*.log
 upstox/*.png
 *.env
+*_state.json
+upstox/risk_state.json
+upstox/alert_state.json
