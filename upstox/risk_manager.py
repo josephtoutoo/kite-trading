@@ -6,6 +6,7 @@ checks underlying trend (index opts 5m, stock opts/futures 15m; CE/FUT need clos
 close<EMA20 & ST red). Intact -> target += entry*0.20, stop floor = target two steps back (1st roll: entry). Broken -> LIMIT sell
 at LTP*0.995 for live qty. Long futures: 1.5% trail from high, target step +2%.
 Only acts 09:15-15:25 IST Mon-Fri. Cancels leftover SELL SL orders on contracts with no long position.
+Kite (4 Nov): also manages Kite long options/futures (Upstox LTP+trend, Kite SL/LIMIT orders); no-op if Kite token invalid.
 --dry-run: read-only, prints intended actions, ignores time window, writes no state."""
 import json,os,sys
 sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
@@ -115,5 +116,59 @@ for p in pos:
 for o in orders:
     if o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and isopt(o.get("trading_symbol") or o.get("tradingsymbol","")) and o["instrument_token"] not in longs:
         acts.append({"sym":o.get("trading_symbol"),"action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
+# ---------------- Kite positions (4 Nov): Upstox prices/trend, Kite orders, same stop/roll rules ----------------
+kacts=[]
+try:
+    import broker_kite as bk
+    if not bk.valid(): kacts.append({"action":"KITE_SKIPPED","why":"Kite token invalid - no-op"}); bk.log("risk_manager: kite skipped, invalid token")
+    else:
+        kpos=bk.positions(); kord=bk.orders(); klongs=set()
+        def kpending(ts): return [o for o in kord if o["trading_symbol"]==ts and o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M")]
+        for p in kpos:
+            sym=p["trading_symbol"]; q=p["quantity"]; ex=p["exchange"]
+            if not (isopt(sym) or isfut(sym)) or q<=0: continue
+            fut=isfut(sym); klongs.add(sym); kk="KITE|%s|%s"%(ex,sym)
+            ukey=bk.to_upstox(ex,sym); ltp=None
+            if ukey:
+                import urllib.parse
+                d=req("https://api.upstox.com/v2/market-quote/ltp?instrument_key="+urllib.parse.quote(ukey,safe="")).get("data") or {}
+                for v in d.values(): ltp=float(v.get("last_price") or 0) or None
+            ltp=ltp or p["last_price"]; avg=p["average_price"] or p["buy_price"]
+            if not avg or not ltp: kacts.append({"sym":sym,"broker":"kite","action":"SKIP_NO_PRICE"}); continue
+            TRAIL=0.015 if fut else 0.30; STEP=0.02 if fut else 0.20
+            s=st.setdefault(kk,{"high":avg}); s["sym"]=sym; s["broker"]="kite"; s["high"]=max(s.get("high",avg),ltp)
+            s.setdefault("entry",avg); s.setdefault("target",round(avg*(1+STEP),2))
+            _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":kk,"transaction_type":"SELL","order_type":"SL","product":p["product"],"quantity":q},broker="kite")
+            if _aq<=0: kacts.append({"sym":sym,"broker":"kite","action":"SKIP_R8","why":_why}); continue
+            q=min(q,_aq)
+            sls=kpending(sym)
+            for o in sls[1:]: kacts.append({"sym":sym,"broker":"kite","action":"CANCEL_DUP_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
+            sls=sls[:1]; floor=0
+            while ltp>=s["target"]:
+                ok,why=trend_ok(sym)
+                if not ok:
+                    for o in sls: bk.cancel(o["order_id"],dry=DRY)
+                    lim=tick(ltp*0.995)
+                    r=bk.place(ex,sym,"SELL",q,lim,tag="target_book",product=p["product"],dry=DRY)
+                    kacts.append({"sym":sym,"broker":"kite","action":"BOOK_PROFIT_TREND_BROKEN","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"target":s["target"],"trend":why,"resp":r}); break
+                prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,round(prev-avg*STEP,2),avg)
+                kacts.append({"sym":sym,"broker":"kite","action":"ROLL_TARGET","from":prev,"to":s["target"],"trend":why})
+            else:
+                stop=tick(max(avg*(1-TRAIL),s["high"]*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
+                if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))
+                else: s["stop"]=stop
+                lim=tick(stop*(0.99 if fut else 0.95))
+                info={"sym":sym,"broker":"kite","qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
+                if not sls: kacts.append({**info,"action":"PLACE_SL","resp":bk.place(ex,sym,"SELL",q,lim,order_type="SL",trigger=stop,tag="trailsl",product=p["product"],dry=DRY)})
+                else:
+                    o=sls[0]
+                    if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:
+                        t2=max(stop,o["trigger_price"])
+                        kacts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":bk.modify(o["order_id"],q,tick(t2*(0.99 if fut else 0.95)),t2,dry=DRY)})
+                    else: kacts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
+        for o in kord:
+            if o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and isopt(o["trading_symbol"]) and o["trading_symbol"] not in klongs:
+                kacts.append({"sym":o["trading_symbol"],"broker":"kite","action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
+except Exception as e: kacts.append({"action":"KITE_ERROR","why":f"{type(e).__name__}: {e}"})
 if not DRY: json.dump(st,open(SF,"w"))
-print(json.dumps({"dry_run":DRY,"now":now.strftime("%Y-%m-%d %H:%M IST"),"breaker":breaker,"actions":acts},indent=1))
+print(json.dumps({"dry_run":DRY,"now":now.strftime("%Y-%m-%d %H:%M IST"),"breaker":breaker,"actions":acts,"kite_actions":kacts},indent=1))

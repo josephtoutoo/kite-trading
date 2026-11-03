@@ -83,8 +83,29 @@ def lot_size(key,sym=""):
         return _cache[f].get(key) or None
     except Exception: return None
 # ---------------- rules ----------------
-def check_order(order):
-    """-> (allowed: bool, reasons: list[str], adjusted_qty: int)"""
+def kite_data():
+    """Kite positions/orders (normalized) or ([],[]) when Kite token invalid - never raises."""
+    if "_kite" in _cache: return _cache["_kite"]
+    try:
+        import broker_kite as bk
+        _cache["_kite"]=(bk.positions(),bk.orders()) if bk.valid() else ([],[])
+    except Exception: _cache["_kite"]=([],[])
+    return _cache["_kite"]
+def _decisions(filled,now):
+    """Index-option BUY decisions today across brokers: an Upstox+Kite pair (same index, same CE/PE, within 5 min,
+    different brokers) counts as ONE decision."""
+    ev=sorted([(_ts(o),underlying(sym_of(o)),sym_of(o)[-2:],o.get("broker","upstox")) for o in filled
+        if o["transaction_type"]=="BUY" and is_opt(sym_of(o)) and is_index(sym_of(o)) and _ts(o) and _ts(o).date()==now.date()])
+    dec=[]
+    for t,u,sd,b in ev:
+        m=next((d for d in dec if d["u"]==u and d["sd"]==sd and b not in d["b"] and abs((t-d["t"]).total_seconds())<=300),None)
+        if m: m["b"].add(b)
+        else: dec.append({"t":t,"u":u,"sd":sd,"b":{b}})
+    return dec
+def check_order(order,broker="upstox"):
+    """-> (allowed: bool, reasons: list[str], adjusted_qty: int)
+    broker: 'upstox' | 'kite'. Daily limits (R1 count, R2 loss cutoffs, R3, R7) use BOTH accounts;
+    quantity-held checks (R6, R8, R11, R10) use the given broker's positions."""
     now=datetime.datetime.strptime(order["_now"],"%Y-%m-%d %H:%M").replace(tzinfo=IST) if order.get("_now") else datetime.datetime.now(IST)
     sym=sym_of(order); side=(order.get("transaction_type") or "").upper(); ot=(order.get("order_type") or "").upper()
     prod=(order.get("product") or "").upper(); qty=int(order.get("quantity") or 0); k=order.get("instrument_token")
@@ -94,7 +115,10 @@ def check_order(order):
     funds=_data("/v2/user/get-funds-and-margin") or {}
     eq=funds.get("equity",{}) if isinstance(funds,dict) else {}
     capital=float(eq.get("available_margin") or 0)+float(eq.get("used_margin") or 0)
-    filled=[o for o in orders if o.get("status")=="complete" and (_ts(o) or now)<=now]
+    kpos,kord=kite_data()
+    filled=[o for o in orders+kord if o.get("status")=="complete" and (_ts(o) or now)<=now]
+    upos=pos
+    if broker=="kite": pos=kpos; mtf=[]
     block=[]; flags=[]; adj=qty
     allpos=pos+[m for m in mtf if m.get("instrument_token") not in {p.get("instrument_token") for p in pos}]
     held=[p for p in allpos if p.get("instrument_token")==k or (sym and sym_of(p)==sym)]
@@ -102,19 +126,19 @@ def check_order(order):
     ltp=_ltp(order,allpos)
     if side=="BUY":
         # rule 2b: account day loss breaker / reduced day
-        day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos)
-        if day_pnl< -THRESHOLD: block.append(f"R2: account day P&L Rs {day_pnl:,.0f} < -30,000 - no new trades today")
+        day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in upos+kpos)
+        if day_pnl< -THRESHOLD: block.append(f"R2: combined (Upstox+Kite) day P&L Rs {day_pnl:,.0f} < -30,000 - no new trades today")
         ok,fac,why=can_enter(1)
         if not ok: block.append("R2: "+why)
         elif fac<1:
             adj=max(int(adj*fac),0); flags.append(f"R2: {why}; qty cut to {adj} (round to lot size)")
         if idx_opt:
             # rule 1
-            n=sum(1 for o in filled if o["transaction_type"]=="BUY" and is_opt(sym_of(o)) and is_index(sym_of(o)) and _ts(o) and _ts(o).date()==now.date())
-            if n>=INDEX_OPT_MAX: block.append(f"R1: {n} index option BUY entries already today (max {INDEX_OPT_MAX})")
+            n=len(_decisions(filled,now))
+            if n>=INDEX_OPT_MAX and not order.get("_paired"): block.append(f"R1: {n} index option trade decisions already today across Upstox+Kite (max {INDEX_OPT_MAX})")
             # rule 2a
-            bl=sum(float(p.get("realised") or 0) for p in pos if is_opt(sym_of(p)) and is_index(sym_of(p)))
-            if bl< -INDEX_OPT_LOSS: block.append(f"R2: index-option booked loss Rs {bl:,.0f} < -2,000 - no more index option trades today")
+            bl=sum(float(p.get("realised") or 0) for p in upos+kpos if is_opt(sym_of(p)) and is_index(sym_of(p)))
+            if bl< -INDEX_OPT_LOSS: block.append(f"R2: combined index-option booked loss Rs {bl:,.0f} < -2,000 - no more index option trades today")
             # rule 3
             other="PE" if sym.endswith("CE") else "CE"
             for o in filled:

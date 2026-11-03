@@ -7,12 +7,15 @@ Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   (MACD + ADX>=18 filters are there to avoid chop.)
 Option: nearest weekly expiry, ATM strike, qty 2*lot_size (trade_lock may halve it).
 All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product I (fallback D),
-tag auto_entry; cancel if unfilled after 2 min. On fill: trade_lock.record_entry, risk_state.json
+tag auto_entry; cancel if unfilled after 2 min.
+Kite (4 Nov): same signal also buys 2 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
+the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffected. On fill: trade_lock.record_entry, risk_state.json
 (entry, target +20%, stop -30%), seen_entries.json. One open position per index max.
 --dry-run: no orders, no state writes, ignores time window."""
 import json,os,sys,gzip,time,datetime,urllib.request,urllib.error,urllib.parse
 D=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,D)
 import ind,trade_lock
+import broker_kite as bk
 DRY="--dry-run" in sys.argv
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
@@ -85,41 +88,88 @@ for name,cfg in IDX.items():
         openp=[p for p in pos if int(p.get("quantity") or 0)>0 and trade_lock.underlying(trade_lock.sym_of(p))==name and trade_lock.is_opt(trade_lock.sym_of(p))]
         if openp: r["open_position"]=[trade_lock.sym_of(p) for p in openp]
         if not sig: r["action"]="none: no fresh signal"; continue
-        if openp: r["action"]="skip: position already open in "+name; continue
         ltp,ask=quote(best["instrument_key"]); t=float(best.get("tick_size") or 0.05)
         if t>1: t=t/100  # some masters give paise
         px=tick(ask if ask else ltp*1.005,t); r["ltp"]=ltp; r["ask"]=ask; r["limit"]=px
-        csym=f"{name}{exp:%y%m%d}{int(best['strike_price'])}{raw}"  # compact form trade_lock parses (master symbol has spaces)
-        o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px}
-        ok,reasons,adj=trade_lock.check_order(o); lot=int(best["lot_size"]); adj=(adj//lot)*lot
-        r["check"]={"allowed":ok,"reasons":reasons,"adjusted_qty":adj}
-        if not ok or adj<=0: r["action"]="blocked by pre-trade rules"; continue
-        if DRY: r["action"]=f"DRY-RUN: would BUY {adj} {best['trading_symbol']} LIMIT {px}"; continue
-        body={"quantity":adj,"product":"I","validity":"DAY","price":px,"tag":"auto_entry","instrument_token":best["instrument_key"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False}
-        pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
-        if pr.get("status")!="success" and "product" in json.dumps(pr).lower():
-            body["product"]="D"; pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
-        oid=(pr.get("data") or {}).get("order_id")
-        if not oid: r["action"]="order rejected"; r["resp"]={"code":pr.get("code"),"body":pr.get("body")}; continue
-        r["order_id"]=oid; st="open"; fill=0; avg=px
+        lot=int(best["lot_size"])
+        # ---- Kite leg plan (checked BEFORE any order so the pair is one decision; never blocks Upstox) ----
+        kleg=None
+        try:
+            if not bk.valid(): r["kite"]={"action":"skipped: Kite token invalid ("+bk.why()[:80]+")"}; bk.log(f"auto_entry {name}: kite skipped, invalid token")
+            else:
+                m=bk.from_upstox(best["instrument_key"])
+                kopen=[p for p in bk.positions() if p["quantity"]>0 and trade_lock.underlying(p["trading_symbol"])==name and trade_lock.is_opt(p["trading_symbol"])]
+                if not m: r["kite"]={"action":"skipped: no Kite symbol for "+best["instrument_key"]}
+                elif kopen: r["kite"]={"action":"skip: Kite position already open","open":[p["trading_symbol"] for p in kopen]}
+                else:
+                    kq=LOTS*m["lot_size"]
+                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":"NRML","quantity":kq,"price":px}
+                    kok,kre,kadj=trade_lock.check_order(ko,broker="kite"); kadj=(kadj//m["lot_size"])*m["lot_size"]
+                    r["kite"]={"symbol":m["tradingsymbol"],"exchange":m["exchange"],"qty":kq,"check":{"allowed":kok,"reasons":kre,"adjusted_qty":kadj}}
+                    if kok and kadj>0: kleg={**m,"qty":kadj}
+                    else: r["kite"]["action"]="blocked by pre-trade rules"
+        except Exception as e: r["kite"]={"action":f"skipped: error {type(e).__name__}: {e}"}; kleg=None
+        # ---- Upstox leg ----
+        uleg=None
+        if openp: r["action"]="skip: position already open in "+name
+        else:
+            csym=f"{name}{exp:%y%m%d}{int(best['strike_price'])}{raw}"  # compact form trade_lock parses (master symbol has spaces)
+            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px}
+            ok,reasons,adj=trade_lock.check_order(o); adj=(adj//lot)*lot
+            r["check"]={"allowed":ok,"reasons":reasons,"adjusted_qty":adj}
+            if not ok or adj<=0: r["action"]="blocked by pre-trade rules"
+            else: uleg=adj
+        if DRY:
+            if uleg: r["action"]=f"DRY-RUN: would BUY {uleg} {best['trading_symbol']} LIMIT {px}"
+            if kleg: r["kite"]["action"]=f"DRY-RUN: would BUY {kleg['qty']} {kleg['tradingsymbol']} LIMIT {px} NRML on Kite"; bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,dry=True)
+            continue
+        if not uleg and not kleg: continue
+        oid=None; koid=None
+        if uleg:
+            body={"quantity":uleg,"product":"I","validity":"DAY","price":px,"tag":"auto_entry","instrument_token":best["instrument_key"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False}
+            pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
+            if pr.get("status")!="success" and "product" in json.dumps(pr).lower():
+                body["product"]="D"; pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
+            oid=(pr.get("data") or {}).get("order_id")
+            if not oid: r["action"]="order rejected"; r["resp"]={"code":pr.get("code"),"body":pr.get("body")}
+            else: r["order_id"]=oid
+        if kleg:
+            koid=bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,tag="auto_entry",product="NRML")
+            r["kite"]["order_id"]=koid
+            if not koid: r["kite"]["action"]="Kite order failed (see kite_broker.log)"
+        st="open"; fill=0; avg=px; kst=None
         for _ in range(12):
+            if not oid and not koid: break
             time.sleep(10)
-            d=req("https://api.upstox.com/v2/order/details?order_id="+oid).get("data") or {}
-            st=d.get("status",""); fill=int(d.get("filled_quantity") or 0); avg=float(d.get("average_price") or px)
-            if st in("complete","rejected","cancelled"): break
-        if st not in("complete","rejected","cancelled"):
+            if oid and st not in("complete","rejected","cancelled"):
+                d=req("https://api.upstox.com/v2/order/details?order_id="+oid).get("data") or {}
+                st=d.get("status",""); fill=int(d.get("filled_quantity") or 0); avg=float(d.get("average_price") or px)
+            if koid and (not kst or kst["status"] not in("complete","rejected","cancelled")): kst=bk.order_status(koid) or kst
+            if (not oid or st in("complete","rejected","cancelled")) and (not koid or (kst and kst["status"] in("complete","rejected","cancelled"))): break
+        if oid and st not in("complete","rejected","cancelled"):
             req("https://api-hft.upstox.com/v2/order/cancel?order_id="+oid,None,"DELETE",proxy=True); r["cancelled_unfilled"]=True
-        r["status"]=st; r["filled"]=fill
-        if fill>0:
-            trade_lock.record_entry()
-            s=json.load(open(SF)) if os.path.exists(SF) else {}
-            s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry"}
-            s.setdefault("_min_stop_by_symbol",{})[best["trading_symbol"]]=tick(avg*0.7)
-            json.dump(s,open(SF,"w"),indent=1)
-            seen=json.load(open(SEEN)) if os.path.exists(SEEN) else {}
-            seen[oid]={"sym":best["trading_symbol"],"qty":fill,"avg":avg,"time":now.isoformat(),"source":"auto_entry"}
-            json.dump(seen,open(SEEN,"w"),indent=1)
-            r["action"]=f"ENTERED {fill} {best['trading_symbol']} @ {avg}; target {round(avg*1.2,2)} stop {tick(avg*0.7)}"
-        else: r["action"]="not filled in 2 min - cancelled"
+        if koid and not (kst and kst["status"] in("complete","rejected","cancelled")):
+            bk.cancel(koid); r["kite"]["cancelled_unfilled"]=True
+        kfill=(kst or {}).get("filled",0) if koid else 0
+        if fill>0 or kfill>0: trade_lock.record_entry()  # one decision even if both legs fill
+        s=json.load(open(SF)) if os.path.exists(SF) else {}; seen=json.load(open(SEEN)) if os.path.exists(SEEN) else {}
+        if oid:
+            r["status"]=st; r["filled"]=fill
+            if fill>0:
+                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry"}
+                s.setdefault("_min_stop_by_symbol",{})[best["trading_symbol"]]=tick(avg*0.7)
+                seen[oid]={"sym":best["trading_symbol"],"qty":fill,"avg":avg,"time":now.isoformat(),"source":"auto_entry"}
+                r["action"]=f"ENTERED {fill} {best['trading_symbol']} @ {avg}; target {round(avg*1.2,2)} stop {tick(avg*0.7)}"
+            else: r["action"]="not filled in 2 min - cancelled"
+        if koid:
+            ka=(kst or {}).get("avg") or px; r["kite"]["status"]=(kst or {}).get("status"); r["kite"]["filled"]=kfill
+            if kfill>0:
+                kk="KITE|%s|%s"%(kleg["exchange"],kleg["tradingsymbol"])
+                s[kk]={"high":ka,"entry":ka,"target":round(ka*1.2,2),"sym":kleg["tradingsymbol"],"source":"auto_entry","broker":"kite"}
+                s.setdefault("_min_stop_by_symbol",{})[kleg["tradingsymbol"]]=tick(ka*0.7)
+                seen["kite:"+str(koid)]={"sym":kleg["tradingsymbol"],"qty":kfill,"avg":ka,"time":now.isoformat(),"source":"auto_entry","broker":"kite"}
+                r["kite"]["action"]=f"ENTERED {kfill} {kleg['tradingsymbol']} @ {ka} on Kite; target {round(ka*1.2,2)} stop {tick(ka*0.7)}"
+            else: r["kite"]["action"]="Kite not filled in 2 min - cancelled"
+        json.dump(s,open(SF,"w"),indent=1); json.dump(seen,open(SEEN,"w"),indent=1)
     except Exception as e: r["error"]=f"{type(e).__name__}: {e}"
 done()
