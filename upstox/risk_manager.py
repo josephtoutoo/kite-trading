@@ -55,6 +55,9 @@ for p in pos:
     for o in sls[1:]:  # never hold more than one SL per contract
         acts.append({"sym":sym,"action":"CANCEL_DUP_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
     sls=sls[:1]
+    _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":k,"transaction_type":"SELL","order_type":"SL","product":p["product"],"quantity":q})
+    if _aq<=0: acts.append({"sym":sym,"action":"SKIP_R8","why":_why}); continue
+    q=min(q,_aq)  # rule 8: never sell more than live long qty in same product
     if ltp>=avg*1.2:
         for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":0,"tag":"target20","instrument_token":k,"order_type":"MARKET","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
