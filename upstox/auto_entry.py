@@ -89,7 +89,8 @@ for name,cfg in IDX.items():
         ltp,ask=quote(best["instrument_key"]); t=float(best.get("tick_size") or 0.05)
         if t>1: t=t/100  # some masters give paise
         px=tick(ask if ask else ltp*1.005,t); r["ltp"]=ltp; r["ask"]=ask; r["limit"]=px
-        o={"trading_symbol":best["trading_symbol"],"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px}
+        csym=f"{name}{exp:%y%m%d}{int(best['strike_price'])}{raw}"  # compact form trade_lock parses (master symbol has spaces)
+        o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px}
         ok,reasons,adj=trade_lock.check_order(o); lot=int(best["lot_size"]); adj=(adj//lot)*lot
         r["check"]={"allowed":ok,"reasons":reasons,"adjusted_qty":adj}
         if not ok or adj<=0: r["action"]="blocked by pre-trade rules"; continue
