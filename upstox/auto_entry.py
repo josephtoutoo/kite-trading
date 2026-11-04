@@ -5,7 +5,10 @@ Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   CE: close > EMA20 and Supertrend green, previous candle not both; MACD hist > 0; ADX >= 18
   PE: close < EMA20 and Supertrend red,   previous candle not both; MACD hist < 0; ADX >= 18
   (MACD + ADX>=18 filters are there to avoid chop.)
-Option: nearest weekly expiry, ATM strike, qty 2*lot_size (trade_lock may halve it).
+Option: nearest weekly expiry, ATM strike, qty 2*lot_size on an ordinary trend (trade_lock may halve it).
+STRONG trend (ind.strong: ADX >= 25 AND still rising, price on the Supertrend side of EMA20): qty doubles
+to 4 lots (t295u). Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
+14% of signals; the rest -0.016%. trade_lock caps still apply.
 All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product I (fallback D),
 tag auto_entry; cancel if unfilled after 2 min.
 Kite (4 Nov): same signal also buys 2 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
@@ -28,7 +31,7 @@ def in_expiry_week(exp_date):
     return False
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
-LOTS=2; ADX_MIN=18
+LOTS=2; ADX_MIN=18; STRONG_LOTS=2*LOTS  # t295u: a STRONG trend doubles the index-option size
 IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO"},
      "BANKNIFTY":{"key":"NSE_INDEX|Nifty Bank","exch":"NSE","seg":"NSE_FO"},
      "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO"}}
@@ -95,7 +98,13 @@ for name,cfg in IDX.items():
         r["candle"]=a["last_ts"][11:16]; r["5m"]={k:a[k] for k in("close","ema20","st","dir","prev_close","prev_ema","prev_dir","hist","adx")}
         sig,raw,why=signal(a); r["signal"]=sig or "NONE"; r["trend_side"]=raw; r["why"]=why
         best,exp,std=pick(name,cfg,raw or "CE",a["close"])
-        qty=LOTS*int(best["lot_size"])
+        strong,sside,sdet=ind.strong(a); r["strong"]={"on":strong,"side":sside,**sdet}
+        lots=LOTS
+        if strong and sig:
+            if sside==raw: lots=STRONG_LOTS; r["size"]=f"STRONG trend -> {lots} lots (doubled)"
+            else: r["size"]=f"strong {sside} but signal is {raw} - normal {lots} lots"
+        elif sig: r["size"]=f"ordinary trend -> {lots} lots"
+        qty=lots*int(best["lot_size"])
         r["option"]={"symbol":best["trading_symbol"],"key":best["instrument_key"],"expiry":str(exp),"strike":best["strike_price"],"lot_size":best["lot_size"],"qty":qty,"strike_step":std}
         openp=[p for p in pos if int(p.get("quantity") or 0)>0 and trade_lock.underlying(trade_lock.sym_of(p))==name and trade_lock.is_opt(trade_lock.sym_of(p))]
         if openp: r["open_position"]=[trade_lock.sym_of(p) for p in openp]
@@ -117,7 +126,7 @@ for name,cfg in IDX.items():
                 if not m: r["kite"]={"action":"skipped: no Kite symbol for "+best["instrument_key"]}
                 elif kopen: r["kite"]={"action":"skip: Kite position already open","open":[p["trading_symbol"] for p in kopen]}
                 else:
-                    kq=LOTS*m["lot_size"]
+                    kq=lots*m["lot_size"]
                     kprod="MIS" if ekw else "NRML"
                     ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px}
                     kok,kre,kadj=trade_lock.check_order(ko,broker="kite"); kadj=(kadj//m["lot_size"])*m["lot_size"]
