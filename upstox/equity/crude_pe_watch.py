@@ -2,8 +2,10 @@
 """Watch crude oil and buy the CRUDEOIL 9000 PE 17 NOV 26 on Upstox when crude drops under 8,950.
 
 User standing permission (4 Nov 2026, t274u): place this one order automatically when the trigger
-hits. Upstox currently disables MCX orders through its API, so when the order is refused the script
-reports that and asks the user to place it in the app instead.
+hits. Upstox DISABLES all MCX orders through its API (error UDAPI1161 "MCX API orders are temporarily
+disabled", applies to v2 and v3 alike), so an API order can never fill; the script reports that and
+asks the user to place it in the Upstox app instead. It also checks that the commodity segment has
+margin, because Upstox keeps equity and commodity purses separate.
 
 Rules: 1 lot (=100 barrels, quantity 1 on Upstox), LIMIT at ask+2, SL -30%, target +20%.
 Only fires once per calendar day (state in crude_pe_watch.json). Run only during MCX hours.
@@ -17,7 +19,7 @@ STATE = os.path.join(D, 'crude_pe_watch.json')
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 TRIGGER = 8950.0
 FUT_KEY = 'MCX_FO|573422'      # CRUDEOIL FUT 19 NOV 26
-PE_KEY = 'MCX_FO|582930'       # CRUDEOIL 9000 PE 17 NOV 26
+PE_KEY = 'MCX_FO|583080'       # CRUDEOIL 9000 PE 17 NOV 26 (was 582930 = the 9000 CE - wrong leg, fixed 4 Nov 2026 t296u)
 PE_SYM = 'CRUDEOIL 9000 PE 17 NOV 26'
 DRY = '--dry' in sys.argv
 STATUS = '--status' in sys.argv
@@ -58,6 +60,8 @@ def main():
     ask = float(((pe.get('depth') or {}).get('sell') or [{}])[0].get('price') or pe.get('last_price') or 0)
     out['crude'] = ltp
     out['pe_ask'] = ask
+    out['pe_symbol'] = pe.get('symbol') or pe.get('trading_symbol') or PE_SYM  # prove which leg was quoted
+    out['commodity_margin'] = commodity_margin()
     out['trigger'] = TRIGGER
     if STATUS:
         out['state'] = st
@@ -73,6 +77,13 @@ def main():
         return
     if st['placed'].get(now.date().isoformat()):
         out['action'] = 'already acted today'
+        print(json.dumps(out, indent=1))
+        return
+    cm = out.get('commodity_margin')
+    if cm is not None and cm < ask * 100:
+        out['action'] = (f'BLOCKED: commodity purse has Rs {cm:,.0f}, the 1-lot premium needs Rs {ask*100:,.0f}. '
+                         'Move funds to the commodity segment in the Upstox app, then place the order there '
+                         '(Upstox also refuses MCX orders from the API: UDAPI1161).')
         print(json.dumps(out, indent=1))
         return
     price = round(ask + 2, 1)   # crude options trade in 0.1 ticks
@@ -109,6 +120,15 @@ def main():
         out['action'] = 'order refused by broker'
         out['error'] = msg
     print(json.dumps(out, indent=1))
+
+
+def commodity_margin():
+    u = 'https://api.upstox.com/v2/user/get-funds-and-margin'
+    try:
+        d = json.load(op.open(urllib.request.Request(u, headers=H), timeout=20)).get('data') or {}
+        return float((d.get('commodity') or {}).get('available_margin') or 0)
+    except Exception:
+        return None
 
 
 if __name__ == '__main__':
