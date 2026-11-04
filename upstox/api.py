@@ -30,8 +30,10 @@ import json, os, time, gzip, base64, socket, ssl, http.client, urllib.parse
 D = os.path.dirname(os.path.abspath(__file__))
 UA = 'Mozilla/5.0'
 DEFAULT_TIMEOUT = 20.0
-RETRIES = 2                 # extra attempts for a transient GET failure (3 tries total)
-BACKOFF = 0.4               # seconds before retry 1; doubled for retry 2
+RETRIES = 3                 # extra attempts for a transient GET failure (4 tries total);
+                            # a Cloudflare-fronted host does occasionally reset a TLS
+                            # connection mid-handshake, and one retry was not always enough
+BACKOFF = 0.4               # seconds before retry 1; doubled for each retry after that
 TRANSIENT_STATUS = (429, 500, 502, 503, 504)
 CF_1010 = '1010'
 
