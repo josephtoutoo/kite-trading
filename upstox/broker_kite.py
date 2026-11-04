@@ -99,7 +99,8 @@ def orders():
             "instrument_token":"KITE|%s|%s"%(o["exchange"],o["tradingsymbol"]),"transaction_type":o["transaction_type"],
             "status":(o.get("status") or "").lower(),"order_type":o.get("order_type"),"quantity":int(o.get("quantity") or 0),
             "filled_quantity":int(o.get("filled_quantity") or 0),"average_price":float(o.get("average_price") or 0),
-            "trigger_price":float(o.get("trigger_price") or 0),"price":float(o.get("price") or 0),"order_timestamp":ts,"tag":o.get("tag")})
+            "trigger_price":float(o.get("trigger_price") or 0),"price":float(o.get("price") or 0),"order_timestamp":ts,"tag":o.get("tag"),
+            "status_message":o.get("status_message") or ""})
     return out
 def order_status(oid):
     if not valid(): return None
