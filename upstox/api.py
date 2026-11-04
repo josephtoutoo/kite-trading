@@ -238,5 +238,7 @@ if __name__ == '__main__':
             d = get('/v2/order/retrieve-all')
         print('3 pooled GETs %.0f ms, status=%s orders=%d' % (
             (time.perf_counter() - t0) * 1000, d.get('status'), len(d.get('data') or [])))
-        r = call('https://api-hft.upstox.com/v2/order/retrieve-all')
-        print('proxied order-host GET:', r.get('status'), r.get('code'))
+        # NOTE: api-hft.upstox.com serves order PLACEMENT/MODIFY only; a read path there
+        # returns 404 by design, so it is not a health check. Reads all go to api.upstox.com.
+        r = call('https://api.upstox.com/v2/order/retrieve-all')
+        print('second host GET:', r.get('status'), len(r.get('data') or []), 'orders')
