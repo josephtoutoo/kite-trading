@@ -76,11 +76,25 @@ def main():
     if not bk.valid():
         print('kite invalid:', bk.why()); return
     k = bk.client()
-    kh = k.holdings()       # one read for the whole loop: it was re-fetched per symbol
+    try:
+        kh = k.holdings()   # one read for the whole loop: it was re-fetched per symbol
+    except Exception as e:
+        print(json.dumps({'error': f'Kite holdings unreadable: {type(e).__name__}: {e}'}))
+        return
     st = ms.state('kite')
     held = {s: v for s, v in st['held'].items() if v > 0}
     stops, qty = {}, {}
-    for o in k.orders():
+    # (5 Nov) a failed order read must not look like "no live stop", or the script places a second
+    # full-size SL on top of the live one and a double stop sells twice the quantity.
+    try:
+        kbook = k.orders()
+    except Exception as e:
+        print(json.dumps({'error': f'Kite order book unreadable - refusing to place stops: {type(e).__name__}: {e}'}))
+        return
+    if kbook is None:
+        print(json.dumps({'error': 'Kite order book returned no data - refusing to place stops'}))
+        return
+    for o in kbook:
         if (o['transaction_type'] == 'SELL' and o['product'] == 'MTF'
                 and o['status'] in ('TRIGGER PENDING', 'OPEN') and o['order_type'] in ('SL', 'SL-M')):
             stops[o['tradingsymbol']] = o

@@ -115,7 +115,14 @@ def main():
         v['key'] = v.get('key') or km.get(s)
     quotes = upstox_quotes([v['key'] for v in held.values()])
 
-    orders = ms._get('/v2/order/retrieve-all').get('data') or []
+    # (5 Nov) a failed order-book read must never look like "no live stops": the script would then
+    # place a second full-size SL on top of the live one, and a double stop sells twice the quantity.
+    book = ms._get('/v2/order/retrieve-all')
+    if book.get('status') != 'success' or book.get('data') is None:
+        print(json.dumps({'error': 'order book unreadable - refusing to place stops that could duplicate',
+                          'resp': str(book)[:200]}), file=sys.stderr)
+        raise SystemExit(2)
+    orders = book.get('data') or []
     live_sl = {}
     for o in orders:
         if ((o.get('transaction_type') or '').upper() == 'SELL'
