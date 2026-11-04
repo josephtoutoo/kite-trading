@@ -23,7 +23,7 @@ for p in pos:
         hi=max([c[2] for c in cs if c[0][:19].replace('T',' ')>=entry_time[:16]] or [ltp])
     except Exception as e: hi=ltp
     hi=max(hi,ltp,st['peaks'].get(ts,0)); st['peaks'][ts]=hi
-    name=row['name']; under='BSE_INDEX|SENSEX' if name=='SENSEX' else ('NSE_INDEX|Nifty 50' if name=='NIFTY' else eqkey(name))
+    name=row['name']; under={'SENSEX':'BSE_INDEX|SENSEX','NIFTY':'NSE_INDEX|Nifty 50','BANKNIFTY':'NSE_INDEX|Nifty Bank','FINNIFTY':'NSE_INDEX|Nifty Fin Service','MIDCPNIFTY':'NSE_INDEX|NIFTY MID SELECT','BANKEX':'BSE_INDEX|BANKEX'}.get(name) or eqkey(name)
     a=ind.analyze(under,'minutes',15,10)
     sls=[o for o in ords if o['trading_symbol']==ts and o['transaction_type']=='SELL' and o['status'] in('trigger pending','open') and o['order_type']=='SL']
     out.append(dict(ts=ts,ex=ex,uk=uk,qty=p['quantity'],avg=p['average_price'],ltp=ltp,high=hi,expiry=row['expiry'],tick=row['tick_size'],
