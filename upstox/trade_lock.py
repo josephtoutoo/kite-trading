@@ -4,7 +4,9 @@ Lock file: trade_lock.json {date, reason, loss, next_day_reduced, next_day_date}
 CLI: python3 trade_lock.py check '<json order>'   (order keys: trading_symbol, instrument_token,
      transaction_type, order_type, product, quantity, price, trigger_price; optional "_now":"YYYY-MM-DD HH:MM" for tests)
 Read-only: places NO orders."""
-import json,os,re,sys,datetime,urllib.request,urllib.parse
+import json,os,re,sys,datetime,urllib.parse
+sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
+import api                     # pooled + timed transport (5 Nov 2026)
 D=os.path.dirname(os.path.abspath(__file__))
 LF=os.path.join(D,"trade_lock.json")
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
@@ -20,7 +22,8 @@ def next_trading_day(d):
     try:
         import market_calendar
         return market_calendar.next_trading_day(d)
-    except Exception:
+    except Exception as e:
+        print(f"trade_lock: market_calendar unavailable, next day is judged on weekdays only: {type(e).__name__}: {e}",file=sys.stderr)
         d=d+datetime.timedelta(days=1)
         while d.weekday()>=5: d+=datetime.timedelta(days=1)
         return d
@@ -49,13 +52,14 @@ def record_entry():
 # ---------------- live data ----------------
 _cache={}
 def _get(path):
+    """GET api.upstox.com + path, cached for the life of this process (one decision per run)."""
     if path in _cache: return _cache[path]
-    t=json.load(open(os.path.join(D,"token.json")))["access_token"]
-    r=urllib.request.Request("https://api.upstox.com"+path,headers={"Authorization":"Bearer "+t,"Accept":"application/json","User-Agent":"Mozilla/5.0"})
-    _cache[path]=json.load(urllib.request.urlopen(r,timeout=20)); return _cache[path]
+    _cache[path]=api.get(path); return _cache[path]
 def _data(path):
     try: return _get(path).get("data") or []
-    except Exception as e: return []
+    except Exception as e:
+        print(f"trade_lock: read failed for {path.split('?')[0]}: {type(e).__name__}: {str(e)[:160]}",file=sys.stderr)
+        return []
 def sym_of(x): return (x.get("trading_symbol") or x.get("tradingsymbol") or "").upper()
 def is_opt(s):
     # 4 Nov: a stock named ...CE (e.g. BAJFINANCE) is not an option - require underlying + expiry digits first
@@ -79,15 +83,32 @@ def _ltp(order,positions):
     return None
 def lot_size(key,sym=""):
     """lot size from Upstox instrument master (cached daily file)."""
-    import gzip
     exch="BSE" if (key or "").startswith("BSE") or sym.startswith("SENSEX") or sym.startswith("BANKEX") else "NSE"
     f=os.path.join(D,f"instruments_{exch}_{datetime.datetime.now(IST).date()}.json.gz")
     try:
         if not os.path.exists(f):
-            urllib.request.urlretrieve(f"https://assets.upstox.com/market-quote/instruments/exchange/{exch}.json.gz",f)
-        if f not in _cache: _cache[f]={x["instrument_key"]:int(x.get("lot_size") or 0) for x in json.load(gzip.open(f)) if x.get("segment","").endswith("_FO")}
-        return _cache[f].get(key) or None
-    except Exception: return None
+            _download(f,f"https://assets.upstox.com/market-quote/instruments/exchange/{exch}.json.gz")
+        lm=_lotmap(f)
+        return lm.get(key) or None
+    except Exception as e:
+        print(f"trade_lock: lot size lookup failed for {key or sym} ({exch}): {type(e).__name__}: {str(e)[:120]}",file=sys.stderr)
+        return None
+
+
+def _download(dest,url):
+    """Fetch a master file to `dest` (60 s timeout) - the one raw download left in this module."""
+    import urllib.request
+    data=urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"}),timeout=60).read()
+    open(dest,"wb").write(data)
+
+
+def _lotmap(f):
+    """instrument_key -> lot_size for that exchange's F&O rows; parsed once per process per file."""
+    hit=_cache.get(("lotmap",f))
+    if hit: return hit
+    lm={x["instrument_key"]:int(x.get("lot_size") or 0) for x in api.gzip_json(f) if x.get("segment","").endswith("_FO")}
+    _cache[("lotmap",f)]=lm
+    return lm
 # ---------------- rules ----------------
 def kite_data():
     """Kite positions/orders (normalized) or ([],[]) when Kite token invalid - never raises."""
@@ -95,7 +116,9 @@ def kite_data():
     try:
         import broker_kite as bk
         _cache["_kite"]=(bk.positions(),bk.orders()) if bk.valid() else ([],[])
-    except Exception: _cache["_kite"]=([],[])
+    except Exception as e:
+        print(f"trade_lock: Kite positions/orders unavailable: {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
+        _cache["_kite"]=([],[])
     return _cache["_kite"]
 def _kite_holdings():
     """Kite holdings normalized to positions (MTF/CNC) so R8/R6 see settled shares, not just day positions."""
@@ -103,7 +126,9 @@ def _kite_holdings():
     try:
         import broker_kite as bk
         _cache["_kiteh"]=bk.holdings() if bk.valid() and hasattr(bk,"holdings") else []
-    except Exception: _cache["_kiteh"]=[]
+    except Exception as e:
+        print(f"trade_lock: Kite holdings unavailable: {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
+        _cache["_kiteh"]=[]
     return _cache["_kiteh"]
 def _kite_mtf():
     """Kite MTF rows normalized for R10 (4 Nov: this used to be an empty list, so Kite's
@@ -125,7 +150,8 @@ def _kite_mtf():
                     d["average_price"]=float(m.get("average_price") or h.get("average_price") or 0)
                     d["product"]="MTF"; seen[h["trading_symbol"]]=d
             rows=list(seen.values())
-    except Exception:
+    except Exception as e:
+        print(f"trade_lock: Kite MTF rows unavailable (R10 reads empty): {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
         rows=[]
     _cache["_kitemtf"]=rows
     return rows
@@ -159,7 +185,8 @@ def check_order(order,broker="upstox"):
             if bk.valid():
                 m=bk.client().margins("equity")
                 capital=float(m.get("net") or 0)+float(m.get("utilised",{}).get("debits") or 0)
-        except Exception: pass
+        except Exception as e:
+            print(f"trade_lock: Kite margins unavailable, using the Upstox capital figure: {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
     kpos,kord=kite_data()
     filled=[o for o in orders+kord if o.get("status")=="complete" and (_ts(o) or now)<=now]
     upos=pos

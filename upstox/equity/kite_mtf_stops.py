@@ -23,19 +23,19 @@ if '--pct' in sys.argv:
 
 
 def upstox_quotes(keys):
-    import urllib.request, urllib.parse
-    tok = json.load(open('/workspace/upstox/token.json'))['access_token']
+    """Batched LTP/band quotes from Upstox (Kite quotes need a permission this app lacks)."""
+    import sys, urllib.parse
+    import api
     out = {}
     keys = [k for k in keys if k]
     for i in range(0, len(keys), 20):
         chunk = keys[i:i + 20]
         q = urllib.parse.quote(','.join(chunk), safe='')
-        r = urllib.request.Request('https://api.upstox.com/v2/market-quote/quotes?instrument_key=' + q,
-                                   headers={'Authorization': 'Bearer ' + tok, 'Accept': 'application/json',
-                                            'User-Agent': 'Mozilla/5.0'})
         try:
-            d = json.load(urllib.request.urlopen(r, timeout=20)).get('data') or {}
-        except Exception:
+            # direct read, exactly as before (api.get only proxies the order host by default)
+            d = api.get('/v2/market-quote/quotes?instrument_key=' + q).get('data') or {}
+        except Exception as e:
+            print(f'kite_mtf_stops: quote batch {i // 20} failed: {type(e).__name__}: {e}', file=sys.stderr)
             d = {}
         for v in d.values():
             out[v.get('instrument_token')] = v
@@ -47,7 +47,8 @@ def st_1h(key):
         import ind
         a = ind.analyze(key, 'hours', 1, 30)
         return a.get('st'), a.get('dir')
-    except Exception:
+    except Exception as e:
+        print(f'kite_mtf_stops: 1h Supertrend unavailable for {key}: {type(e).__name__}: {e}', file=sys.stderr)
         return None, None
 
 
@@ -75,6 +76,7 @@ def main():
     if not bk.valid():
         print('kite invalid:', bk.why()); return
     k = bk.client()
+    kh = k.holdings()       # one read for the whole loop: it was re-fetched per symbol
     st = ms.state('kite')
     held = {s: v for s, v in st['held'].items() if v > 0}
     stops, qty = {}, {}
@@ -84,9 +86,10 @@ def main():
             stops[o['tradingsymbol']] = o
     km = dict(ms.keymap())
     # BSE-listed names (e.g. NSE Ltd trades on BSE) are missing from the NSE map
-    import gzip, glob
+    import glob
+    import api
     for f in sorted(glob.glob('/workspace/upstox/instruments_BSE_*.json.gz'))[-1:]:
-        for x in json.load(gzip.open(f)):
+        for x in api.gzip_json(f):
             if x.get('segment') == 'BSE_EQ' and x.get('trading_symbol') not in km:
                 km[x['trading_symbol']] = x['instrument_key']
     quotes = upstox_quotes([km.get(s) for s in held])
@@ -103,7 +106,7 @@ def main():
         if not ltp:
             acts.append(dict(sym=sym, action='SKIP', why='no quote')); continue
         exch = 'BSE' if key.startswith('BSE_') else 'NSE'
-        mtf = int((next((h.get('mtf') or {} for h in k.holdings() if h['tradingsymbol'] == sym), {}) or {}).get('quantity') or 0)
+        mtf = int((next((h.get('mtf') or {} for h in kh if h['tradingsymbol'] == sym), {}) or {}).get('quantity') or 0)
         want = mtf or int(round(held[sym] / max(ltp, 1e-9)))
         stx, d = st_1h(key)
         pct_stop = ltp * (1 - PCT / 100.0)

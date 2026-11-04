@@ -28,10 +28,21 @@ CLI:  python3 mtf_sizing.py state [broker]
       python3 mtf_sizing.py check SYMBOL QTY PRICE [--broker upstox|kite] [--mode new|add]
       python3 mtf_sizing.py size  SYMBOL PRICE [--broker upstox|kite] [--mode new|add]
 """
-import json, sys, os, glob, gzip, urllib.request
+import json, sys, os, glob, gzip, time
 
 sys.path.insert(0, '/workspace/upstox')
+import api                     # one pooled, timed, User-Agent-bearing client (5 Nov 2026)
+
 D = '/workspace/upstox'
+# (5 Nov 2026) In-process memo so one run never re-asks the broker for the same thing:
+#   * keymap(): the gzipped NSE master used to be re-read and re-parsed on every call (~304 ms).
+#     Cached on (path, mtime, size), so an instruments refresh invalidates it at once.
+#   * _get(): portfolio / order / funds reads are reused for QUOTE_TTL seconds. The old code
+#     fetched /v2/order/retrieve-all twice inside one size() and again in slots().
+QUOTE_TTL = 3.0               # seconds; one decision run stays well inside this
+_memo = {}                    # path -> (expires_at, payload)
+_margin_memo = {}             # (broker, symbol, qty, price) -> (expires_at, quote)
+_state_memo = {}              # broker -> (expires_at, state)
 PER_STOCK = 0.10
 TOTAL = 0.50
 NEW_SHARE = 0.50          # new stocks may use half of the remaining room
@@ -41,13 +52,19 @@ CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_sizing_cac
 # "mine" when one of my own entry tags appears on a completed BUY for it, or when it is recorded
 # in mtf_managed.json. Broker free margin (R10d) still uses every live holding - that is real money.
 MY_TAGS = ('rotation', 'scanmtf', 'pullback', 'mtfentry', 'mtf_entry', 'refill', 'add', 'top5')
+_km_cache = {}               # master path -> ((mtime_ns, size), map)
 MANAGED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_managed.json')
 
 
 def _managed():
     try:
         return set((json.load(open(MANAGED)).get('managed') or []))
-    except Exception:
+    except FileNotFoundError:
+        return set()
+    except Exception as e:
+        # An unreadable managed list under-counts MY names, which moves the stock cap - say so.
+        print(f'mtf_sizing: could not read {os.path.basename(MANAGED)} (my-name list): {type(e).__name__}: {e}',
+              file=sys.stderr)
         return set()
 
 
@@ -58,8 +75,8 @@ def mine_upstox():
             if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
                     and o.get('status') == 'complete' and (o.get('tag') or '') in MY_TAGS):
                 tags[o['trading_symbol'].replace('-EQ', '')] = o.get('tag')
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'mtf_sizing: order book read failed in mine_upstox: {type(e).__name__}: {e}', file=sys.stderr)
     return set(tags) | _managed()
 
 
@@ -73,23 +90,52 @@ def mine_kite():
             if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
                     and o.get('status') == 'COMPLETE' and (o.get('tag') or '') in MY_TAGS):
                 out.add(o.get('tradingsymbol'))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'mtf_sizing: Kite order book read failed in mine_kite: {type(e).__name__}: {e}', file=sys.stderr)
     return out
 
 
 def _get(path):
-    tok = json.load(open(os.path.join(D, 'token.json')))['access_token']
-    r = urllib.request.Request('https://api.upstox.com' + path,
-                               headers={'Authorization': 'Bearer ' + tok, 'Accept': 'application/json',
-                                        'User-Agent': 'Mozilla/5.0'})
-    return json.load(urllib.request.urlopen(r, timeout=20))
+    """GET api.upstox.com + path. Memoised for QUOTE_TTL seconds per process."""
+    if QUOTE_TTL > 0:
+        hit = _memo.get(path)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+    d = api.get(path)
+    if QUOTE_TTL > 0:
+        _memo[path] = (time.monotonic() + QUOTE_TTL, d)
+    return d
+
+
+def forget(path=None):
+    """Drop the read memo (all paths, or one) - used after an order so the next read is fresh.
+    Also drops the memoised broker state and margin quotes, so nothing downstream can act on
+    a book or a quote from before the order."""
+    if path is None:
+        _memo.clear(); _state_memo.clear(); _margin_memo.clear()
+    else:
+        _memo.pop(path, None)
+        if path.startswith('/v3/portfolio') or path.startswith('/v2/user'):
+            _state_memo.clear()
+
+
+def _km(f):
+    return {x['trading_symbol']: x['instrument_key'] for x in api.gzip_json(f)
+            if x.get('segment') == 'NSE_EQ' and x.get('instrument_type') == 'EQ'}
 
 
 def keymap():
+    """trading_symbol -> instrument_key from the newest NSE master. Parsed once per process;
+    the cache is keyed on (path, mtime, size) so a refreshed/rolled master is re-read."""
     f = sorted(glob.glob(os.path.join(D, 'instruments_NSE_*.json.gz')))[-1]
-    return {x['trading_symbol']: x['instrument_key'] for x in json.load(gzip.open(f))
-            if x.get('segment') == 'NSE_EQ' and x.get('instrument_type') == 'EQ'}
+    hit = _km_cache.get(f)
+    st = os.stat(f)
+    if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+        return dict(hit[1])          # fresh dict per call, as before - callers may mutate it
+    km = _km(f)
+    _km_cache.clear()
+    _km_cache[f] = ((st.st_mtime_ns, st.st_size), km)
+    return dict(km)
 
 
 # ---------------- per-broker state ----------------
@@ -124,13 +170,26 @@ def kite_state():
             q = int((h.get('mtf') or {}).get('quantity') or 0)
             if q > 0 and h['tradingsymbol'] not in held:
                 held[h['tradingsymbol']] = q * float((h.get('mtf') or {}).get('average_price') or h.get('average_price') or 0)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'mtf_sizing: Kite holdings read failed in kite_state: {type(e).__name__}: {e}', file=sys.stderr)
     return dict(broker='kite', capital=cap, free=free, used=sum(held.values()), held=held, mine=mine_kite())
 
 
 def state(broker):
-    return upstox_state() if broker == 'upstox' else kite_state()
+    """Broker capital / holdings / my-names. Memoised for QUOTE_TTL per process: one run asks
+    this several times (size, then check, then the cumulative-budget guard in mtf_dual_entry),
+    and each answer used to cost a funds read plus a portfolio read per call. Call forget()
+    after anything that moves the book so the next reader still sees the trade."""
+    if QUOTE_TTL > 0:
+        hit = _state_memo.get(broker)
+        if hit and hit[0] > time.monotonic():
+            st = dict(hit[1])
+            st['held'] = dict(st['held'])
+            return st
+    st = upstox_state() if broker == 'upstox' else kite_state()
+    if QUOTE_TTL > 0:
+        _state_memo[broker] = (time.monotonic() + QUOTE_TTL, st)
+    return st
 
 
 def state_mine(broker):
@@ -154,14 +213,10 @@ def margin_upstox(symbol, qty, price):
     key = km.get(symbol)
     if not key:
         return dict(ok=False, why=f'no Upstox instrument key for {symbol}')
-    tok = json.load(open(os.path.join(D, 'token.json')))['access_token']
-    body = json.dumps({'instruments': [{'instrument_key': key, 'quantity': int(qty), 'product': 'MTF',
-                                        'transaction_type': 'BUY'}]}).encode()
-    r = urllib.request.Request('https://api.upstox.com/v2/charges/margin', data=body,
-                               headers={'Authorization': 'Bearer ' + tok, 'Accept': 'application/json',
-                                        'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'})
+    body = {'instruments': [{'instrument_key': key, 'quantity': int(qty), 'product': 'MTF',
+                             'transaction_type': 'BUY'}]}
     try:
-        d = json.load(urllib.request.urlopen(r, timeout=20))['data']
+        d = api.request('https://api.upstox.com/v2/charges/margin', body, 'POST')['data']
         return dict(ok=True, margin=float(d['final_margin']), notional=qty * price)
     except Exception as e:
         return dict(ok=False, why=f'{type(e).__name__}: {str(e)[:120]}')
@@ -184,7 +239,19 @@ def margin_kite(symbol, qty, price, exchange='NSE'):
 
 
 def margin_quote(broker, symbol, qty, price):
-    return margin_upstox(symbol, qty, price) if broker == 'upstox' else margin_kite(symbol, qty, price)
+    """The broker's margin for this exact order. size() asks at qty 1 and again at the final
+    qty, check() asks twice more for the same pair, and mtf_dual_entry re-runs size() then
+    check() - all the same question. Memoised for QUOTE_TTL so a run never quotes twice,
+    and never acts on a quote older than QUOTE_TTL."""
+    ck = (broker, symbol, int(qty), float(price))
+    if QUOTE_TTL > 0:
+        hit = _margin_memo.get(ck)
+        if hit and hit[0] > time.monotonic():
+            return dict(hit[1])
+    q = margin_upstox(symbol, qty, price) if broker == 'upstox' else margin_kite(symbol, qty, price)
+    if QUOTE_TTL > 0 and q.get('ok'):
+        _margin_memo[ck] = (time.monotonic() + QUOTE_TTL, dict(q))
+    return q
 
 
 # ---------------- the gate ----------------
@@ -289,8 +356,8 @@ def slots(broker):
             for o in bk.client().orders():
                 if o['product'] == 'MTF' and o['transaction_type'] == 'BUY' and o['status'] in ('OPEN', 'TRIGGER PENDING'):
                     pending.append(o['tradingsymbol'])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'mtf_sizing: pending-order read failed in slots({broker}): {type(e).__name__}: {e}', file=sys.stderr)
     # a pending buy of a name I already hold is an add, not a new slot (and drop duplicate legs)
     pending = sorted({str(x).replace('-EQ', '') for x in pending if x} - set(held))
     free -= len(pending)

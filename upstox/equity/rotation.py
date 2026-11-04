@@ -5,10 +5,11 @@ entries; the other half is RESERVED for pullback adds (pullback_add.py only).
 Strong trend: 1h close > EMA20 and Supertrend green, confirmed on daily (close>EMA20, ST green).
 Score = ADX(1h) + 100*MACDhist/close(1h) * 10 + 2*%dist above EMA20(1h) + daily bonus.
 Swap only if best candidate score >= 1.15 x weakest holding AND weakest is weaker/broken."""
-import json, sys, time, gzip, urllib.request, datetime as dt
-sys.path.insert(0, '/workspace/upstox'); import ind
-TOK = json.load(open('/workspace/upstox/token.json'))['access_token']
+import json, sys, time, glob
+sys.path.insert(0, '/workspace/upstox'); import ind, api
+TOK = None      # the shared client attaches the bearer token itself (5 Nov 2026)
 MAXN, MARGIN = 5, 1.15
+_KM = {}                      # master path -> ((mtime_ns, size), map)
 NIFTY100 = """ABB ADANIENSOL ADANIENT ADANIGREEN ADANIPORTS ADANIPOWER AMBUJACEM APOLLOHOSP ASIANPAINT DMART AXISBANK
 BAJAJ-AUTO BAJFINANCE BAJAJFINSV BAJAJHLDNG BANKBARODA BEL BHARTIARTL BPCL BOSCHLTD BRITANNIA CANBK CHOLAFIN CIPLA COALINDIA
 DABUR DIVISLAB DLF DRREDDY EICHERMOT GAIL GODREJCP GRASIM HAVELLS HCLTECH HDFCBANK HDFCLIFE HAL HEROMOTOCO HINDALCO
@@ -17,11 +18,29 @@ KOTAKBANK LT LICI LODHA LTIM M&M MARUTI NESTLEIND NTPC ONGC PIDILITIND PFC POWER
 MOTHERSON SHREECEM SHRIRAMFIN SIEMENS SBIN SUNPHARMA TATACONSUM TCS TATAMOTORS TATAPOWER TATASTEEL TECHM TITAN TORNTPHARM
 TRENT TVSMOTOR ULTRACEMCO UNIONBANK UNITDSPR VBL VEDL WIPRO ZYDUSLIFE ETERNAL JIOFIN SWIGGY HYUNDAI""".split()
 def get(p):
-    r = urllib.request.Request('https://api.upstox.com'+p, headers={'Authorization':'Bearer '+TOK,'Accept':'application/json','User-Agent':'Mozilla/5.0'})
-    return json.load(urllib.request.urlopen(r, timeout=20))
+    return api.get(p)
+
+
 def keymap():
-    d = json.load(gzip.open(f'/workspace/upstox/instruments_NSE_{dt.date.today()}.json.gz'))
-    return {x['trading_symbol']: x['instrument_key'] for x in d if x.get('segment')=='NSE_EQ' and x.get('instrument_type')=='EQ'}
+    """trading_symbol -> instrument_key from the newest NSE master, parsed once per process.
+
+    It used to open today's dated file only, so on a day where the download had not landed yet
+    the scan died outright. It now takes the newest master present (the same rule every other
+    script uses) and caches the parse on (path, mtime, size) instead of re-reading it per call.
+    """
+    import os
+    files = sorted(glob.glob(f'/workspace/upstox/instruments_NSE_*.json.gz'))
+    if not files:
+        raise RuntimeError('no NSE instruments master in /workspace/upstox')
+    f = files[-1]
+    st = os.stat(f)
+    hit = _KM.get(f)
+    if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+        return dict(hit[1])
+    km = {x['trading_symbol']: x['instrument_key'] for x in api.gzip_json(f)
+          if x.get('segment')=='NSE_EQ' and x.get('instrument_type')=='EQ'}
+    _KM.clear(); _KM[f] = ((st.st_mtime_ns, st.st_size), km)
+    return dict(km)
 def score(key):
     h = ind.analyze(key, 'hours', 1, 30); d = ind.analyze(key, 'days', 1, 120)
     up1h = h['close'] > h['ema20'] and h['close'] > h['st'] and h['dir'] == 1
@@ -42,7 +61,8 @@ def scan(symbols=None, sleep=0.15):
     for s in watch:
         if s not in km: continue
         try: out.append(dict(sym=s, key=km[s], **score(km[s])))
-        except Exception: pass
+        except Exception as e:
+            print(f'rotation: score failed for {s}: {type(e).__name__}: {e}', file=sys.stderr)
         time.sleep(sleep)
     return sorted(out, key=lambda x: -x['score']), held
 

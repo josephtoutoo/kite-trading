@@ -33,8 +33,9 @@ def levels(c):
         import ind
         h = ind.analyze(c['key'], 'hours', 1, 30)
         st = h['st']
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"premarket_top3: 1h Supertrend unavailable for {c.get('sym')}, stop shown as -5%: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
     stop = st if (st and st < close) else round(close * 0.95, 2)
     return dict(entry=round(close, 2), stop=round(stop, 2),
                 stop_pct=round(100 * (close - stop) / close, 2),

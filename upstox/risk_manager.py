@@ -13,6 +13,7 @@ import json,os,sys
 sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
 import json,urllib.request,urllib.error,datetime
 import market_calendar
+import api                     # pooled, proxied, timed client (5 Nov 2026)
 DRY="--dry-run" in sys.argv
 D=os.path.dirname(os.path.abspath(__file__))
 SF=os.path.join(D,"risk_state.json")
@@ -22,13 +23,11 @@ if not DRY and not market_calendar.is_trading_day(now.date()):
     print(json.dumps({"skipped":"exchange holiday / market closed","now":now.isoformat()})); sys.exit(0)
 if not DRY and (now.weekday()>=5 or not (datetime.time(9,15)<=now.time()<=datetime.time(15,25))):
     print(json.dumps({"skipped":"outside 09:15-15:25 IST weekday window","now":now.isoformat()})); sys.exit(0)
-t=json.load(open(os.path.join(D,"token.json")))["access_token"]
-H={"Authorization":"Bearer "+t,"Accept":"application/json","Content-Type":"application/json","User-Agent":"Mozilla/5.0"}
-op=urllib.request.build_opener(urllib.request.ProxyHandler({"https":os.environ["UPSTOX_PROXY_URL"]}))
 def req(u,body=None,method=None):
-    r=urllib.request.Request(u,data=json.dumps(body).encode() if body is not None else None,headers=H,method=method)
-    try: return json.load(op.open(r,timeout=20))
-    except urllib.error.HTTPError as e: return {"status":"error","code":e.code,"body":e.read().decode()[:300]}
+    """Parsed JSON, or {'status':'error','code':..,'body':..} exactly as before. Shared keep-alive
+    client, always through the static-IP proxy (this desk reads and writes order endpoints there),
+    20 s timeout, and a write is never retried."""
+    return api.call(u,body=body,method=method,proxy=True,timeout=20)
 def write(u,body=None,method=None):
     if DRY: return {"status":"dry-run"}
     return req(u,body,method)
@@ -56,11 +55,17 @@ acts=[]; longs=set()
 import ind,gzip
 INDEX_KEYS=trade_lock.INDEX_KEYS
 EQF=os.path.join(D,"eq_keys.json")
+_EQK=None
 def eq_keys():
+    """trading_symbol -> instrument_key for NSE cash. Parsed once per process; it used to
+    re-read eq_keys.json (93 KB) on every trend_ok() call, i.e. once per open position."""
+    global _EQK
+    if _EQK is not None: return _EQK
     if not os.path.exists(EQF):
         raw=urllib.request.urlopen(urllib.request.Request("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",headers={"User-Agent":"Mozilla/5.0"}),timeout=60).read()
         d=json.loads(gzip.decompress(raw)); json.dump({x["trading_symbol"]:x["instrument_key"] for x in d if x.get("segment")=="NSE_EQ" and x.get("instrument_type")=="EQ"},open(EQF,"w"))
-    return json.load(open(EQF))
+    _EQK=api.file_json(EQF)
+    return _EQK
 def trend_ok(sym):
     """Underlying trend on last CLOSED candle. Index opts: 5m; stock opts/futures: 15m.
     CE / long FUT: close>EMA20 & ST green. PE: close<EMA20 & ST red."""
@@ -143,7 +148,9 @@ try:
                 import urllib.parse
                 qd=req("https://api.upstox.com/v2/market-quote/quotes?instrument_key="+urllib.parse.quote(k,safe="")).get("data") or {}
                 for v in qd.values(): hi=max(hi,float((v.get("ohlc") or {}).get("high") or 0)); lcl=float(v.get("lower_circuit_limit") or 0)
-            except Exception: pass
+            except Exception as e:
+                # Not fatal: the stop then uses the position LTP only. Say so once per name.
+                print(f"risk_manager: MTF quote unavailable for {sym}, using the position high/ltp: {type(e).__name__}: {e}",file=sys.stderr)
             s["high"]=max(s.get("high",avg),hi)
             _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":k,"transaction_type":"SELL","order_type":"SL","product":"MTF","quantity":q})
             if not _ok: acts.append({"sym":sym,"action":"MTF_SKIP_CHECK","why":_why}); continue

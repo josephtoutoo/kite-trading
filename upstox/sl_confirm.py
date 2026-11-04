@@ -16,8 +16,10 @@ sl_confirm_failures.json. /workspace/kite/option_monitor.py (10-min routine) pri
 risk_manager.py clears them as soon as it sees a live SL.
 This module places orders ONLY through guard_*() (entry path). confirm() is read-only.
 """
-import json,os,time,datetime,urllib.request,urllib.error
+import json,os,sys,time,datetime
 D=os.path.dirname(os.path.abspath(__file__))
+if D not in sys.path: sys.path.insert(0,D)
+import api                     # pooled, proxied, timed client (5 Nov 2026)
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 FAILF=os.path.join(D,"sl_confirm_failures.json")
 STATE=os.path.join(D,"risk_state.json")
@@ -26,7 +28,7 @@ LIVE=("open","trigger pending","open pending","modified")
 def log(msg):
     try:
         with open(os.path.join(D,"sl_confirm.log"),"a") as f: f.write(f"{datetime.datetime.now(IST):%Y-%m-%d %H:%M:%S} {msg}\n")
-    except Exception: pass
+    except Exception as e: print(f"sl_confirm: could not write the log: {type(e).__name__}: {e}",file=sys.stderr)
 # ---------------- failure state file ----------------
 def failures(include_resolved=False):
     try:
@@ -67,26 +69,26 @@ def snap(broker,exchange,symbol,price,default=TICK):
         try:
             import broker_kite as bk
             return bk.snap(price,bk.tick_for(exchange or "NFO",symbol,default))
-        except Exception: pass
+        except Exception as e:
+            print(f"sl_confirm: Kite tick lookup failed for {symbol}, using {default}: {type(e).__name__}: {e}",file=sys.stderr)
     t=float(default or TICK) or TICK
     return round(round(float(price)/t)*t,4)
 # ---------------- order books ----------------
 def _req(u,body=None,method=None):
-    h={"Authorization":"Bearer "+json.load(open(os.path.join(D,"token.json")))["access_token"],
-       "Accept":"application/json","Content-Type":"application/json","User-Agent":"Mozilla/5.0"}
-    r=urllib.request.Request(u,data=json.dumps(body).encode() if body is not None else None,headers=h,method=method)
-    px=os.environ.get("UPSTOX_PROXY_URL")
-    op=urllib.request.build_opener(urllib.request.ProxyHandler({"https":px,"http":px}))
-    try: return json.load(op.open(r,timeout=20))
-    except urllib.error.HTTPError as e: return {"status":"error","code":e.code,"body":e.read().decode()[:300]}
-    except Exception as e: return {"status":"error","code":0,"body":f"{type(e).__name__}: {str(e)[:200]}"}
+    """Same contract as before (parsed JSON, or an error dict). It used to build a brand-new
+    proxied opener on EVERY call, which this module makes 2-4 times per confirmation (5 Nov 2026)."""
+    return api.call(u,body=body,method=method,proxy=True,timeout=20)
 def get_orders(broker):
     """Normalized order list: order_id, trading_symbol, transaction_type, order_type, status (lower),
-    quantity, filled_quantity, price, trigger_price, status_message, tag."""
+    quantity, filled_quantity, price, trigger_price, status_message, tag.
+    Kite reads bypass broker_kite's short read cache on purpose: this module's whole job is to
+    re-read the live book after an entry, so it must never be served a snapshot."""
     if broker=="kite":
         try:
             import broker_kite as bk
-            return bk.orders() if bk.valid() else []
+            if not bk.valid(): return []
+            bk.forget()
+            return bk.orders()
         except Exception as e: log(f"kite orders {e}"); return []
     d=(_req("https://api.upstox.com/v2/order/retrieve-all") or {}).get("data") or []
     out=[]
@@ -102,6 +104,7 @@ def position_qty(broker,symbol):
     try:
         if broker=="kite":
             import broker_kite as bk
+            bk.forget()
             return sum(p["quantity"] for p in bk.positions() if p["trading_symbol"]==symbol)
         d=(_req("https://api.upstox.com/v2/portfolio/short-term-positions") or {}).get("data") or []
         return sum(int(p.get("quantity") or 0) for p in d if (p.get("trading_symbol") or "")==symbol)

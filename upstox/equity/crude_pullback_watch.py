@@ -16,7 +16,7 @@ separate. The ping tells the user to place it in the Upstox app.
 
 CLI: python3 crude_pullback_watch.py [--status] [--force]
 """
-import os, sys, json, datetime, urllib.request, urllib.error, urllib.parse
+import os, sys, json, datetime, urllib.parse
 
 D = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(D, 'crude_pullback_watch.json')
@@ -28,17 +28,11 @@ PE_MAX = 470.0              # "near Rs 450" - allow the ask up to here
 EXPIRES = '2026-11-11'      # this watch is temporary; last day it may alert
 
 sys.path.insert(0, '/workspace/upstox')
-TOK = json.load(open('/workspace/upstox/token.json'))['access_token']
-H = {'Authorization': 'Bearer ' + TOK, 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0'}
-_op = urllib.request.build_opener(urllib.request.ProxyHandler(
-    {'https': os.environ['UPSTOX_PROXY_URL'], 'http': os.environ['UPSTOX_PROXY_URL']})) \
-    if os.environ.get('UPSTOX_PROXY_URL') else urllib.request.build_opener()
+import api                     # pooled, proxied, timed client (5 Nov 2026)
 
 
 def get(u, body=None, method=None):
-    r = urllib.request.Request(u, data=json.dumps(body).encode() if body is not None else None,
-                               headers=H, method=method)
-    return json.load(_op.open(r, timeout=25))
+    return api.request(u, body=body, method=method, proxy=True, timeout=25)
 
 
 def quote(key):
@@ -59,11 +53,13 @@ def save(s):
 
 
 def trend():
-    """5m crude trend from the shared indicator module: (is_down, detail)."""
+    """5m crude trend from the shared indicator module: (is_down, detail, levels)."""
     import ind
     a = ind.analyze(FUT_KEY, 'minutes', 5, 5)
     down = a['close'] < a['ema20'] and a['dir'] == -1
-    return down, f"5m close {a['close']:.0f} vs EMA20 {a['ema20']:.0f}, Supertrend {'red' if a['dir']==-1 else 'green'}, ADX {a['adx']}"
+    detail = f"5m close {a['close']:.0f} vs EMA20 {a['ema20']:.0f}, Supertrend {'red' if a['dir']==-1 else 'green'}, ADX {a['adx']}"
+    levels = {'close': a['close'], 'ema20': a['ema20'], 'st': a['st'], 'dir': a['dir'], 'adx': a['adx']}
+    return down, detail, levels
 
 
 def main():
@@ -98,11 +94,21 @@ def main():
     day = now.date().isoformat()
     in_zone = LO <= ltp <= HI
     cheap = ask <= PE_MAX
-    down, tdet = trend()
+    down, tdet, tlev = trend()
     out['in_zone'] = in_zone
     out['pe_ok'] = cheap
     out['trend_down'] = down
     out['trend'] = tdet
+    # Exit plan quoted in the alert (user, t299u: trend-based SL, not a flat 30%).
+    # For a bought PUT the trade is wrong when crude's 5m turns up: close above EMA20 with Supertrend green.
+    # Trend exit only arms once the put is >=15% above the fill (same gate as the index-option rule), so an
+    # early wiggle does not shake it out; a 30% floor under the fill bounds the loss until then.
+    out['exit_plan'] = {
+        'trend_exit': f"sell when crude 5m closes ABOVE {tlev['ema20']:.0f} with Supertrend green (now {'red' if tlev['dir']==-1 else 'green'} at {tlev['st']:.0f})",
+        'trend_exit_arms_at': 'once the put is 15% above your fill',
+        'floor_stop': '30% under your fill until the trend exit arms',
+        'invalidation': f"crude back above {HI:.0f} also voids the setup",
+    }
     if not (in_zone and cheap and down):
         out['action'] = 'no alert'
         # remember why, so a run is diagnosable

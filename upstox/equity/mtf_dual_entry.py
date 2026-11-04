@@ -24,7 +24,7 @@ CLI:
   python3 mtf_dual_entry.py mirror [--apply]                              # plan (default) or buy + arm stops
 Plan/state go to mtf_mirror.json.
 """
-import os, sys, json, time, datetime, urllib.request, urllib.error, urllib.parse
+import os, sys, json, time, datetime, urllib.parse
 
 D = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, D)
@@ -32,26 +32,17 @@ sys.path.insert(0, '/workspace/upstox')
 import mtf_sizing as ms
 import trade_lock
 import ind
+import api                     # one pooled, proxied, timed client (5 Nov 2026)
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 REC = os.path.join(D, 'mtf_mirror.json')
-TOK = json.load(open('/workspace/upstox/token.json'))['access_token']
-H = {'Authorization': 'Bearer ' + TOK, 'Accept': 'application/json', 'Content-Type': 'application/json',
-     'User-Agent': 'Mozilla/5.0'}
-_op = urllib.request.build_opener(urllib.request.ProxyHandler(
-    {'https': os.environ['UPSTOX_PROXY_URL'], 'http': os.environ['UPSTOX_PROXY_URL']})) \
-    if os.environ.get('UPSTOX_PROXY_URL') else urllib.request.build_opener()
 
 
 def req(u, body=None, method=None):
-    r = urllib.request.Request(u, data=json.dumps(body).encode() if body is not None else None,
-                               headers=H, method=method)
-    try:
-        return json.load(_op.open(r, timeout=25))
-    except urllib.error.HTTPError as e:
-        return {'status': 'error', 'code': e.code, 'body': e.read().decode()[:300]}
-    except Exception as e:
-        return {'status': 'error', 'body': f'{type(e).__name__}: {e}'}
+    """Same contract as before: parsed JSON, or {'status':'error','code':..,'body':..}.
+    Runs over the shared keep-alive client, always via the static-IP proxy (this script's
+    orders and quotes both need it), with a 25 s timeout and no retry for writes."""
+    return api.call(u, body=body, method=method, proxy=True, timeout=25)
 
 
 def tick(p, t=0.05):
@@ -112,7 +103,10 @@ def sl_level(key, ltp, entry):
         st = a['st']
         cand = max(ltp * 0.95, st) if st < ltp else ltp * 0.95
         return round(min(cand, ltp * 0.999), 2), a
-    except Exception:
+    except Exception as e:
+        # Falls back to the flat 5% stop, which is a DIFFERENT level than the rule picks - log it.
+        print(f'mtf_dual_entry: 1h Supertrend unavailable for {key}, stop uses the flat 5%: {type(e).__name__}: {e}',
+              file=sys.stderr)
         return round(ltp * 0.95, 2), None
 
 
@@ -143,6 +137,7 @@ def buy(symbol, price, mode='new', qty=None):
             'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}
     r = req('https://api-hft.upstox.com/v2/order/place', body, 'POST')
     oid = (r.get('data') or {}).get('order_id')
+    ms.forget()          # the book has moved: never let the next read reuse a pre-order snapshot
     p['legs']['upstox']['order_id'] = oid
     p['legs']['upstox']['response'] = {'code': r.get('code'), 'body': r.get('body')} if not oid else 'placed'
     # --- Kite leg ---
@@ -150,7 +145,8 @@ def buy(symbol, price, mode='new', qty=None):
         import broker_kite as bk
         try:
             m = bk.from_upstox(key)
-        except Exception:
+        except Exception as e:
+            print(f'mtf_dual_entry: Kite symbol map failed for {key}: {type(e).__name__}: {e}', file=sys.stderr)
             m = None
         if not m:
             p['legs']['kite']['order_id'] = None
@@ -298,6 +294,7 @@ def mirror(apply=False):
         res = _place_mirror_leg(leg)
         placed.append(res)
     out['placed'] = placed
+    ms.forget()          # same reason: the stop arming below must read the post-order book
     ok = [p for p in placed if p.get('order_id')]
     out['action'] = f'placed {len(ok)}/{len(placed)} missing leg(s)'
     # ---- arm protective stops on both books ----
@@ -398,6 +395,7 @@ def _place_mirror_leg(leg):
                 'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}
         r = req('https://api-hft.upstox.com/v2/order/place', body, 'POST')
         oid = (r.get('data') or {}).get('order_id')
+        ms.forget()
         return {'symbol': sym, 'broker': broker, 'qty': q, 'order_id': oid,
                 'resp': None if oid else {'code': r.get('code'), 'body': r.get('body')}}
     import broker_kite as bk
@@ -405,6 +403,7 @@ def _place_mirror_leg(leg):
     if not m:
         return {'symbol': sym, 'broker': broker, 'qty': q, 'order_id': None, 'resp': 'no Kite symbol'}
     oid = bk.place(m['exchange'], m['tradingsymbol'], 'BUY', q, px, tag='rotation', product='MTF')
+    ms.forget()
     return {'symbol': sym, 'broker': broker, 'kite_symbol': m['tradingsymbol'], 'qty': q, 'order_id': oid}
 
 

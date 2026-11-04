@@ -96,11 +96,12 @@ def upstox_tick(instrument_key):
     """Tick size from the Upstox master (MCX uses 5 or 10, not 0.05 - orders get rejected otherwise)."""
     global _TICK
     if _TICK is None:
-        import gzip, glob, json as _j
+        import glob
+        import api
         m = {}
         for f in glob.glob('/workspace/upstox/instruments_*_*.json.gz'):
             try:
-                for x in _j.load(gzip.open(f)):
+                for x in api.gzip_json(f):
                     k = x.get('instrument_key')
                     if k:
                         try:
@@ -123,7 +124,8 @@ def _expiry_map():
     global _EXP
     if _EXP is not None:
         return _EXP
-    import gzip, glob, json as _j, datetime as _dt, csv
+    import glob, datetime as _dt, csv
+    import api
     out = {}
     # Kite masters carry the authoritative expiry for Kite symbols (compact form)
     for f in glob.glob('/workspace/upstox/kite_instruments_*_*.csv'):
@@ -131,11 +133,13 @@ def _expiry_map():
             for x in csv.DictReader(open(f)):
                 if x.get('instrument_type') in ('CE', 'PE') and x.get('expiry'):
                     out[x['tradingsymbol'].replace(' ', '').upper()] = _dt.date.fromisoformat(x['expiry'])
-        except Exception:
+        except Exception as e:
+            print(f'expiry_squareoff: Kite master unreadable ({f.split("/")[-1]}), expiries from it missing: '
+                  f'{type(e).__name__}: {e}', file=sys.stderr)
             continue
     for f in glob.glob('/workspace/upstox/instruments_*_*.json.gz'):
         try:
-            for x in _j.load(gzip.open(f)):
+            for x in api.gzip_json(f):
                 if x.get('instrument_type') in ('CE', 'PE') and x.get('expiry') and x.get('trading_symbol'):
                     out[x['trading_symbol'].replace(' ', '').upper()] = _dt.datetime.fromtimestamp(
                         x['expiry'] / 1000).date()
@@ -151,11 +155,12 @@ def _strike_index():
     global _STRIKE
     if _STRIKE is not None:
         return _STRIKE
-    import gzip, glob, json as _j, datetime as _dt
+    import glob, datetime as _dt
+    import api
     out = {}
     for f in glob.glob('/workspace/upstox/instruments_*_*.json.gz'):
         try:
-            for x in _j.load(gzip.open(f)):
+            for x in api.gzip_json(f):
                 if x.get('instrument_type') not in ('CE', 'PE') or not x.get('expiry'):
                     continue
                 root = underlying_of(x.get('asset_symbol') or x.get('name') or x.get('trading_symbol') or '')
@@ -208,17 +213,19 @@ def expiry_for(tsym):
 
 
 def main():
-    import urllib.request, urllib.parse
+    import sys, urllib.parse
+    import api
     now = datetime.datetime.now(IST)
     out = {'now': now.strftime('%Y-%m-%d %H:%M IST'), 'dry': DRY, 'only': ONLY, 'acts': []}
-    tok = json.load(open('/workspace/upstox/token.json'))['access_token']
-    H = {'Authorization': 'Bearer ' + tok, 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0',
-         'Content-Type': 'application/json'}
+
     def call(u, body=None, method=None):
-        r = urllib.request.Request(u, data=json.dumps(body).encode() if body is not None else None,
-                                   headers=H, method=method)
+        """Same contract as before (parsed JSON, or an error dict), on the shared client:
+        keep-alive connection, User-Agent, 20 s timeout, no retry for an order POST.
+        Routing is deliberately unchanged: this script went DIRECT for reads and for its
+        square-off POST, so proxy=False keeps it direct (a routing change on an order
+        endpoint is not something a performance refactor gets to make)."""
         try:
-            return json.load(urllib.request.urlopen(r, timeout=20))
+            return api.request(u, body=body, method=method, proxy=False, timeout=20)
         except Exception as e:
             return {'status': 'error', 'err': str(e)[:120]}
 

@@ -13,6 +13,18 @@ IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 TOKF=os.environ.get("KITE_TOKEN_FILE","/workspace/kite/token.json")
 SEG={"NSE_FO":"NFO","BSE_FO":"BFO","MCX_FO":"MCX"}; RSEG={v:k for k,v in SEG.items()}
 _k=None; _valid=None; _why=""; _dump={}
+# (5 Nov 2026) One run reads the same Kite book several times (trade_lock wants positions+orders,
+# mtf_sizing wants the order book for my tags, the stop scripts want orders AND holdings), and each
+# read is a proxied round trip. These reads are memoised for READ_TTL seconds and dropped by
+# forget() immediately after any write, so nothing can act on a book from before an order.
+READ_TTL=3.0
+_reads={}          # ('orders'|'positions'|'holdings') -> (expires_at, value)
+# (5 Nov 2026) Lookup indexes over the daily CSV masters. dump() already parsed each exchange
+# once, but from_upstox/to_upstox/tick_for then walked the whole list (NFO is ~100k rows) on
+# every single call - that is the hot path in option strikes and MTF stop placement. The
+# indexes are keyed on (path, mtime, size) and keep the FIRST row per key, exactly the row the
+# linear scan returned, so every mapping result is unchanged.
+_idx={}
 def log(msg):
     with open(os.path.join(D,"kite_broker.log"),"a") as f: f.write(f"{datetime.datetime.now(IST):%Y-%m-%d %H:%M:%S} {msg}\n")
 def client():
@@ -45,21 +57,49 @@ def dump(exch):
         raw=urllib.request.urlopen(f"https://api.kite.trade/instruments/{exch}",timeout=60).read().decode()
         open(f,"w").write(raw)
     _dump[exch]=list(csv.DictReader(open(f))); return _dump[exch]
+def _index(exch):
+    """-> (by_token, by_symbol) for one exchange's master, built once per (path, mtime, size)."""
+    rows=dump(exch)
+    f=os.path.join(D,f"kite_instruments_{exch}_{datetime.datetime.now(IST).date()}.csv")
+    try:
+        st=os.stat(f); stamp=(st.st_mtime_ns,st.st_size)
+    except OSError:
+        stamp=None
+    hit=_idx.get(exch)
+    if hit and hit[0]==stamp: return hit[1]
+    by_tok={}; by_sym={}
+    for r in rows:                                  # first row per key wins, as the scan did
+        by_tok.setdefault(r["exchange_token"],r)
+        by_sym.setdefault(r["tradingsymbol"],r)
+    _idx[exch]=(stamp,(by_tok,by_sym))
+    return by_tok,by_sym
 def from_upstox(key):
     """NSE_FO|50978 -> {'exchange':'NFO','tradingsymbol':..,'lot_size':..} or None"""
     try:
         seg,tok=key.split("|"); exch=SEG[seg]
-        for r in dump(exch):
-            if r["exchange_token"]==tok: return {"exchange":exch,"tradingsymbol":r["tradingsymbol"],"lot_size":int(r["lot_size"]),"tick_size":float(r["tick_size"])}
+        r=_index(exch)[0].get(tok)
+        if r is not None: return {"exchange":exch,"tradingsymbol":r["tradingsymbol"],"lot_size":int(r["lot_size"]),"tick_size":float(r["tick_size"])}
     except Exception as e: log(f"map fail {key}: {e}")
     return None
 def to_upstox(exch,tsym):
-    for r in dump(exch):
-        if r["tradingsymbol"]==tsym: return f"{RSEG[exch]}|{r['exchange_token']}"
+    r=_index(exch)[1].get(tsym)
+    if r is not None: return f"{RSEG[exch]}|{r['exchange_token']}"
     return None
 # ---------- reads (normalized to Upstox-like dicts) ----------
+def forget():
+    """Drop the read memo - call after placing/cancelling/modifying an order."""
+    _reads.clear()
+def _memo(name,fn):
+    if READ_TTL>0:
+        hit=_reads.get(name)
+        if hit and hit[0]>__import__("time").monotonic(): return hit[1]
+    val=fn()
+    if READ_TTL>0: _reads[name]=(__import__("time").monotonic()+READ_TTL,val)
+    return val
 def positions():
     if not valid(): return []
+    return _memo("positions",_positions)
+def _positions():
     try: net=client().positions().get("net") or []
     except Exception as e: log(f"positions fail {e}"); return []
     out=[]
@@ -73,6 +113,8 @@ def positions():
 def holdings():
     """Kite holdings normalized: MTF shares carry product MTF, delivery shares CNC. Used by trade_lock R8."""
     if not valid(): return []
+    return _memo("holdings",_holdings)
+def _holdings():
     try: hs=client().holdings() or []
     except Exception as e: log(f"holdings fail {e}"); return []
     out=[]
@@ -90,6 +132,8 @@ def holdings():
     return out
 def orders():
     if not valid(): return []
+    return _memo("orders",_orders)
+def _orders():
     try: od=client().orders() or []
     except Exception as e: log(f"orders fail {e}"); return []
     out=[]
@@ -111,10 +155,10 @@ def order_status(oid):
 # ---------- writes ----------
 def tick_for(exch,tsym,default=0.05):
     """Tick size for a contract; Kite rejects prices off the grid (16283), so round every price to this."""
-    for r in dump(exch):
-        if r["tradingsymbol"]==tsym:
-            try: return float(r.get("tick_size") or default)
-            except Exception: return default
+    r=_index(exch)[1].get(tsym)
+    if r is not None:
+        try: return float(r.get("tick_size") or default)
+        except Exception: return default
     return default
 def snap(p,ts):
     """Round p onto the tick grid ts."""
@@ -130,17 +174,21 @@ def place(exch,tsym,side,qty,price,order_type="LIMIT",trigger=None,tag="auto_ent
     if order_type=="SL": body["trigger_price"]=trigger
     if dry: log("DRY place "+json.dumps(body)); return "DRY"
     if not valid(): log("skip place (kite invalid) "+tsym); return None
-    try: oid=client().place_order(**body); log(f"placed {oid} {json.dumps(body)}"); return oid
+    try:
+        oid=client().place_order(**body); forget(); log(f"placed {oid} {json.dumps(body)}"); return oid
     except Exception as e: log(f"place fail {tsym}: {e}"); return None
 def modify(oid,qty,price,trigger=None,order_type="SL",dry=False):
     if dry: return "DRY"
     if not valid(): return None
-    try: return client().modify_order(variety="regular",order_id=oid,quantity=int(qty),price=round(price,2),trigger_price=round(trigger,2) if trigger else None,order_type=order_type)
+    try:
+        r=client().modify_order(variety="regular",order_id=oid,quantity=int(qty),price=round(price,2),trigger_price=round(trigger,2) if trigger else None,order_type=order_type)
+        forget(); return r
     except Exception as e: log(f"modify fail {oid}: {e}"); return None
 def cancel(oid,dry=False):
     if dry: return "DRY"
     if not valid(): return None
-    try: return client().cancel_order(variety="regular",order_id=oid)
+    try:
+        r=client().cancel_order(variety="regular",order_id=oid); forget(); return r
     except Exception as e: log(f"cancel fail {oid}: {e}"); return None
 if __name__=="__main__":
     a=sys.argv[1:] or ["status"]

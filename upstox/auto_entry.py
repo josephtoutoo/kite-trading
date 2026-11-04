@@ -17,9 +17,10 @@ the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffe
 After a fill the SL is placed and immediately re-verified (sl_confirm.py: re-reads the order book, retries once on a
 tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for the 10-min option monitor to alert on).
 --dry-run: no orders, no state writes, ignores time window."""
-import json,os,sys,gzip,time,datetime,urllib.request,urllib.error,urllib.parse
+import json,os,sys,gzip,time,datetime,urllib.parse
 D=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,D)
 import ind,trade_lock
+import api                     # pooled, timed, proxy-aware client (5 Nov 2026)
 import market_calendar
 import broker_kite as bk
 import sl_confirm as sc
@@ -42,21 +43,29 @@ if not DRY and not market_calendar.is_trading_day(now.date()):
     out["skipped"]="exchange holiday / market closed ("+now.date().isoformat()+")"; done()
 if not DRY and (now.weekday()>=5 or not (datetime.time(9,20)<=now.time()<=datetime.time(14,45))):
     out["skipped"]="outside 09:20-14:45 IST weekday entry window"; done()
-TOK=json.load(open(os.path.join(D,"token.json")))["access_token"]
-H={"Authorization":"Bearer "+TOK,"Accept":"application/json","Content-Type":"application/json","User-Agent":"Mozilla/5.0"}
-op=urllib.request.build_opener(urllib.request.ProxyHandler({"https":os.environ.get("UPSTOX_PROXY_URL",""),"http":os.environ.get("UPSTOX_PROXY_URL","")}) if os.environ.get("UPSTOX_PROXY_URL") else urllib.request.ProxyHandler({}))
 def req(u,body=None,method=None,proxy=False):
-    r=urllib.request.Request(u,data=json.dumps(body).encode() if body is not None else None,headers=H,method=method)
-    try: return json.load((op.open if proxy else urllib.request.urlopen)(r,timeout=20))
-    except urllib.error.HTTPError as e: return {"status":"error","code":e.code,"body":e.read().decode()[:300]}
+    """Parsed JSON, or {'status':'error','code':..,'body':..} exactly as before. One shared
+    keep-alive client; proxy=True forces the static-IP proxy, False forces a direct read.
+    A POST (order) is never retried."""
+    return api.call(u,body=body,method=method,proxy=True if proxy else False,timeout=20)
 def tick(p,t=0.05): return round(max(round(p/t)*t,t),2)
 def master(exch):
+    """Today's contract master for an exchange. Downloaded once when missing, then served from
+    the per-process parse cache - pick() walked the same 4 MB list three times per run (5 Nov 2026)."""
     f=os.path.join(D,f"instruments_{exch}_{now.date()}.json.gz")
     if not os.path.exists(f):
         for o in os.listdir(D):
             if o.startswith(f"instruments_{exch}_"): os.remove(os.path.join(D,o))
-        urllib.request.urlretrieve(f"https://assets.upstox.com/market-quote/instruments/exchange/{exch}.json.gz",f)
-    return json.load(gzip.open(f))
+        _download(f,f"https://assets.upstox.com/market-quote/instruments/exchange/{exch}.json.gz")
+    return api.gzip_json(f)
+
+
+def _download(dest,url):
+    import urllib.request
+    data=urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"}),timeout=60).read()
+    tmp=dest+".part"
+    open(tmp,"wb").write(data)
+    os.replace(tmp,dest)
 def signal(a):
     up=lambda c,e,d: c>e and d==1; dn=lambda c,e,d: c<e and d==-1
     cur_up=up(a["close"],a["ema20"],a["dir"]); prv_up=up(a["prev_close"],a["prev_ema"],a["prev_dir"])
@@ -87,7 +96,9 @@ def quote(k):
     for v in d.values():
         ask=None
         try: ask=float(v["depth"]["sell"][0]["price"]) or None
-        except Exception: pass
+        except Exception as e:
+            # No ask means the limit falls back to LTP*1.005 - a different entry price, so say it.
+            print(f"auto_entry: no sell depth for {k}, pricing off LTP*1.005: {type(e).__name__}: {e}",file=sys.stderr)
         return float(v.get("last_price") or 0),ask
     return 0,None
 pos=req("https://api.upstox.com/v2/portfolio/short-term-positions").get("data") or []

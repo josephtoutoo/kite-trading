@@ -8,17 +8,29 @@ Reserve rule: half of remaining MTF room is reserved for pullback adds; adds may
 Add size per broker: <= 10% of that broker's capital minus current value, and <= 50% total MTF budget minus MTF used.
 Stop: nearer-below of 1h ST / daily EMA20. Target: roll-forward (entry*1.20, +20% steps past LTP).
 Usage: python3 pullback_add.py [--json]"""
-import json, sys, os, gzip, glob, urllib.request
-sys.path.insert(0, '/workspace/upstox'); import ind
+import json, sys, os, glob
+sys.path.insert(0, '/workspace/upstox'); import ind, api
 JS = '--json' in sys.argv
-TOK = json.load(open('/workspace/upstox/token.json'))['access_token']
+TOK = None      # the shared client attaches the bearer token itself (5 Nov 2026)
 PER, TOT, STEP = 0.10, 0.50, 0.20
 def get(p):
-    r = urllib.request.Request('https://api.upstox.com'+p, headers={'Authorization':'Bearer '+TOK,'Accept':'application/json','User-Agent':'Mozilla/5.0'})
-    return json.load(urllib.request.urlopen(r, timeout=20))
+    return api.get(p)
+
+
+_KM = {}
+
+
 def keymap():
+    """Newest NSE master, parsed once per process (was re-read and re-parsed on every call)."""
     f = sorted(glob.glob('/workspace/upstox/instruments_NSE_*.json.gz'))[-1]
-    return {x['trading_symbol']: x['instrument_key'] for x in json.load(gzip.open(f)) if x.get('segment')=='NSE_EQ' and x.get('instrument_type')=='EQ'}
+    st = os.stat(f)
+    hit = _KM.get(f)
+    if hit and hit[0] == (st.st_mtime_ns, st.st_size):
+        return dict(hit[1])
+    km = {x['trading_symbol']: x['instrument_key'] for x in api.gzip_json(f)
+          if x.get('segment')=='NSE_EQ' and x.get('instrument_type')=='EQ'}
+    _KM.clear(); _KM[f] = ((st.st_mtime_ns, st.st_size), km)
+    return dict(km)
 def rsi(c, n=14):
     g=[max(c[i]-c[i-1],0) for i in range(1,len(c))]; l=[max(c[i-1]-c[i],0) for i in range(1,len(c))]
     ag, al = ind.rma(g,n), ind.rma(l,n)
@@ -69,7 +81,8 @@ def kite_side(km):
         for h in k.holdings():
             if int(h.get('mtf',{}).get('quantity') or 0)>0 and not any(o['sym']==h['tradingsymbol'] for o in out):
                 out.append(dict(broker='kite',sym=h['tradingsymbol'],qty=int(h['mtf']['quantity']),avg=float(h['mtf'].get('average_price') or h['average_price']),key=km.get(h['tradingsymbol'])))
-    except Exception: pass
+    except Exception as e:
+        print(f'pullback_add: Kite holdings read failed: {type(e).__name__}: {e}', file=sys.stderr)
     return cap,out,'ok'
 def main():
     km=keymap(); notes=[]

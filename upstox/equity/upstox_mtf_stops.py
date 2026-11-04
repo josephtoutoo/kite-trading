@@ -17,10 +17,11 @@ CLI: python3 upstox_mtf_stops.py [--dry-run] [--pct 5] [--at HH:MM]
   --dry-run  print every action, place/cancel nothing, write no state
   --at       evaluate trade_lock at HH:MM today instead of now (out-of-hours preview only)
 """
-import sys, os, json, datetime, urllib.request, urllib.parse
+import sys, os, json, datetime, urllib.parse
 
 sys.path.insert(0, '/workspace/upstox')
 sys.path.insert(0, '/workspace/equity')
+import api                     # pooled, proxied, timed client (5 Nov 2026)
 D = os.path.dirname(os.path.abspath(__file__))
 STOPFILE = os.path.join(D, 'mtf_stops_upstox.json')
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -38,21 +39,12 @@ def is_dry():
     return '--dry-run' in sys.argv or '--dry' in sys.argv
 
 LIVE = ('trigger pending', 'open', 'open pending', 'modify pending')
-TOK = json.load(open('/workspace/upstox/token.json'))['access_token']
-H = {'Authorization': 'Bearer ' + TOK, 'Accept': 'application/json', 'Content-Type': 'application/json',
-     'User-Agent': 'Mozilla/5.0'}
-_px = os.environ.get('UPSTOX_PROXY_URL')
-op = urllib.request.build_opener(urllib.request.ProxyHandler({'https': _px, 'http': _px})) if _px \
-    else urllib.request.build_opener()
 
 
 def req(u, body=None, method=None):
-    r = urllib.request.Request(u, data=json.dumps(body).encode() if body is not None else None,
-                               headers=H, method=method)
-    try:
-        return json.load(op.open(r, timeout=25))
-    except Exception as e:
-        return {'status': 'error', 'body': f'{type(e).__name__}: {str(e)[:200]}'}
+    """Parsed JSON, or {'status':'error', ...} - the shape this script already handled.
+    Shared keep-alive client, static-IP proxy, 25 s timeout, no retry on a write."""
+    return api.call(u, body=body, method=method, proxy=True, timeout=25)
 
 
 def tick_for(p):
@@ -81,7 +73,11 @@ def st_1h(key):
         import ind
         a = ind.analyze(key, 'hours', 1, 30)
         return a.get('st'), a.get('dir')
-    except Exception:
+    except Exception as e:
+        # Not fatal (the 5% stop still applies), but it must not be silent: a missing 1h series
+        # is how a stop quietly ends up looser than the rule intends.
+        print(f'upstox_mtf_stops: 1h Supertrend unavailable for {key}: {type(e).__name__}: {e}',
+              file=sys.stderr)
         return None, None
 
 

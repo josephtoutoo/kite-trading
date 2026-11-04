@@ -12,7 +12,7 @@ Only fires once per calendar day (state in crude_pe_watch.json). Run only during
 
 CLI: python3 crude_pe_watch.py [--dry] [--status]
 """
-import os, sys, json, datetime, urllib.request, urllib.parse
+import os, sys, json, datetime, urllib.parse
 
 D = os.path.dirname(os.path.abspath(__file__))
 STATE = os.path.join(D, 'crude_pe_watch.json')
@@ -26,16 +26,12 @@ STATUS = '--status' in sys.argv
 
 sys.path.insert(0, '/workspace/upstox')
 import trade_lock as tl
-
-TOK = json.load(open('/workspace/upstox/token.json'))['access_token']
-H = {'Authorization': 'Bearer ' + TOK, 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0'}
-op = urllib.request.build_opener(urllib.request.ProxyHandler(
-    {'https': os.environ['UPSTOX_PROXY_URL'], 'http': os.environ['UPSTOX_PROXY_URL']}))
+import api                     # pooled, proxied, timed client (5 Nov 2026)
 
 
 def quote(key):
     u = 'https://api.upstox.com/v2/market-quote/quotes?instrument_key=' + urllib.parse.quote(key, safe='')
-    d = json.load(op.open(urllib.request.Request(u, headers=H), timeout=25)).get('data') or {}
+    d = api.request(u, method='GET', proxy=True, timeout=25).get('data') or {}
     return list(d.values())[0] if d else {}
 
 
@@ -103,10 +99,8 @@ def main():
     body = {'quantity': int(adj), 'product': 'D', 'validity': 'DAY', 'price': price, 'tag': 'crude_pe',
             'instrument_token': PE_KEY, 'order_type': 'LIMIT', 'transaction_type': 'BUY',
             'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}
-    H2 = dict(H); H2['Content-Type'] = 'application/json'
     try:
-        r = json.load(op.open(urllib.request.Request('https://api-hft.upstox.com/v2/order/place',
-                                                     data=json.dumps(body).encode(), headers=H2, method='POST'), timeout=25))
+        r = api.request('https://api-hft.upstox.com/v2/order/place', body, 'POST', proxy=True, timeout=25)
         oid = (r.get('data') or {}).get('order_id')
         out['action'] = 'BUY placed'
         out['order'] = oid
@@ -125,9 +119,12 @@ def main():
 def commodity_margin():
     u = 'https://api.upstox.com/v2/user/get-funds-and-margin'
     try:
-        d = json.load(op.open(urllib.request.Request(u, headers=H), timeout=20)).get('data') or {}
+        d = api.request(u, method='GET', proxy=True, timeout=20).get('data') or {}
         return float((d.get('commodity') or {}).get('available_margin') or 0)
-    except Exception:
+    except Exception as e:
+        # None means "unknown", and the caller then skips the purse check - so it must be visible.
+        print(f'crude_pe_watch: commodity margin unavailable, purse check skipped: {type(e).__name__}: {e}',
+              file=sys.stderr)
         return None
 
 
