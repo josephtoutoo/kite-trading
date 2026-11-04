@@ -40,6 +40,7 @@ if pr.get("status")!="success": print(json.dumps({"error":"positions fetch faile
 pos=pr.get("data") or []
 # --- account-wide loss circuit breaker (no auto-close; per-trade stops keep running) ---
 import trade_lock
+import sl_confirm as sc  # clears SL_CONFIRM_FAILED once a live SL is seen
 day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos)
 breaker={"day_pnl":round(day_pnl,2),"threshold":-trade_lock.THRESHOLD,"locked":False}
 if day_pnl< -trade_lock.THRESHOLD:
@@ -106,8 +107,10 @@ for p in pos:
         if not sls:
             r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"trailsl","instrument_token":k,"order_type":"SL","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":stop,"is_amo":False})
             acts.append({**info,"action":"PLACE_SL","resp":r.get("status"),"err":r.get("body")})
+            if not DRY and r.get("status")=="success": sc.clear("upstox",sym)
         else:
             o=sls[0]
+            if not DRY: sc.clear("upstox",sym)
             if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:
                 t2=max(stop,o["trigger_price"])
                 r=write("https://api-hft.upstox.com/v2/order/modify",{"order_id":o["order_id"],"quantity":q,"validity":"DAY","price":tick(t2*(0.99 if fut else 0.95)),"order_type":"SL","trigger_price":t2,"disclosed_quantity":0},method="PUT")
@@ -206,7 +209,9 @@ try:
                 else: s["stop"]=stop
                 lim=tick(stop*(0.99 if fut else 0.95))
                 info={"sym":sym,"broker":"kite","qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
-                if not sls: kacts.append({**info,"action":"PLACE_SL","resp":bk.place(ex,sym,"SELL",q,lim,order_type="SL",trigger=stop,tag="trailsl",product=p["product"],dry=DRY)})
+                if not sls:
+                    kacts.append({**info,"action":"PLACE_SL","resp":bk.place(ex,sym,"SELL",q,lim,order_type="SL",trigger=stop,tag="trailsl",product=p["product"],dry=DRY)})
+                    if not DRY: sc.clear("kite",sym)
                 else:
                     o=sls[0]
                     if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:

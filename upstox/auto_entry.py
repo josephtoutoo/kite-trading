@@ -11,11 +11,14 @@ tag auto_entry; cancel if unfilled after 2 min.
 Kite (4 Nov): same signal also buys 2 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
 the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffected. On fill: trade_lock.record_entry, risk_state.json
 (entry, target +20%, stop -30%), seen_entries.json. One open position per index max.
+After a fill the SL is placed and immediately re-verified (sl_confirm.py: re-reads the order book, retries once on a
+tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for the 10-min option monitor to alert on).
 --dry-run: no orders, no state writes, ignores time window."""
 import json,os,sys,gzip,time,datetime,urllib.request,urllib.error,urllib.parse
 D=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,D)
 import ind,trade_lock
 import broker_kite as bk
+import sl_confirm as sc
 DRY="--dry-run" in sys.argv
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
@@ -171,5 +174,20 @@ for name,cfg in IDX.items():
                 r["kite"]["action"]=f"ENTERED {kfill} {kleg['tradingsymbol']} @ {ka} on Kite; target {round(ka*1.2,2)} stop {tick(ka*0.7)}"
             else: r["kite"]["action"]="Kite not filled in 2 min - cancelled"
         json.dump(s,open(SF,"w"),indent=1); json.dump(seen,open(SEEN,"w"),indent=1)
+        # ---- post-placement confirmation (4 Nov): SL must be LIVE before this counts as an entered trade ----
+        if fill>0:
+            try:
+                c=sc.guard_upstox(best["trading_symbol"],best["instrument_key"],fill,avg,product=body.get("product","I"),
+                                  target=s[best["instrument_key"]]["target"],tick=t,entry_order=oid)
+                r["sl_check"]={k:c.get(k) for k in ("ok","sl","sl_trigger","sl_status","target_live","attempts","reasons")}
+                if not c["ok"]: r["action"]+=" | SL_CONFIRM_FAILED (see sl_confirm_failures.json)"
+            except Exception as e: r["sl_check"]={"ok":False,"error":f"{type(e).__name__}: {e}"}
+        if kfill>0:
+            try:
+                c=sc.guard_kite(kleg["exchange"],kleg["tradingsymbol"],kfill,ka,product="NRML",
+                                target=s[kk]["target"],tick=bk.tick_for(kleg["exchange"],kleg["tradingsymbol"]),entry_order=koid)
+                r["kite"]["sl_check"]={k:c.get(k) for k in ("ok","sl","sl_trigger","sl_status","target_live","attempts","reasons")}
+                if not c["ok"]: r["kite"]["action"]+=" | SL_CONFIRM_FAILED (see sl_confirm_failures.json)"
+            except Exception as e: r["kite"]["sl_check"]={"ok":False,"error":f"{type(e).__name__}: {e}"}
     except Exception as e: r["error"]=f"{type(e).__name__}: {e}"
 done()
