@@ -92,12 +92,13 @@ for p in pos:
         acts.append({"sym":sym,"action":"CANCEL_DUP_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
     sls=sls[:1]
     floor=0
-    # ---- exit rule D (4 Nov, t287u): 30% fixed floor + trend exit once the trade is up >=15% ----
-    # A pure trend exit cut winners in the backtest (avg +5% vs +12%), so trend is used to PROTECT a winner,
-    # not to defend a loser. Losses are bounded by the 30% floor under entry; winners are let run until the
-    # underlying trend turns (index opts 5m, stock opts 15m) - only after s["high"] has been +15% above entry.
-    ok,why=trend_ok(sym) if not fut else (True,"futures use the % trail")
-    if not fut and s["high"]>=avg*1.15 and not ok:
+    # ---- exit rule (4 Nov, t287u/t288u): INDEX OPTIONS ONLY get the trend exit ----
+    # Losses are always bounded by a fixed 30% floor under entry. For index options, once the contract's high
+    # is 15% above entry the exit also follows the underlying 5m trend (CE sold when close<EMA20 with
+    # Supertrend red, PE the opposite), so winners run. Stock options and futures keep the plain % stop.
+    INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
+    ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
+    if INDEX_OPT and s["high"]>=avg*1.15 and not ok:
         for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
         lim=tick(ltp*0.995)
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
@@ -203,8 +204,9 @@ try:
             sls=kpending(sym)
             for o in sls[1:]: kacts.append({"sym":sym,"broker":"kite","action":"CANCEL_DUP_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
             sls=sls[:1]; floor=0
-            ok,why=trend_ok(sym) if not fut else (True,"futures use the % trail")
-            if not fut and s["high"]>=avg*1.15 and not ok:
+            INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
+            ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
+            if INDEX_OPT and s["high"]>=avg*1.15 and not ok:
                 for o in sls: bk.cancel(o["order_id"],dry=DRY)
                 lim=tick(ltp*0.995)
                 r=bk.place(ex,sym,"SELL",q,lim,tag="target_book",product=p["product"],dry=DRY)
