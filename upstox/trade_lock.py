@@ -190,6 +190,7 @@ def check_order(order,broker="upstox"):
     kpos,kord=kite_data()
     filled=[o for o in orders+kord if o.get("status")=="complete" and (_ts(o) or now)<=now]
     upos=pos
+    umtf=mtf          # captured before a Kite book shadows `mtf` below
     if broker=="kite":
         pos=kpos+_kite_holdings(); mtf=_kite_mtf()
     block=[]; flags=[]; adj=qty
@@ -199,7 +200,10 @@ def check_order(order,broker="upstox"):
     ltp=_ltp(order,allpos)
     if side=="BUY":
         # rule 2b: account day loss breaker / reduced day
-        day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in upos+kpos)
+        # (5 Nov) Upstox MTF equity lives in /v3/portfolio/mtf-positions, NOT in short-term-positions,
+        # so its P&L was missing from this breaker: a six-name MTF book could lose money all day and
+        # never trip the Rs 30,000 cutoff. Both brokers, all three books, now feed it.
+        day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in upos+umtf+kpos)
         if day_pnl< -THRESHOLD: block.append(f"R2: combined (Upstox+Kite) day P&L Rs {day_pnl:,.0f} < -30,000 - no new trades today")
         ok,fac,why=can_enter(1)
         if not ok: block.append("R2: "+why)

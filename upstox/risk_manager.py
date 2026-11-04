@@ -44,7 +44,13 @@ pos=pr.get("data") or []
 import trade_lock
 import market_calendar
 import sl_confirm as sc  # clears SL_CONFIRM_FAILED once a live SL is seen
-day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos)
+# (5 Nov) include Upstox MTF equity P&L: it is not in short-term-positions, so the breaker used to
+# miss it. One bad MTF day could cross the Rs 30,000 cutoff without ever locking the account.
+try:
+    _mtfp=(req("https://api.upstox.com/v3/portfolio/mtf-positions").get("data") or [])
+except Exception:
+    _mtfp=[]
+day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos+_mtfp)
 breaker={"day_pnl":round(day_pnl,2),"threshold":-trade_lock.THRESHOLD,"locked":False}
 if day_pnl< -trade_lock.THRESHOLD:
     breaker["locked"]=True; breaker["lock"]=trade_lock.lock(-day_pnl,f"day loss Rs {-day_pnl:,.0f} > Rs 30,000",dry=DRY)
