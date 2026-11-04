@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatic NIFTY/SENSEX option entries (user standing permission from 4 Nov 2026, 2 lots/trade).
+"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026, 2 lots/trade).
 Run every 5 min by a routine. Acts only 09:20-14:45 IST Mon-Fri (risk_manager handles exits till 15:25).
 Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   CE: close > EMA20 and Supertrend green, previous candle not both; MACD hist > 0; ADX >= 18
@@ -17,17 +17,26 @@ tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for 
 import json,os,sys,gzip,time,datetime,urllib.request,urllib.error,urllib.parse
 D=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,D)
 import ind,trade_lock
+import market_calendar
 import broker_kite as bk
 import sl_confirm as sc
 DRY="--dry-run" in sys.argv
+# User rule (4 Nov 2026, refined): the expiry-week intraday-only rule applies to STOCK options only.
+# This script trades index options only (NIFTY/BANKNIFTY/SENSEX), so they keep normal carry (NRML) -
+# in_expiry_week always returns False here. expiry_squareoff.py enforces the rule for stock options.
+def in_expiry_week(exp_date):
+    return False
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
 LOTS=2; ADX_MIN=18
 IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO"},
+     "BANKNIFTY":{"key":"NSE_INDEX|Nifty Bank","exch":"NSE","seg":"NSE_FO"},
      "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO"}}
 SF=os.path.join(D,"risk_state.json"); SEEN=os.path.join(D,"seen_entries.json")
 out={"now":now.strftime("%Y-%m-%d %H:%M IST"),"dry_run":DRY,"rules":f"fresh 5m cross EMA20+Supertrend, MACD hist in direction, ADX>={ADX_MIN} (anti-chop)","indices":{}}
 def done(): print(json.dumps(out,indent=1,default=str)); sys.exit(0)
+if not DRY and not market_calendar.is_trading_day(now.date()):
+    out["skipped"]="exchange holiday / market closed ("+now.date().isoformat()+")"; done()
 if not DRY and (now.weekday()>=5 or not (datetime.time(9,20)<=now.time()<=datetime.time(14,45))):
     out["skipped"]="outside 09:20-14:45 IST weekday entry window"; done()
 TOK=json.load(open(os.path.join(D,"token.json")))["access_token"]
@@ -95,6 +104,9 @@ for name,cfg in IDX.items():
         if t>1: t=t/100  # some masters give paise
         px=tick(ask if ask else ltp*1.005,t); r["ltp"]=ltp; r["ask"]=ask; r["limit"]=px
         lot=int(best["lot_size"])
+        ekw=in_expiry_week(exp)
+        r["expiry_week"]=ekw
+        r["carry"]="intraday only (expiry week)" if ekw else "positional"
         # ---- Kite leg plan (checked BEFORE any order so the pair is one decision; never blocks Upstox) ----
         kleg=None
         try:
@@ -106,7 +118,8 @@ for name,cfg in IDX.items():
                 elif kopen: r["kite"]={"action":"skip: Kite position already open","open":[p["trading_symbol"] for p in kopen]}
                 else:
                     kq=LOTS*m["lot_size"]
-                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":"NRML","quantity":kq,"price":px}
+                    kprod="MIS" if ekw else "NRML"
+                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px}
                     kok,kre,kadj=trade_lock.check_order(ko,broker="kite"); kadj=(kadj//m["lot_size"])*m["lot_size"]
                     r["kite"]={"symbol":m["tradingsymbol"],"exchange":m["exchange"],"qty":kq,"check":{"allowed":kok,"reasons":kre,"adjusted_qty":kadj}}
                     if kok and kadj>0: kleg={**m,"qty":kadj}
@@ -131,13 +144,13 @@ for name,cfg in IDX.items():
         if uleg:
             body={"quantity":uleg,"product":"I","validity":"DAY","price":px,"tag":"auto_entry","instrument_token":best["instrument_key"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False}
             pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
-            if pr.get("status")!="success" and "product" in json.dumps(pr).lower():
+            if pr.get("status")!="success" and "product" in json.dumps(pr).lower() and not ekw:
                 body["product"]="D"; pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
             oid=(pr.get("data") or {}).get("order_id")
             if not oid: r["action"]="order rejected"; r["resp"]={"code":pr.get("code"),"body":pr.get("body")}
             else: r["order_id"]=oid
         if kleg:
-            koid=bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,tag="auto_entry",product="NRML")
+            koid=bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,tag="auto_entry",product=kprod)
             r["kite"]["order_id"]=koid
             if not koid: r["kite"]["action"]="Kite order failed (see kite_broker.log)"
         st="open"; fill=0; avg=px; kst=None
@@ -159,7 +172,7 @@ for name,cfg in IDX.items():
         if oid:
             r["status"]=st; r["filled"]=fill
             if fill>0:
-                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry"}
+                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry","intraday":ekw}
                 s.setdefault("_min_stop_by_symbol",{})[best["trading_symbol"]]=tick(avg*0.7)
                 seen[oid]={"sym":best["trading_symbol"],"qty":fill,"avg":avg,"time":now.isoformat(),"source":"auto_entry"}
                 r["action"]=f"ENTERED {fill} {best['trading_symbol']} @ {avg}; target {round(avg*1.2,2)} stop {tick(avg*0.7)}"
@@ -184,7 +197,7 @@ for name,cfg in IDX.items():
             except Exception as e: r["sl_check"]={"ok":False,"error":f"{type(e).__name__}: {e}"}
         if kfill>0:
             try:
-                c=sc.guard_kite(kleg["exchange"],kleg["tradingsymbol"],kfill,ka,product="NRML",
+                c=sc.guard_kite(kleg["exchange"],kleg["tradingsymbol"],kfill,ka,product=kprod,
                                 target=s[kk]["target"],tick=bk.tick_for(kleg["exchange"],kleg["tradingsymbol"]),entry_order=koid)
                 r["kite"]["sl_check"]={k:c.get(k) for k in ("ok","sl","sl_trigger","sl_status","target_live","attempts","reasons")}
                 if not c["ok"]: r["kite"]["action"]+=" | SL_CONFIRM_FAILED (see sl_confirm_failures.json)"

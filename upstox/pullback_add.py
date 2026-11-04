@@ -95,6 +95,15 @@ def main():
             val=p['qty']*last; gap=min(PER*cap-val, TOT*cap-used[p['broker']])
             r['cap_10pct']=round(PER*cap); r['value']=round(val); r['add_qty']=max(int(gap//last),0)
             room=max(TOT*cap-used[p['broker']],0); r['reserve_room']=round(room/2); r['from_reserve']=round(min(r['add_qty']*last,room/2))
+            # margin gate: shrink the add to what the broker's margin API covers right now
+            if r['add_qty']>0:
+                try:
+                    import mtf_sizing as ms
+                    g=ms.size(p['broker'],p['sym'],last,mode='add')
+                    if g['qty']<r['add_qty']:
+                        r['add_qty']=g['qty']; r['margin_limited']=True
+                    r['margin_req']=g.get('margin'); r['leverage']=g.get('leverage')
+                except Exception as e: r['margin_check']=f'failed: {type(e).__name__}'
         else: r['add_qty']=None
         if not a['d_up']: v,n='NO','daily trend broken - trim/exit rules apply'
         elif pnl< -0.5: v,n='NO','position in loss - no averaging down'

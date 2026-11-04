@@ -17,9 +17,13 @@ INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FIN
 STOCK_OPT_MAX_UND=3
 def today(): return datetime.datetime.now(IST).date()
 def next_trading_day(d):
-    d=d+datetime.timedelta(days=1)
-    while d.weekday()>=5: d+=datetime.timedelta(days=1)
-    return d
+    try:
+        import market_calendar
+        return market_calendar.next_trading_day(d)
+    except Exception:
+        d=d+datetime.timedelta(days=1)
+        while d.weekday()>=5: d+=datetime.timedelta(days=1)
+        return d
 def load(): return json.load(open(LF)) if os.path.exists(LF) else {}
 def save(s): json.dump(s,open(LF,"w"),indent=1)
 def lock(loss,reason,dry=False):
@@ -101,6 +105,30 @@ def _kite_holdings():
         _cache["_kiteh"]=bk.holdings() if bk.valid() and hasattr(bk,"holdings") else []
     except Exception: _cache["_kiteh"]=[]
     return _cache["_kiteh"]
+def _kite_mtf():
+    """Kite MTF rows normalized for R10 (4 Nov: this used to be an empty list, so Kite's
+    10%/50% MTF caps never fired). Uses holdings.mtf.quantity plus open MTF day positions."""
+    if "_kitemtf" in _cache: return _cache["_kitemtf"]
+    rows=[]
+    try:
+        import broker_kite as bk
+        if bk.valid():
+            seen={}
+            for p in bk.positions():
+                if p.get("product")=="MTF" and int(p.get("quantity") or 0)>0 and p.get("exchange") in ("NSE","BSE"):
+                    seen[p["trading_symbol"]]=dict(p)
+            for h in bk.holdings():
+                m=h.get("mtf") or {}
+                q=int(m.get("quantity") or 0)
+                if q>0:
+                    d=dict(h); d["quantity"]=q
+                    d["average_price"]=float(m.get("average_price") or h.get("average_price") or 0)
+                    d["product"]="MTF"; seen[h["trading_symbol"]]=d
+            rows=list(seen.values())
+    except Exception:
+        rows=[]
+    _cache["_kitemtf"]=rows
+    return rows
 def _decisions(filled,now):
     """Index-option BUY decisions today across brokers: an Upstox+Kite pair (same index, same CE/PE, within 5 min,
     different brokers) counts as ONE decision."""
@@ -125,11 +153,18 @@ def check_order(order,broker="upstox"):
     funds=_data("/v2/user/get-funds-and-margin") or {}
     eq=funds.get("equity",{}) if isinstance(funds,dict) else {}
     capital=float(eq.get("available_margin") or 0)+float(eq.get("used_margin") or 0)
+    if broker=="kite":
+        try:
+            import broker_kite as bk
+            if bk.valid():
+                m=bk.client().margins("equity")
+                capital=float(m.get("net") or 0)+float(m.get("utilised",{}).get("debits") or 0)
+        except Exception: pass
     kpos,kord=kite_data()
     filled=[o for o in orders+kord if o.get("status")=="complete" and (_ts(o) or now)<=now]
     upos=pos
     if broker=="kite":
-        pos=kpos+_kite_holdings(); mtf=[]
+        pos=kpos+_kite_holdings(); mtf=_kite_mtf()
     block=[]; flags=[]; adj=qty
     allpos=pos+[m for m in mtf if m.get("instrument_token") not in {p.get("instrument_token") for p in pos}]
     held=[p for p in allpos if p.get("instrument_token")==k or (sym and sym_of(p)==sym)]

@@ -31,6 +31,22 @@ def score(key):
     if not up1h: s -= 40
     return dict(close=h['close'], adx=h['adx'], hist=h['hist'], dist=round(dist,2), up1h=up1h, upd=upd,
                 strong=up1h and upd, score=round(s,1))
+def scan(symbols=None, sleep=0.15):
+    """Rank NIFTY100 names by the same technical score; returns strong candidates only.
+    READ ONLY. Used by rotation.py and by the pre-market top-3 picker."""
+    km = keymap()
+    pos = get('/v3/portfolio/mtf-positions').get('data') or []
+    held = {(p.get('trading_symbol') or '').replace('-EQ','') for p in pos if (p.get('quantity') or 0) > 0}
+    watch = [s.replace('-EQ','') for s in (symbols or NIFTY100) if s.replace('-EQ','') not in held]
+    out = []
+    for s in watch:
+        if s not in km: continue
+        try: out.append(dict(sym=s, key=km[s], **score(km[s])))
+        except Exception: pass
+        time.sleep(sleep)
+    return sorted(out, key=lambda x: -x['score']), held
+
+
 def main():
     km = keymap()
     f = get('/v2/user/get-funds-and-margin')['data']['equity']

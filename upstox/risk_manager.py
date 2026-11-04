@@ -12,11 +12,14 @@ Kite (4 Nov): also manages Kite long options/futures (Upstox LTP+trend, Kite SL/
 import json,os,sys
 sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
 import json,urllib.request,urllib.error,datetime
+import market_calendar
 DRY="--dry-run" in sys.argv
 D=os.path.dirname(os.path.abspath(__file__))
 SF=os.path.join(D,"risk_state.json")
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
+if not DRY and not market_calendar.is_trading_day(now.date()):
+    print(json.dumps({"skipped":"exchange holiday / market closed","now":now.isoformat()})); sys.exit(0)
 if not DRY and (now.weekday()>=5 or not (datetime.time(9,15)<=now.time()<=datetime.time(15,25))):
     print(json.dumps({"skipped":"outside 09:15-15:25 IST weekday window","now":now.isoformat()})); sys.exit(0)
 t=json.load(open(os.path.join(D,"token.json")))["access_token"]
@@ -30,7 +33,7 @@ def write(u,body=None,method=None):
     if DRY: return {"status":"dry-run"}
     return req(u,body,method)
 def tick(p): return round(round(p/0.05)*0.05,2)
-def isopt(sym): return sym.endswith("CE") or sym.endswith("PE")
+def isopt(sym): return len(sym)>2 and sym[-2:] in("CE","PE") and sym[-3].isdigit()  # BAJFINANCE ends in CE: require strike digit
 st=json.load(open(SF)) if os.path.exists(SF) else {}
 seeds=st.setdefault("_min_stop_by_symbol",{})
 for sym,v in {"INDHOTEL26NOV830CE":14.75,"SENSEX26N0576500CE":367.5,"PAYTM26NOV1720CE":44.25,"GLENMARK26NOV2400CE":56.3}.items():
@@ -40,6 +43,7 @@ if pr.get("status")!="success": print(json.dumps({"error":"positions fetch faile
 pos=pr.get("data") or []
 # --- account-wide loss circuit breaker (no auto-close; per-trade stops keep running) ---
 import trade_lock
+import market_calendar
 import sl_confirm as sc  # clears SL_CONFIRM_FAILED once a live SL is seen
 day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos)
 breaker={"day_pnl":round(day_pnl,2),"threshold":-trade_lock.THRESHOLD,"locked":False}
