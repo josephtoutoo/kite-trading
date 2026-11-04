@@ -16,7 +16,13 @@ the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffe
 (entry, target +20%, stop -30%), seen_entries.json. One open position per index max.
 After a fill the SL is placed and immediately re-verified (sl_confirm.py: re-reads the order book, retries once on a
 tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for the 10-min option monitor to alert on).
---dry-run: no orders, no state writes, ignores time window."""
+--dry-run: no orders, no state writes, ignores time window.
+t336u (4 Nov 2026): lot size is no longer fixed. `lots` comes from equity/book_sizing.py, which sizes
+from free capital, the premium actually quoted, the 5m ADX tier, whether the daily trend agrees, the
+expiry-day multiplier and the index-option book's weight. The old 3-lot / 5-on-expiry answer (size_lots)
+is kept as the fallback for a missing input or a sizing error, and --fixed-size forces it outright.
+The chosen lots, the reason, and the inputs used are written to r["size"], r["size_lots"] and
+r["size_inputs"]. No cap in trade_lock.py is changed or bypassed - it still re-checks every order."""
 import json,os,sys,gzip,time,datetime,urllib.parse
 D=os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0,D)
 import ind,trade_lock
@@ -25,6 +31,9 @@ import market_calendar
 import broker_kite as bk
 import sl_confirm as sc
 DRY="--dry-run" in sys.argv
+# t336u (4 Nov 2026): sizes come from capital + market conditions via equity/book_sizing.py.
+# --fixed-size forces the old 3-lot / 5-on-expiry behaviour; any sizing failure falls back to it too.
+FIXED="--fixed-size" in sys.argv
 # User rule (4 Nov 2026, refined): the expiry-week intraday-only rule applies to STOCK options only.
 # This script trades index options only (NIFTY/BANKNIFTY/SENSEX), so they keep normal carry (NRML) -
 # in_expiry_week always returns False here. expiry_squareoff.py enforces the rule for stock options.
@@ -101,6 +110,69 @@ def size_lots(expire_today, strong_aligned, sig, raw=None, sside=None):
     return LOTS, None
 
 
+# ---------------- t336u: capital- and conditions-driven sizing ----------------
+_CAP={}
+def free_capital():
+    """Equity free margin (available_margin) from Upstox, read once per process. None on failure -
+    the caller then keeps the fixed size rather than sizing on a number it could not read."""
+    if "v" in _CAP: return _CAP["v"]
+    v=None
+    try:
+        eq=(req("https://api.upstox.com/v2/user/get-funds-and-margin").get("data") or {}).get("equity") or {}
+        avail=eq.get("available_margin")
+        v=float(avail) if avail is not None else None
+    except Exception as e:
+        print(f"auto_entry: free capital unreadable, keeping the fixed size: {type(e).__name__}: {e}",file=sys.stderr)
+        v=None
+    _CAP["v"]=v
+    return v
+
+
+def book_weight(book="index_options"):
+    """This book's weight from equity/book_sizing.py, or None (caller keeps the fixed size)."""
+    if "w" in _CAP: return _CAP["w"].get(book)
+    w={}
+    try:
+        sys.path.insert(0,"/workspace/equity")
+        import book_sizing as bsz
+        w=bsz.book_weights()
+    except Exception as e:
+        print(f"auto_entry: book weights unavailable, keeping the fixed size: {type(e).__name__}: {e}",file=sys.stderr)
+        w={}
+    _CAP["w"]=w
+    return w.get(book)
+
+
+def sized_lots(premium, lot_size, adx, daily_aligned, expire_today, fallback_lots, fallback_note):
+    """(lots, note) from book_sizing, or exactly (fallback_lots, fallback_note) when anything is
+    missing or the module raises. A sizing bug must never stop the entry routine, and must never
+    produce a size the caps do not allow - trade_lock still re-checks every order downstream."""
+    if FIXED:
+        return fallback_lots, (fallback_note or f"{fallback_lots} lots")+" | fixed size (--fixed-size)"
+    try:
+        cap=free_capital(); wgt=book_weight("index_options")
+        if not premium or not lot_size or cap is None or wgt is None or adx is None:
+            return fallback_lots, (fallback_note or f"{fallback_lots} lots")+" | fixed size (sizing input missing)"
+        sys.path.insert(0,"/workspace/equity")
+        import book_sizing as bsz
+        lots,note=bsz.index_option_lots(premium,lot_size,cap,adx,daily_aligned,expire_today,wgt)
+        lots=int(lots)
+        if lots<0 or lots>bsz.MAX_LOTS:
+            return fallback_lots, (fallback_note or f"{fallback_lots} lots")+f" | fixed size (sized {lots} outside 0..{bsz.MAX_LOTS})"
+        return lots, f"{lots} lot(s): {note}"
+    except Exception as e:
+        print(f"auto_entry: dynamic sizing failed, using the fixed size: {type(e).__name__}: {e}",file=sys.stderr)
+        return fallback_lots, (fallback_note or f"{fallback_lots} lots")+f" | fixed size (sizing error {type(e).__name__})"
+
+
+def daily_dir(key):
+    """Daily trend direction (+1/-1), or None if it cannot be read."""
+    try: return ind.analyze(key,"days",1,60).get("dir")
+    except Exception as e:
+        print(f"auto_entry: daily trend unavailable for {key}: {type(e).__name__}: {e}",file=sys.stderr)
+        return None
+
+
 def pick(name,cfg,side,spot):
     ins=[x for x in master(cfg["exch"]) if x.get("segment")==cfg["seg"] and x.get("instrument_type")==side and x.get("underlying_symbol",x.get("name",""))==name]
     today_ms=int(datetime.datetime.combine(now.date(),datetime.time(0),IST).timestamp()*1000)
@@ -144,6 +216,22 @@ for name,cfg in IDX.items():
         if t>1: t=t/100  # some masters give paise
         px=tick(ask if ask else ltp*1.005,t); r["ltp"]=ltp; r["ask"]=ask; r["limit"]=px
         lot=int(best["lot_size"])
+        # t336u: re-size on the real premium just quoted. Until now `lots` is the old fixed answer,
+        # which is also the fallback if the dynamic sizing cannot run.
+        # A degenerate quote (no LTP and no ask -> px would be 5 paise) must NOT be sized: a 5-paise
+        # premium would "afford" MAX_LOTS. Keep the fixed size and say why.
+        quoted=bool(ltp or ask) and px>0
+        dd=daily_dir(cfg["key"]) if sig else None
+        d_aligned=bool(dd is not None and raw is not None and ((dd==1 and raw=="CE") or (dd==-1 and raw=="PE")))
+        if quoted:
+            lots,size_note=sized_lots(px,lot,a["adx"],d_aligned,expire_today,lots,r.get("size"))
+        else:
+            size_note=(r.get("size") or f"{lots} lots")+" | fixed size (no usable quote: ltp "+str(ltp)+", ask "+str(ask)+")"
+        r["size"]=size_note; r["size_lots"]=lots
+        r["size_inputs"]={"premium":px,"lot_size":lot,"adx":a["adx"],"daily_aligned":d_aligned,
+                          "expire_today":expire_today,"weight":book_weight("index_options"),
+                          "free_capital":free_capital(),"fixed_size":FIXED}
+        qty=lots*lot; r["option"]["qty"]=qty
         ekw=in_expiry_week(exp)
         r["expiry_week"]=ekw
         r["carry"]="intraday only (expiry week)" if ekw else "positional"
