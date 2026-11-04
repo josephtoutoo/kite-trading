@@ -232,11 +232,20 @@ def check_order(order,broker="upstox"):
         # rule 10
         px=float(order.get("price") or 0) or ltp or 0
         if prod=="MTF":
+            # 4 Nov 2026 (t292u): R10 caps are measured on the MTF MARGIN the broker blocks, not on price x qty.
             mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
             this=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf if m.get("instrument_token")==k or sym_of(m)==und)
-            new=px*qty
-            if this+new>capital*MTF_STOCK_CAP: block.append(f"R10: {und} MTF Rs {this+new:,.0f} > 10% cap Rs {capital*MTF_STOCK_CAP:,.0f}")
-            if mtf_total+new>capital*MTF_TOTAL_CAP: block.append(f"R10: total MTF Rs {mtf_total+new:,.0f} > 50% cap Rs {capital*MTF_TOTAL_CAP:,.0f}")
+            ratio=1.0
+            try:
+                sys.path.insert(0,"/workspace/equity")
+                import mtf_sizing as _ms
+                q=_ms.margin_quote(broker,und,qty,px)
+                if q.get("ok") and px and qty: ratio=float(q["margin"])/(px*qty)
+                else: block.append(f"R10: MTF margin quote failed ({q.get('why','no quote')}) - cannot size on margin")
+            except Exception as e: block.append(f"R10: MTF margin sizing unavailable ({type(e).__name__}: {e})")
+            this_m=this*ratio; total_m=mtf_total*ratio; new_m=px*qty*ratio
+            if this_m+new_m>capital*MTF_STOCK_CAP: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > 10% cap Rs {capital*MTF_STOCK_CAP:,.0f}")
+            if total_m+new_m>capital*MTF_TOTAL_CAP: block.append(f"R10: total MTF margin Rs {total_m+new_m:,.0f} > 50% cap Rs {capital*MTF_TOTAL_CAP:,.0f}")
         elif opt or sym.endswith("FUT"):
             mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
             fno_lim=min(capital*0.5,capital-mtf_total)

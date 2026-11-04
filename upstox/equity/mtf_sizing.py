@@ -2,8 +2,11 @@
 """MTF sizing + margin gate (4 Nov 2026). READ ONLY - places NO orders.
 
 Rules it enforces, per broker, on every proposed MTF BUY:
-  R10a  stock cap      value(symbol) + new <= 10% of that broker's capital
-  R10b  total cap      MTF used + new <= 50% of capital
+  CAPS ARE ON MARGIN (4 Nov 2026): the 10% per stock and 50% total caps are measured on the
+  MTF MARGIN the broker blocks for the order, not on price x qty. MTF margin runs ~24% of
+  notional (4.1x leverage), so the same 10% cap now funds roughly 4x the notional it used to.
+  R10a  stock cap      margin(symbol held) + margin(new) <= 10% of that broker's capital
+  R10b  total cap      MTF margin used + margin(new) <= 50% of capital
   R10c  reserve        a NEW stock may use at most half of the remaining room;
                        the other half is kept for pullback adds into existing
                        holdings (mode="add" may draw on the reserve)
@@ -125,26 +128,34 @@ def margin_quote(broker, symbol, qty, price):
 
 
 # ---------------- the gate ----------------
-def limits(st, symbol, mode='new'):
-    """Money limits for one order, before any margin quote."""
+def limits(st, symbol, mode='new', ratio=1.0):
+    """Margin limits for one order (4 Nov 2026: caps are on MTF margin, not on notional).
+    ratio = margin / notional for this symbol, so existing holdings stored at cost can be
+    converted to the margin they consume."""
     cap = st['capital']
     per = PER_STOCK * cap
-    already = st['held'].get(symbol, 0.0)
-    room_total = max(TOTAL * cap - st['used'], 0.0)
+    already = st['held'].get(symbol, 0.0) * ratio          # cost -> margin it blocks
+    used_m = st['used'] * ratio                            # portfolio at cost -> margin
+    room_total = max(TOTAL * cap - used_m, 0.0)
     room = (room_total * NEW_SHARE if mode == 'new' and symbol not in st['held'] else room_total)
     by_stock = max(per - already, 0.0)
     return dict(per_stock=round(per), already=round(already), by_stock=round(by_stock),
-                room=round(room), room_total=round(room_total),
+                room=round(room), room_total=round(room_total), ratio=round(ratio, 4),
                 reserve_after=round(room_total - min(room_total, room)))
 
 
 def size(broker, symbol, price, mode='new', step=None):
     st = state(broker)
-    lim = limits(st, symbol, mode)
-    amt_cap = min(lim['by_stock'], lim['room'])
-    qty_by_value = int(amt_cap // price) if price > 0 else 0
-    # shrink for the real margin the broker asks for
-    q = qty_by_value
+    probe = margin_quote(broker, symbol, 1, price)     # margin for ONE share at the proposed price
+    if not probe['ok']:
+        return dict(broker=broker, symbol=symbol, mode=mode, qty=0, verdict='NO SIZE',
+                    reason='margin quote failed: ' + probe.get('why', ''), state=st, quote=probe)
+    per_share = probe['margin']
+    ratio = per_share / price if price else 1.0
+    lim = limits(st, symbol, mode, ratio)
+    amt_cap = min(lim['by_stock'], lim['room'])        # rupees of MARGIN the caps allow
+    qty_by_margin = int(amt_cap // per_share) if per_share > 0 else 0
+    q = qty_by_margin
     quote = None
     floor = step or 1
     while q >= floor:
@@ -157,6 +168,7 @@ def size(broker, symbol, price, mode='new', step=None):
                     reason='free margin does not cover one lot', state=st, limits=lim, quote=quote)
     out = dict(broker=broker, symbol=symbol, price=price, mode=mode, qty=q,
                amount=round(q * price), margin=round(quote['margin']),
+               margin_pct_of_capital=round(100 * quote['margin'] / st['capital'], 1),
                leverage=quote.get('leverage'), verdict='OK' if q else 'NO SIZE',
                state=dict(capital=round(st['capital']), free=round(st['free']), used=round(st['used'])),
                limits=lim)
@@ -167,16 +179,19 @@ def size(broker, symbol, price, mode='new', step=None):
 
 def check(broker, symbol, qty, price, mode='new'):
     st = state(broker)
-    lim = limits(st, symbol, mode)
+    probe = margin_quote(broker, symbol, 1, price)
+    ratio = (probe['margin'] / price) if probe.get('ok') and price else 1.0
+    lim = limits(st, symbol, mode, ratio)
+    q = margin_quote(broker, symbol, qty, price)
+    m_new = q['margin'] if q.get('ok') else qty * price * ratio
     notional = qty * price
     blocks, warns = [], []
-    if notional > lim['by_stock']:
-        blocks.append(f"R10a: {symbol} {notional:,.0f} > 10% stock cap room {lim['by_stock']:,.0f} (cap {lim['per_stock']:,.0f}, already {lim['already']:,.0f})")
-    if st['used'] + notional > TOTAL * st['capital']:
-        blocks.append(f"R10b: total MTF {st['used'] + notional:,.0f} > 50% cap {TOTAL * st['capital']:,.0f}")
-    if mode == 'new' and symbol not in st['held'] and notional > lim['room']:
-        blocks.append(f"R10c: new entry {notional:,.0f} > half of remaining room {lim['room']:,.0f} (reserve {lim['reserve_after']:,.0f} kept for pullback adds)")
-    q = margin_quote(broker, symbol, qty, price)
+    if m_new > lim['by_stock']:
+        blocks.append(f"R10a: {symbol} margin {m_new:,.0f} > 10% stock cap room {lim['by_stock']:,.0f} (cap {lim['per_stock']:,.0f}, already {lim['already']:,.0f})")
+    if st['used'] * ratio + m_new > TOTAL * st['capital']:
+        blocks.append(f"R10b: total MTF margin {st['used'] * ratio + m_new:,.0f} > 50% cap {TOTAL * st['capital']:,.0f}")
+    if mode == 'new' and symbol not in st['held'] and m_new > lim['room']:
+        blocks.append(f"R10c: new entry margin {m_new:,.0f} > half of remaining room {lim['room']:,.0f} (reserve {lim['reserve_after']:,.0f} kept for pullback adds)")
     if not q['ok']:
         blocks.append('R10d: margin quote failed - ' + q['why'])
     elif q['margin'] > st['free']:
@@ -184,6 +199,7 @@ def check(broker, symbol, qty, price, mode='new'):
     if q.get('leverage') is not None and q['leverage'] < 1.5:
         warns.append(f"leverage only {q['leverage']}x")
     return dict(broker=broker, symbol=symbol, qty=qty, price=price, mode=mode, notional=round(notional),
+                margin=round(m_new),
                 allowed=not blocks, blocks=blocks, warns=warns, quote=q,
                 max_qty=size(broker, symbol, price, mode)['qty'],
                 state=dict(capital=round(st['capital']), free=round(st['free']), used=round(st['used'])),
