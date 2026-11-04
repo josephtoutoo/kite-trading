@@ -25,7 +25,7 @@ Call shapes (stdlib only, no framework):
   api.call(url, body, method)                    -> parsed JSON or {'status':'error','code':..,'body':..}
 Every script keeps its own function names and return types; only the transport changes.
 """
-import json, os, time, gzip, base64, socket, ssl, http.client, urllib.parse
+import json, os, sys, time, gzip, base64, random, socket, ssl, http.client, urllib.parse
 
 D = os.path.dirname(os.path.abspath(__file__))
 UA = 'Mozilla/5.0'
@@ -36,6 +36,9 @@ RETRIES = 3                 # extra attempts for a transient GET failure (4 trie
 BACKOFF = 0.4               # seconds before retry 1; doubled for each retry after that
 TRANSIENT_STATUS = (429, 500, 502, 503, 504)
 CF_1010 = '1010'
+JITTER = 0.25               # +- fraction on each backoff, so routines that fail together do not
+                            # retry in lockstep and hammer the same host
+ERRLF = os.path.join(D, 'api_errors.log')   # one line per GET that exhausted its retries
 
 _pool = {}                  # (host, proxy) -> http.client.HTTPSConnection
 _tok = {'stamp': None, 'value': None}
@@ -144,6 +147,31 @@ def _attempt(url, body, method, proxy, timeout, extra_headers):
     return resp.status, text
 
 
+def _log_attempts(url, tries, err):
+    """Append a line whenever a GET burns every retry, so a real transport drop is diagnosable
+    after the fact instead of vanishing into a caller's generic error message. Best effort:
+    a logging failure must never turn into a request failure."""
+    try:
+        u = urllib.parse.urlsplit(url)
+        now = time.time() + 19800                      # box clock may be UTC; log in IST
+        line = '%s IST GET %s%s tries=%d %s: %s\n' % (
+            time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(now)), u.hostname, u.path, tries,
+            type(err).__name__, str(err).replace('\n', ' ')[:160])
+        with open(ERRLF, 'a') as fh:
+            fh.write(line)
+        if os.path.getsize(ERRLF) > 500_000:      # keep the tail, never grow without bound
+            with open(ERRLF) as fh:
+                tail = fh.readlines()[-500:]
+            with open(ERRLF, 'w') as fh:
+                fh.writelines(tail)
+    except Exception:
+        pass
+
+
+def _sleep(i):
+    time.sleep(BACKOFF * (2 ** i) * (1 + random.uniform(-JITTER, JITTER)))
+
+
 def _transient(status, text):
     return status in TRANSIENT_STATUS or (status == 403 and CF_1010 in (text or '')[:400])
 
@@ -160,17 +188,21 @@ def request(url, body=None, method=None, proxy=None, timeout=DEFAULT_TIMEOUT, he
         except (socket.timeout, ConnectionError, http.client.HTTPException, ssl.SSLError, OSError) as e:
             last = e
             if i + 1 < attempts:
-                time.sleep(BACKOFF * (2 ** i))
+                _sleep(i)
                 continue
+            _log_attempts(url, attempts, e)
             raise
         if 200 <= status < 300:
             return json.loads(text) if text.strip() else {}
         if _transient(status, text) and i + 1 < attempts:
             last = ApiError(status, text, url)
-            time.sleep(BACKOFF * (2 ** i))
+            _sleep(i)
             continue
         raise ApiError(status, text, url)
-    raise last if isinstance(last, Exception) else ApiError(0, 'retries exhausted', url)
+    if isinstance(last, Exception):
+        _log_attempts(url, attempts, last)
+        raise last
+    raise ApiError(0, 'retries exhausted', url)
 
 
 def get(path, proxy=None, timeout=DEFAULT_TIMEOUT):
