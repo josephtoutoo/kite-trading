@@ -184,7 +184,13 @@ def kite_state():
     av = m.get('available') or {}
     free = min(float(m['net']), float(av.get('live_balance') or 0) + float(av.get('collateral') or 0))
     held = {}
-    for p in k.positions().get('net') or []:
+    try:
+        net = k.positions().get('net')
+    except Exception as e:
+        raise BookUnavailable(f'Kite positions unreadable: {type(e).__name__}: {e}')
+    if net is None:
+        raise BookUnavailable('Kite positions returned no data')
+    for p in net:
         if p['product'] == 'MTF' and p['quantity'] > 0 and p['exchange'] in ('NSE', 'BSE'):
             held[p['tradingsymbol']] = held.get(p['tradingsymbol'], 0.0) + p['quantity'] * float(p['average_price'])
     try:
@@ -193,7 +199,10 @@ def kite_state():
             if q > 0 and h['tradingsymbol'] not in held:
                 held[h['tradingsymbol']] = q * float((h.get('mtf') or {}).get('average_price') or h.get('average_price') or 0)
     except Exception as e:
-        print(f'mtf_sizing: Kite holdings read failed in kite_state: {type(e).__name__}: {e}', file=sys.stderr)
+        # Fail closed. An incomplete `held` is dangerous: mtf_dual_entry's "never buy a name the
+        # broker already holds" guard reads this dict, so a swallowed holdings error would let the
+        # mirror buy an MTF holding it already owns.
+        raise BookUnavailable(f'Kite holdings unreadable: {type(e).__name__}: {e}')
     return dict(broker='kite', capital=cap, free=free, used=sum(held.values()), held=held, mine=mine_kite())
 
 
