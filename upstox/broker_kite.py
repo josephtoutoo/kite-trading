@@ -96,12 +96,21 @@ def _memo(name,fn):
     val=fn()
     if READ_TTL>0: _reads[name]=(__import__("time").monotonic()+READ_TTL,val)
     return val
-def positions():
+def positions(strict=False):
+    """Normalized Kite positions. strict=True RAISES instead of returning [] on a failed read:
+    a silent [] makes a caller believe the book is empty, and risk_manager used to cancel every
+    live Kite option stop as 'stray' when that happened (5 Nov 2026)."""
+    if strict:
+        if not valid(): raise RuntimeError('Kite token invalid')
+        return _positions(True)
     if not valid(): return []
     return _memo("positions",_positions)
-def _positions():
+def _positions(strict=False):
     try: net=client().positions().get("net") or []
-    except Exception as e: log(f"positions fail {e}"); return []
+    except Exception as e:
+        log(f"positions fail {e}")
+        if strict: raise
+        return []
     out=[]
     for p in net:
         out.append({"broker":"kite","trading_symbol":p["tradingsymbol"],"exchange":p["exchange"],
@@ -130,12 +139,20 @@ def _holdings():
         if cq>0:
             d=dict(base); d.update({"quantity":cq,"product":"CNC"}); out.append(d)
     return out
-def orders():
+def orders(strict=False):
+    """Normalized Kite orders. strict=True RAISES on a failed read - use it wherever an empty
+    list would be read as 'nothing is live' (stop placement, stray-stop cleanup)."""
+    if strict:
+        if not valid(): raise RuntimeError('Kite token invalid')
+        return _orders(True)
     if not valid(): return []
     return _memo("orders",_orders)
-def _orders():
+def _orders(strict=False):
     try: od=client().orders() or []
-    except Exception as e: log(f"orders fail {e}"); return []
+    except Exception as e:
+        log(f"orders fail {e}")
+        if strict: raise
+        return []
     out=[]
     for o in od:
         ts=o.get("order_timestamp"); ts=ts.strftime("%Y-%m-%d %H:%M:%S") if hasattr(ts,"strftime") else ts

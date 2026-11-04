@@ -167,7 +167,10 @@ try:
     import broker_kite as bk
     if not bk.valid(): kacts.append({"action":"KITE_SKIPPED","why":"Kite token invalid - no-op"}); bk.log("risk_manager: kite skipped, invalid token")
     else:
-        kpos=bk.positions(); kord=bk.orders(); klongs=set()
+        # strict reads: a failed book read here used to come back as [], and the stray-SL sweep at
+        # the end of this block then cancelled every live Kite option stop on the account. Refuse
+        # the whole Kite section instead.
+        kpos=bk.positions(strict=True); kord=bk.orders(strict=True); klongs=set()
         def kpending(ts): return [o for o in kord if o["trading_symbol"]==ts and o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M")]
         for p in kpos:
             sym=p["trading_symbol"]; q=p["quantity"]; ex=p["exchange"]
