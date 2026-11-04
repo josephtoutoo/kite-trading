@@ -168,8 +168,10 @@ def _decisions(filled,now):
     return dec
 def check_order(order,broker="upstox"):
     """-> (allowed: bool, reasons: list[str], adjusted_qty: int)
-    broker: 'upstox' | 'kite'. Daily limits (R1 count, R2 loss cutoffs, R3, R7) use BOTH accounts;
-    quantity-held checks (R6, R8, R11, R10) use the given broker's positions."""
+    broker: 'upstox' | 'kite'. Daily index-option limits (R1 count, R2a loss cutoff, R3, R7) use BOTH
+    accounts but ONLY the order's own underlying: NIFTY, SENSEX and BANKNIFTY are separate books (t329u).
+    The account-wide day-loss breaker (R2b) stays account-wide. Quantity-held checks (R6, R8, R11, R10)
+    use the given broker's positions."""
     now=datetime.datetime.strptime(order["_now"],"%Y-%m-%d %H:%M").replace(tzinfo=IST) if order.get("_now") else datetime.datetime.now(IST)
     sym=sym_of(order); side=(order.get("transaction_type") or "").upper(); ot=(order.get("order_type") or "").upper()
     prod=(order.get("product") or "").upper(); qty=int(order.get("quantity") or 0); k=order.get("instrument_token")
@@ -210,12 +212,16 @@ def check_order(order,broker="upstox"):
         elif fac<1:
             adj=max(int(adj*fac),0); flags.append(f"R2: {why}; qty cut to {adj} (round to lot size)")
         if idx_opt:
+            # t329u (4 Nov): NIFTY, SENSEX and BANKNIFTY are SEPARATE books. Every index-option rule below
+            # counts only this order's own underlying - a NIFTY loss or a third NIFTY decision must never
+            # block BANKNIFTY or SENSEX. (MCX crude is a separate script and never enters this path.)
             # rule 1
-            n=len(_decisions(filled,now))
-            if n>=INDEX_OPT_MAX and not order.get("_paired"): block.append(f"R1: {n} index option trade decisions already today across Upstox+Kite (max {INDEX_OPT_MAX})")
+            n=len([d for d in _decisions(filled,now) if d["u"]==und])
+            if n>=INDEX_OPT_MAX and not order.get("_paired"): block.append(f"R1: {n} {und} option trade decisions already today across Upstox+Kite (max {INDEX_OPT_MAX} per index)")
             # rule 2a
-            bl=sum(float(p.get("realised") or 0) for p in upos+kpos if is_opt(sym_of(p)) and is_index(sym_of(p)))
-            if bl< -INDEX_OPT_LOSS: block.append(f"R2: combined index-option booked loss Rs {bl:,.0f} < -2,000 - no more index option trades today")
+            bl=sum(float(p.get("realised") or 0) for p in upos+kpos
+                   if is_opt(sym_of(p)) and is_index(sym_of(p)) and underlying(sym_of(p))==und)
+            if bl< -INDEX_OPT_LOSS: block.append(f"R2: {und} option booked loss Rs {bl:,.0f} < -{INDEX_OPT_LOSS:,} - no more {und} option trades today")
             # rule 3
             other="PE" if sym.endswith("CE") else "CE"
             for o in filled:

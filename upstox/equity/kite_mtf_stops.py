@@ -159,10 +159,21 @@ def main():
         else:
             if DRY:
                 acts.append(dict(sym=sym, action='PLACE(dry)', qty=want, trigger=trig, limit=limit, ltp=ltp)); continue
+            # An overnight GTT and a day SL on the same position would both fire and sell twice.
+            # The GTT goes first; if it cannot be cancelled, no day SL is placed and the GTT stays as cover.
+            try:
+                import gtt_overnight as gtt
+                ok_g, det_g = gtt.cancel_for_day('kite', sym)
+            except Exception as e:
+                ok_g, det_g = False, f'{type(e).__name__}: {e}'
+            if not ok_g:
+                acts.append(dict(sym=sym, action='GTT_FAIL', qty=want, trigger=trig, ltp=ltp,
+                                 why=f'overnight GTT could not be cancelled, day SL not placed: {det_g}'))
+                continue
             oid = bk.place(exch, sym, 'SELL', want, limit, order_type='SL', trigger=trig, tag='mtfsl', product='MTF')
             acts.append(dict(sym=sym, action='PLACE' if oid else 'FAIL', qty=want, trigger=trig, limit=limit, ltp=ltp, order=oid))
     print(json.dumps(acts, indent=1, default=str))
-    bad = [a for a in acts if a['action'] in ('FAIL', 'SKIP')]
+    bad = [a for a in acts if a['action'] in ('FAIL', 'SKIP', 'GTT_FAIL')]
     if bad:
         print('\nNEEDS ATTENTION:', json.dumps(bad, default=str))
 

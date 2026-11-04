@@ -33,6 +33,22 @@ def write(u,body=None,method=None):
     return req(u,body,method)
 def tick(p): return round(round(p/0.05)*0.05,2)
 def isopt(sym): return len(sym)>2 and sym[-2:] in("CE","PE") and sym[-3].isdigit()  # BAJFINANCE ends in CE: require strike digit
+
+def _gtt_clear(broker, sym, key=None):
+    """Cancel this name's overnight GTT before a day order is placed on it.
+
+    A GTT and a day SELL on the same position would both fire and sell the quantity twice.
+    Returns (ok, detail). On False the caller must NOT place the day order: the GTT stays as cover.
+    """
+    if DRY:
+        return True, "dry-run (GTT left alone)"
+    try:
+        sys.path.insert(0,"/workspace/equity")
+        import gtt_overnight as _g
+        return _g.cancel_for_day(broker, sym, key=key)
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
 st=json.load(open(SF)) if os.path.exists(SF) else {}
 seeds=st.setdefault("_min_stop_by_symbol",{})
 for sym,v in {"INDHOTEL26NOV830CE":14.75,"SENSEX26N0576500CE":367.5,"PAYTM26NOV1720CE":44.25,"GLENMARK26NOV2400CE":56.3}.items():
@@ -110,6 +126,9 @@ for p in pos:
     INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
     ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
     if INDEX_OPT and s["high"]>=avg*1.15 and not ok:
+        gok,gdet=_gtt_clear("upstox",sym,key=k)
+        if not gok:
+            acts.append({"sym":sym,"action":"GTT_FAIL","why":f"overnight GTT not cancelled, trend exit not sent: {gdet}"}); continue
         for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
         lim=tick(ltp*0.995)
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
@@ -126,6 +145,9 @@ for p in pos:
         lim=tick(stop*(0.99 if fut else 0.95))
         info={"sym":sym,"qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
         if not sls:
+            gok,gdet=_gtt_clear("upstox",sym,key=k)
+            if not gok:
+                acts.append({**info,"action":"GTT_FAIL","why":f"overnight GTT not cancelled, day SL not placed: {gdet}"}); continue
             r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"trailsl","instrument_token":k,"order_type":"SL","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":stop,"is_amo":False})
             acts.append({**info,"action":"PLACE_SL","resp":r.get("status"),"err":r.get("body")})
             if not DRY and r.get("status")=="success": sc.clear("upstox",sym)
@@ -195,6 +217,9 @@ try:
             INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
             ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
             if INDEX_OPT and s["high"]>=avg*1.15 and not ok:
+                gok,gdet=_gtt_clear("kite",sym)
+                if not gok:
+                    kacts.append({"sym":sym,"broker":"kite","action":"GTT_FAIL","why":f"overnight GTT not cancelled, trend exit not sent: {gdet}"}); continue
                 for o in sls: bk.cancel(o["order_id"],dry=DRY)
                 lim=tick(ltp*0.995)
                 r=bk.place(ex,sym,"SELL",q,lim,tag="target_book",product=p["product"],dry=DRY)
@@ -210,6 +235,9 @@ try:
                 lim=tick(stop*(0.99 if fut else 0.95))
                 info={"sym":sym,"broker":"kite","qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
                 if not sls:
+                    gok,gdet=_gtt_clear("kite",sym)
+                    if not gok:
+                        kacts.append({**info,"action":"GTT_FAIL","broker":"kite","why":f"overnight GTT not cancelled, day SL not placed: {gdet}"}); continue
                     kacts.append({**info,"action":"PLACE_SL","resp":bk.place(ex,sym,"SELL",q,lim,order_type="SL",trigger=stop,tag="trailsl",product=p["product"],dry=DRY)})
                     if not DRY: sc.clear("kite",sym)
                 else:

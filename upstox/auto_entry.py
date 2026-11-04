@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026, 2 lots/trade).
+"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026; 3 lots/trade from 9 Nov, t327u).
 Run every 5 min by a routine. Acts only 09:20-14:45 IST Mon-Fri (risk_manager handles exits till 15:25).
 Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   CE: close > EMA20 and Supertrend green, previous candle not both; MACD hist > 0; ADX >= 18
   PE: close < EMA20 and Supertrend red,   previous candle not both; MACD hist < 0; ADX >= 18
   (MACD + ADX>=18 filters are there to avoid chop.)
-Option: nearest weekly expiry, ATM strike, qty 2*lot_size on an ordinary trend (trade_lock may halve it).
+Option: nearest weekly expiry, ATM strike, qty 3*lot_size on an ordinary trend (trade_lock may halve it).
 STRONG trend (ind.strong: ADX >= 25 AND still rising, price on the Supertrend side of EMA20): qty doubles
-to 4 lots (t295u). Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
+to 4 lots (t295u; switched off from 9 Nov, t327u: every index entry is 3 lots). Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
 14% of signals; the rest -0.016%. trade_lock caps still apply.
 All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product I (fallback D),
 tag auto_entry; cancel if unfilled after 2 min.
-Kite (4 Nov): same signal also buys 2 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
+Kite (4 Nov): same signal also buys the same 3 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
 the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffected. On fill: trade_lock.record_entry, risk_state.json
 (entry, target +20%, stop -30%), seen_entries.json. One open position per index max.
 After a fill the SL is placed and immediately re-verified (sl_confirm.py: re-reads the order book, retries once on a
@@ -32,7 +32,10 @@ def in_expiry_week(exp_date):
     return False
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
-LOTS=2; ADX_MIN=18; STRONG_LOTS=2*LOTS  # t295u: a STRONG trend doubles the index-option size
+LOTS=3; EXPIRY_LOTS=5; ADX_MIN=18; STRONG_LOTS=LOTS  # t327u/t328u (4 Nov): 3 lots normally, 5 lots on expiry day.
+# The STRONG-trend doubling (t295u) is switched off by setting STRONG_LOTS=LOTS: doubling 3 would be 6 lots,
+# which nobody asked for. Restore it by setting STRONG_LOTS=2*LOTS. trade_lock caps still apply either way.
+# t328u: when the contract being bought expires TODAY (expiry-day trade), size is EXPIRY_LOTS instead.
 IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO"},
      "BANKNIFTY":{"key":"NSE_INDEX|Nifty Bank","exch":"NSE","seg":"NSE_FO"},
      "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO"}}
@@ -80,6 +83,24 @@ def signal(a):
     if side and not macd_ok: why.append(f"MACD hist {a['hist']} against direction")
     if not adx_ok: why.append(f"ADX {a['adx']} < {ADX_MIN} (chop)")
     return (side if side and fresh and macd_ok and adx_ok else None), side, why
+def size_lots(expire_today, strong_aligned, sig, raw=None, sside=None):
+    """Index-option size in lots, and the note to show. Pure, so it can be tested off-market.
+
+    t327u: 3 lots normally. t328u: 5 lots when the contract bought expires today.
+    The old STRONG-trend doubling is off (STRONG_LOTS == LOTS); expiry day overrides everything.
+    """
+    if expire_today:
+        return EXPIRY_LOTS, f"expiry-day -> {EXPIRY_LOTS} lots (t328u)"
+    if strong_aligned:
+        return STRONG_LOTS, (f"STRONG trend -> {STRONG_LOTS} lots" if STRONG_LOTS != LOTS
+                             else f"STRONG trend -> {STRONG_LOTS} lots (size cap: doubling disabled, t327u)")
+    if sig and sside is not None and sside != raw:
+        return LOTS, f"strong {sside} but signal is {raw} - normal {LOTS} lots"
+    if sig:
+        return LOTS, f"ordinary trend -> {LOTS} lots"
+    return LOTS, None
+
+
 def pick(name,cfg,side,spot):
     ins=[x for x in master(cfg["exch"]) if x.get("segment")==cfg["seg"] and x.get("instrument_type")==side and x.get("underlying_symbol",x.get("name",""))==name]
     today_ms=int(datetime.datetime.combine(now.date(),datetime.time(0),IST).timestamp()*1000)
@@ -110,11 +131,10 @@ for name,cfg in IDX.items():
         sig,raw,why=signal(a); r["signal"]=sig or "NONE"; r["trend_side"]=raw; r["why"]=why
         best,exp,std=pick(name,cfg,raw or "CE",a["close"])
         strong,sside,sdet=ind.strong(a); r["strong"]={"on":strong,"side":sside,**sdet}
-        lots=LOTS
-        if strong and sig:
-            if sside==raw: lots=STRONG_LOTS; r["size"]=f"STRONG trend -> {lots} lots (doubled)"
-            else: r["size"]=f"strong {sside} but signal is {raw} - normal {lots} lots"
-        elif sig: r["size"]=f"ordinary trend -> {lots} lots"
+        expire_today = (exp == now.date())
+        lots, size_note = size_lots(expire_today, bool(strong and sig and sside == raw), sig, raw, sside)
+        r["expiry_day"] = expire_today
+        if size_note: r["size"] = size_note
         qty=lots*int(best["lot_size"])
         r["option"]={"symbol":best["trading_symbol"],"key":best["instrument_key"],"expiry":str(exp),"strike":best["strike_price"],"lot_size":best["lot_size"],"qty":qty,"strike_step":std}
         openp=[p for p in pos if int(p.get("quantity") or 0)>0 and trade_lock.underlying(trade_lock.sym_of(p))==name and trade_lock.is_opt(trade_lock.sym_of(p))]

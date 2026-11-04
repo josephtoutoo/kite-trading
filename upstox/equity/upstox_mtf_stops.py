@@ -211,6 +211,17 @@ def main():
                          'cancel': [o['order_id'] for o in stale] or None,
                          'why': 'would cancel stale SL(s) and place fresh SL SELL' if stale else 'would place SL SELL'})
             continue
+        # An overnight GTT and a day SL on the same position would both fire and sell twice.
+        # The GTT goes first; if it cannot be cancelled, no day SL is placed and the GTT stays as cover.
+        try:
+            import gtt_overnight as gtt
+            ok_g, det_g = gtt.cancel_for_day('upstox', sym, key=key)
+        except Exception as e:
+            ok_g, det_g = False, f'{type(e).__name__}: {e}'
+        if not ok_g:
+            acts.append({**info, 'action': 'GTT_FAIL', 'qty': qty2,
+                         'why': f'overnight GTT could not be cancelled, day SL not placed: {det_g}'})
+            continue
         cancelled = []
         for o in stale:
             r = req('https://api-hft.upstox.com/v2/order/cancel?order_id=' + o['order_id'], None, 'DELETE')
