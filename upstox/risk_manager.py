@@ -81,7 +81,7 @@ for p in pos:
     avg=p.get("day_buy_price") if p.get("day_buy_quantity",0)>0 and p.get("overnight_quantity",0)<=0 else None
     avg=avg or p.get("average_price") or p.get("buy_price") or p.get("day_buy_price")
     if not avg or not ltp: acts.append({"sym":sym,"action":"SKIP_NO_PRICE"}); continue
-    TRAIL=0.015 if fut else 0.40; STEP=0.02 if fut else 0.20
+    TRAIL=0.015 if fut else 0.30; STEP=0.02 if fut else 0.20
     s=st.setdefault(k,{"high":avg}); s["sym"]=sym; s["high"]=max(s.get("high",avg),ltp)
     s.setdefault("entry",avg); s.setdefault("target",round(avg*(1+STEP),2))
     _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":k,"transaction_type":"SELL","order_type":"SL","product":p["product"],"quantity":q})
@@ -92,20 +92,22 @@ for p in pos:
         acts.append({"sym":sym,"action":"CANCEL_DUP_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
     sls=sls[:1]
     floor=0
-    # ---- trend-first exit (4 Nov, t285u): options exit when the UNDERLYING trend turns against them ----
-    # index options: 5m close vs EMA20 + Supertrend; stock options: 15m. Checked every run, not only at target.
+    # ---- exit rule D (4 Nov, t287u): 30% fixed floor + trend exit once the trade is up >=15% ----
+    # A pure trend exit cut winners in the backtest (avg +5% vs +12%), so trend is used to PROTECT a winner,
+    # not to defend a loser. Losses are bounded by the 30% floor under entry; winners are let run until the
+    # underlying trend turns (index opts 5m, stock opts 15m) - only after s["high"] has been +15% above entry.
     ok,why=trend_ok(sym) if not fut else (True,"futures use the % trail")
-    if not ok:
+    if not fut and s["high"]>=avg*1.15 and not ok:
         for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
         lim=tick(ltp*0.995)
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
-        acts.append({"sym":sym,"action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"trend":why,"pnl_est":round((lim-avg)*q),"resp":r.get("status"),"err":r.get("body")})
+        acts.append({"sym":sym,"action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"pnl_est":round((lim-avg)*q),"resp":r.get("status"),"err":r.get("body")})
         continue
     while ltp>=s["target"]:
         prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,round(prev-avg*STEP,2),avg)  # stop = target two steps back (1st roll: breakeven)
         acts.append({**{"sym":sym},"action":"ROLL_TARGET","from":prev,"to":s["target"],"trend":why})
     if True:
-        # stop is now a DISASTER BACKSTOP only: fixed % under entry (never trailed from the peak, never lowered)
+        # 30% fixed floor under entry (never lowered); floor rises only when a target rolls
         stop=tick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
         if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))
         else: s["stop"]=stop  # ratchet: never lowered
@@ -192,7 +194,7 @@ try:
                 for v in d.values(): ltp=float(v.get("last_price") or 0) or None
             ltp=ltp or p["last_price"]; avg=p["average_price"] or p["buy_price"]
             if not avg or not ltp: kacts.append({"sym":sym,"broker":"kite","action":"SKIP_NO_PRICE"}); continue
-            TRAIL=0.015 if fut else 0.40; STEP=0.02 if fut else 0.20
+            TRAIL=0.015 if fut else 0.30; STEP=0.02 if fut else 0.20
             s=st.setdefault(kk,{"high":avg}); s["sym"]=sym; s["broker"]="kite"; s["high"]=max(s.get("high",avg),ltp)
             s.setdefault("entry",avg); s.setdefault("target",round(avg*(1+STEP),2))
             _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":kk,"transaction_type":"SELL","order_type":"SL","product":p["product"],"quantity":q},broker="kite")
@@ -202,11 +204,11 @@ try:
             for o in sls[1:]: kacts.append({"sym":sym,"broker":"kite","action":"CANCEL_DUP_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
             sls=sls[:1]; floor=0
             ok,why=trend_ok(sym) if not fut else (True,"futures use the % trail")
-            if not ok:
+            if not fut and s["high"]>=avg*1.15 and not ok:
                 for o in sls: bk.cancel(o["order_id"],dry=DRY)
                 lim=tick(ltp*0.995)
                 r=bk.place(ex,sym,"SELL",q,lim,tag="target_book",product=p["product"],dry=DRY)
-                kacts.append({"sym":sym,"broker":"kite","action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"trend":why,"resp":r})
+                kacts.append({"sym":sym,"broker":"kite","action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"resp":r})
                 continue
             while ltp>=s["target"]:
                 prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,round(prev-avg*STEP,2),avg)
