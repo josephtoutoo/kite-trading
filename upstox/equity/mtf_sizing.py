@@ -19,6 +19,11 @@ Capital, matching the existing scripts:
   Upstox  available_margin + used_margin   (equity segment)
   Kite    margins.net + utilised.debits
 
+Scoping (t304u, finished 5 Nov 2026): the stock COUNT cap and the MTF budget count only names
+this bot opened (mine_upstox / mine_kite / mtf_managed.json). Names the user bought themselves are
+excluded from both - they still block real margin, so free margin and the R10d coverage check keep
+using every live holding.
+
 CLI:  python3 mtf_sizing.py state [broker]
       python3 mtf_sizing.py check SYMBOL QTY PRICE [--broker upstox|kite] [--mode new|add]
       python3 mtf_sizing.py size  SYMBOL PRICE [--broker upstox|kite] [--mode new|add]
@@ -31,6 +36,46 @@ PER_STOCK = 0.10
 TOTAL = 0.50
 NEW_SHARE = 0.50          # new stocks may use half of the remaining room
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_sizing_cache.json')
+# (t304u) The 5-stock MTF cap and the MTF budget count ONLY names this bot opened. Holdings the
+# user brought in themselves (or traded only in the app) are excluded from the count. A name is
+# "mine" when one of my own entry tags appears on a completed BUY for it, or when it is recorded
+# in mtf_managed.json. Broker free margin (R10d) still uses every live holding - that is real money.
+MY_TAGS = ('rotation', 'scanmtf', 'pullback', 'mtfentry', 'mtf_entry', 'refill', 'add', 'top5')
+MANAGED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_managed.json')
+
+
+def _managed():
+    try:
+        return set((json.load(open(MANAGED)).get('managed') or []))
+    except Exception:
+        return set()
+
+
+def mine_upstox():
+    tags = {}
+    try:
+        for o in _get('/v2/order/retrieve-all').get('data') or []:
+            if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
+                    and o.get('status') == 'complete' and (o.get('tag') or '') in MY_TAGS):
+                tags[o['trading_symbol'].replace('-EQ', '')] = o.get('tag')
+    except Exception:
+        pass
+    return set(tags) | _managed()
+
+
+def mine_kite():
+    # t304u: same tag rule as Upstox. This used to accept every COMPLETE MTF BUY, so a name the
+    # user bought in the Kite app counted as mine and ate a slot. Only my tags (or mtf_managed) count.
+    out = set(_managed())
+    try:
+        import broker_kite as bk
+        for o in bk.client().orders():
+            if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
+                    and o.get('status') == 'COMPLETE' and (o.get('tag') or '') in MY_TAGS):
+                out.add(o.get('tradingsymbol'))
+    except Exception:
+        pass
+    return out
 
 
 def _get(path):
@@ -58,7 +103,7 @@ def upstox_state():
             s = p['trading_symbol'].replace('-EQ', '')
             held[s] = held.get(s, 0.0) + q * float(p.get('average_price') or 0)
     return dict(broker='upstox', capital=cap, free=float(f['available_margin']),
-                used=sum(held.values()), held=held)
+                used=sum(held.values()), held=held, mine=mine_upstox())
 
 
 def kite_state():
@@ -81,11 +126,26 @@ def kite_state():
                 held[h['tradingsymbol']] = q * float((h.get('mtf') or {}).get('average_price') or h.get('average_price') or 0)
     except Exception:
         pass
-    return dict(broker='kite', capital=cap, free=free, used=sum(held.values()), held=held)
+    return dict(broker='kite', capital=cap, free=free, used=sum(held.values()), held=held, mine=mine_kite())
 
 
 def state(broker):
     return upstox_state() if broker == 'upstox' else kite_state()
+
+
+def state_mine(broker):
+    """(t304u) The same state, but the MTF stock cap and the MTF budget count ONLY names this bot
+    opened. Other MTF holdings still block real margin, so free / R10d stay untouched.
+    Adds held_all (every MTF name) and not_mine (the user's own), both at cost."""
+    st = state(broker)
+    m = st.get('mine') or set()
+    held = {s: v for s, v in st['held'].items() if s in m}
+    st = dict(st)
+    st['held_all'] = st['held']
+    st['held'] = held
+    st['used'] = sum(held.values())
+    st['not_mine'] = {s: v for s, v in st['held_all'].items() if s not in m}
+    return st
 
 
 # ---------------- broker margin quotes ----------------
@@ -145,7 +205,7 @@ def limits(st, symbol, mode='new', ratio=1.0):
 
 
 def size(broker, symbol, price, mode='new', step=None):
-    st = state(broker)
+    st = state_mine(broker)
     probe = margin_quote(broker, symbol, 1, price)     # margin for ONE share at the proposed price
     if not probe['ok']:
         return dict(broker=broker, symbol=symbol, mode=mode, qty=0, verdict='NO SIZE',
@@ -178,7 +238,7 @@ def size(broker, symbol, price, mode='new', step=None):
 
 
 def check(broker, symbol, qty, price, mode='new'):
-    st = state(broker)
+    st = state_mine(broker)
     probe = margin_quote(broker, symbol, 1, price)
     ratio = (probe['margin'] / price) if probe.get('ok') and price else 1.0
     lim = limits(st, symbol, mode, ratio)
@@ -206,14 +266,16 @@ def check(broker, symbol, qty, price, mode='new'):
                 limits=lim)
 
 
-MAX_STOCKS = 5
+# 6, not 5 (t305u/t306u, 5 Nov 2026): Upstox and Kite must hold the SAME trades from tomorrow, and
+# Upstox already holds 6 of my MTF names - 6 is the lowest level at which the two books can align.
+MAX_STOCKS = 6
 
 
 def slots(broker):
     """How many new MTF stocks this broker may still open, and whether any
     today's pending buy will consume one. READ ONLY."""
-    st = state(broker)
-    held = [s for s, v in st['held'].items() if v > 0]
+    st = state_mine(broker)
+    held = [s for s, v in st['held'].items() if v > 0]   # only names I opened count toward the stock cap
     free = max(MAX_STOCKS - len(held), 0)
     pending = []
     try:
@@ -229,9 +291,12 @@ def slots(broker):
                     pending.append(o['tradingsymbol'])
     except Exception:
         pass
+    # a pending buy of a name I already hold is an add, not a new slot (and drop duplicate legs)
+    pending = sorted({str(x).replace('-EQ', '') for x in pending if x} - set(held))
     free -= len(pending)
-    return dict(broker=broker, held=held, count=len(held), free_slots=max(free, 0),
-                pending_buys=pending, capital=round(st['capital']), used=round(st['used']))
+    return dict(broker=broker, held=held, count=len(held), cap=MAX_STOCKS, free_slots=max(free, 0),
+                pending_buys=pending, not_mine=len(st.get('not_mine') or {}),
+                capital=round(st['capital']), used=round(st['used']))
 
 
 if __name__ == '__main__':
@@ -246,17 +311,28 @@ if __name__ == '__main__':
         for b in ([brk] if brk else ['upstox', 'kite']):
             try:
                 r = slots(b)
-                print(f"{b}: {r['count']}/{MAX_STOCKS} MTF stocks, {r['free_slots']} free slot(s)"
-                      f"{', pending buys ' + ','.join(map(str, r['pending_buys'])) if r['pending_buys'] else ''}"
-                      f" | capital {r['capital']:,.0f} | MTF used {r['used']:,.0f}")
+                print(f"{b}: {r['count']}/{r['cap']} MTF stocks of MINE (cap counts only my names), "
+                      f"{r['free_slots']} free slot(s)"
+                      f"{' - pending buys ' + ','.join(map(str, r['pending_buys'])) if r['pending_buys'] else ''}"
+                      f" | not mine (excluded from cap/budget): {r['not_mine']}"
+                      f" | capital {r['capital']:,.0f} | MTF used (mine) {r['used']:,.0f}")
+                if r['held']:
+                    print(f"    mine: {', '.join(r['held'])}")
             except Exception as e:
                 print(b, 'ERR', type(e).__name__, str(e)[:120])
     elif a and a[0] == 'state':
         for b in ([brk] if brk else ['upstox', 'kite']):
             try:
-                st = state(b)
-                print(f"{b}: capital {st['capital']:,.0f} | 50% budget {0.5*st['capital']:,.0f} | MTF used {st['used']:,.0f} "
-                      f"| room {0.5*st['capital']-st['used']:,.0f} | free margin {st['free']:,.0f} | stocks {len(st['held'])}")
+                st = state_mine(b)
+                allm = st['held_all']; nm = st['not_mine']
+                print(f"{b}: capital {st['capital']:,.0f} | free margin {st['free']:,.0f} (ALL holdings)")
+                print(f"    MINE    : {len(st['held'])}/{MAX_STOCKS} stock(s) (cap {MAX_STOCKS}), cost {st['used']:,.0f}"
+                      f" -> 50% budget {0.5*st['capital']:,.0f}, room {0.5*st['capital']-st['used']:,.0f}")
+                print(f"    not mine: {len(nm)} stock(s), cost {sum(nm.values()):,.0f}  "
+                      f"(excluded from the cap and the MTF budget, still blocks margin)")
+                print(f"    all MTF : {len(allm)} stock(s), cost {sum(allm.values()):,.0f}")
+                for s2, v in sorted(allm.items()):
+                    print(f"      {'MINE ' if s2 in st['held'] else 'user '} {s2:<12} cost {v:,.0f}")
             except Exception as e:
                 print(b, 'ERR', type(e).__name__, str(e)[:120])
     elif a and a[0] == 'check':
