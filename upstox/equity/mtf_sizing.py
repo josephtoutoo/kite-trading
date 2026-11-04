@@ -68,30 +68,52 @@ def _managed():
         return set()
 
 
+class BookUnavailable(RuntimeError):
+    """The broker order book could not be read. Never treat that as "I hold nothing": a failed
+    read used to shrink the cap view to zero and free every slot, which lets a routine open new
+    MTF names on top of positions it cannot see (5 Nov 2026)."""
+
+
 def mine_upstox():
+    """Names this bot opened on Upstox (order-book tags, or mtf_managed.json). Fail-closed:
+    raises BookUnavailable instead of returning an empty set when the book cannot be read."""
     tags = {}
     try:
-        for o in _get('/v2/order/retrieve-all').get('data') or []:
-            if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
-                    and o.get('status') == 'complete' and (o.get('tag') or '') in MY_TAGS):
-                tags[o['trading_symbol'].replace('-EQ', '')] = o.get('tag')
+        book = _get('/v2/order/retrieve-all').get('data')
     except Exception as e:
-        print(f'mtf_sizing: order book read failed in mine_upstox: {type(e).__name__}: {e}', file=sys.stderr)
+        raise BookUnavailable(f'Upstox order book unreadable: {type(e).__name__}: {e}')
+    if book is None:
+        raise BookUnavailable('Upstox order book returned no data')
+    for o in book:
+        if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
+                and o.get('status') == 'complete' and (o.get('tag') or '') in MY_TAGS):
+            tags[o['trading_symbol'].replace('-EQ', '')] = o.get('tag')
     return set(tags) | _managed()
 
 
 def mine_kite():
-    # t304u: same tag rule as Upstox. This used to accept every COMPLETE MTF BUY, so a name the
-    # user bought in the Kite app counted as mine and ate a slot. Only my tags (or mtf_managed) count.
+    """Names this bot opened on Kite (same tag rule as Upstox, or mtf_managed.json). Fail-closed
+    like mine_upstox: an unreadable book raises instead of silently freeing every slot."""
     out = set(_managed())
     try:
         import broker_kite as bk
-        for o in bk.client().orders():
-            if (o.get('product') == 'MTF' and o.get('transaction_type') == 'BUY'
-                    and o.get('status') == 'COMPLETE' and (o.get('tag') or '') in MY_TAGS):
-                out.add(o.get('tradingsymbol'))
+        if not bk.valid():
+            raise BookUnavailable('Kite token invalid')
+        book = bk.client().orders()
+    except BookUnavailable:
+        raise
     except Exception as e:
-        print(f'mtf_sizing: Kite order book read failed in mine_kite: {type(e).__name__}: {e}', file=sys.stderr)
+        raise BookUnavailable(f'Kite order book unreadable: {type(e).__name__}: {e}')
+    if book is None:
+        raise BookUnavailable('Kite order book returned no data')
+    for o in book:
+        try:
+            sym = o['tradingsymbol']; prod = o['product']
+            txn = o['transaction_type']; status = o['status']; tag = o.get('tag') or ''
+        except Exception:
+            continue
+        if prod == 'MTF' and txn == 'BUY' and status == 'COMPLETE' and tag in MY_TAGS:
+            out.add(sym)
     return out
 
 
