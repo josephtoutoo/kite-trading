@@ -70,6 +70,24 @@ def positions():
             "pnl":float(p.get("pnl") or 0),"realised":float(p.get("realised") or 0),"unrealised":float(p.get("unrealised") or 0),
             "product":p.get("product"),"upstox_key":None})
     return out
+def holdings():
+    """Kite holdings normalized: MTF shares carry product MTF, delivery shares CNC. Used by trade_lock R8."""
+    if not valid(): return []
+    try: hs=client().holdings() or []
+    except Exception as e: log(f"holdings fail {e}"); return []
+    out=[]
+    for h in hs:
+        sym=h["tradingsymbol"]; ex=h["exchange"]; tok="KITE|%s|%s"%(ex,sym)
+        mtf=h.get("mtf") or {}
+        mq=int(mtf.get("quantity") or 0); cq=int(h.get("quantity") or 0)+int(h.get("t1_quantity") or 0)
+        base={"broker":"kite","trading_symbol":sym,"exchange":ex,"instrument_token":tok,"is_holding":True,
+              "average_price":float(h.get("average_price") or 0),"buy_price":float(h.get("average_price") or 0),
+              "last_price":float(h.get("last_price") or 0),"pnl":float(h.get("pnl") or 0),"realised":0.0,"unrealised":float(h.get("pnl") or 0),"upstox_key":None}
+        if mq>0:
+            d=dict(base); d.update({"quantity":mq,"product":"MTF","average_price":float(mtf.get("average_price") or base["average_price"])}); out.append(d)
+        if cq>0:
+            d=dict(base); d.update({"quantity":cq,"product":"CNC"}); out.append(d)
+    return out
 def orders():
     if not valid(): return []
     try: od=client().orders() or []

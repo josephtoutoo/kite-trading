@@ -6,6 +6,7 @@ checks underlying trend (index opts 5m, stock opts/futures 15m; CE/FUT need clos
 close<EMA20 & ST red). Intact -> target += entry*0.20, stop floor = target two steps back (1st roll: entry). Broken -> LIMIT sell
 at LTP*0.995 for live qty. Long futures: 1.5% trail from high, target step +2%.
 Only acts 09:15-15:25 IST Mon-Fri. Cancels leftover SELL SL orders on contracts with no long position.
+MTF (4 Nov): Upstox MTF equity longs get a SELL SL-LIMIT at 30% below high (ratchet, limit 0.5% under trigger).
 Kite (4 Nov): also manages Kite long options/futures (Upstox LTP+trend, Kite SL/LIMIT orders); no-op if Kite token invalid.
 --dry-run: read-only, prints intended actions, ignores time window, writes no state."""
 import json,os,sys
@@ -112,6 +113,52 @@ for p in pos:
                 r=write("https://api-hft.upstox.com/v2/order/modify",{"order_id":o["order_id"],"quantity":q,"validity":"DAY","price":tick(t2*(0.99 if fut else 0.95)),"order_type":"SL","trigger_price":t2,"disclosed_quantity":0},method="PUT")
                 acts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":r.get("status"),"err":r.get("body")})
             else: acts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
+# ---------------- Upstox MTF equity (4 Nov): 30% trail below high, never lowered, SL-LIMIT for full qty ----------------
+mtf_longs=set()
+try:
+    mr=req("https://api.upstox.com/v3/portfolio/mtf-positions")
+    if mr.get("status")!="success": acts.append({"action":"MTF_SKIPPED","why":"mtf positions fetch failed","code":mr.get("code")})
+    else:
+        for p in mr.get("data") or []:
+            sym=p.get("trading_symbol"); q=int(p.get("quantity") or 0); k=p.get("instrument_token")
+            if q<=0 or not k: continue
+            mtf_longs.add(k); ltp=float(p.get("last_price") or 0); avg=float(p.get("average_price") or 0)
+            if not ltp or not avg: acts.append({"sym":sym,"action":"MTF_SKIP_NO_PRICE"}); continue
+            s=st.setdefault(k,{"high":avg}); s["sym"]=sym; s["kind"]="MTF_EQ"; s.setdefault("entry",avg)
+            hi=ltp; lcl=0
+            try:
+                import urllib.parse
+                qd=req("https://api.upstox.com/v2/market-quote/quotes?instrument_key="+urllib.parse.quote(k,safe="")).get("data") or {}
+                for v in qd.values(): hi=max(hi,float((v.get("ohlc") or {}).get("high") or 0)); lcl=float(v.get("lower_circuit_limit") or 0)
+            except Exception: pass
+            s["high"]=max(s.get("high",avg),hi)
+            _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":k,"transaction_type":"SELL","order_type":"SL","product":"MTF","quantity":q})
+            if not _ok: acts.append({"sym":sym,"action":"MTF_SKIP_CHECK","why":_why}); continue
+            q=min(q,_aq)
+            sls=[o for o in pending_sl(k) if (o.get("product") or "").upper()=="MTF"]
+            for o in sls[1:]:
+                acts.append({"sym":sym,"action":"CANCEL_DUP_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
+            sls=sls[:1]
+            stop=tick(max(s["high"]*0.70,s.get("stop",0)))
+            if stop>=ltp: acts.append({"sym":sym,"action":"MTF_STOP_AT_OR_ABOVE_LTP","stop":stop,"ltp":ltp}); continue
+            s["stop"]=stop; lim=tick(stop*0.995)
+            if lcl and lim<lcl:  # broker RMS rejects SL limit below the circuit band (seen 4 Nov) - don't spam rejected orders
+                acts.append({"sym":sym,"action":"MTF_SL_BELOW_CIRCUIT_BAND","trigger":stop,"limit":lim,"lower_circuit":lcl,"ltp":ltp}); continue
+            info={"sym":sym,"product":"MTF","qty":q,"avg":avg,"ltp":ltp,"high":s["high"],"trigger":stop,"limit":lim}
+            if not sls:
+                r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":"MTF","validity":"DAY","price":lim,"tag":"trailsl","instrument_token":k,"order_type":"SL","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":stop,"is_amo":False})
+                acts.append({**info,"action":"PLACE_SL","resp":r.get("status"),"order_id":(r.get("data") or {}).get("order_id"),"err":r.get("body")})
+            else:
+                o=sls[0]
+                if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:
+                    t2=max(stop,o["trigger_price"])
+                    r=write("https://api-hft.upstox.com/v2/order/modify",{"order_id":o["order_id"],"quantity":q,"validity":"DAY","price":tick(t2*0.995),"order_type":"SL","trigger_price":t2,"disclosed_quantity":0},method="PUT")
+                    acts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":r.get("status"),"err":r.get("body")})
+                else: acts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
+        for o in orders:
+            if o["transaction_type"]=="SELL" and (o.get("product") or "").upper()=="MTF" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and o["instrument_token"] not in mtf_longs:
+                acts.append({"sym":o.get("trading_symbol"),"action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
+except Exception as e: acts.append({"action":"MTF_ERROR","why":f"{type(e).__name__}: {e}"})
 # stray SELL SLs on option contracts with no long position -> cancel (prevents accidental shorts)
 for o in orders:
     if o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and isopt(o.get("trading_symbol") or o.get("tradingsymbol","")) and o["instrument_token"] not in longs:

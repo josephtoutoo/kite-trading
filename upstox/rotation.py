@@ -1,5 +1,7 @@
 """Equity MTF rotation proposer (PROPOSALS ONLY - places NO orders).
 Rules: max 5 MTF stocks at 10% capital each = 50% total.
+Reserve rule: of the remaining MTF room (50% cap - deployed), only HALF may go to new rotation
+entries; the other half is RESERVED for pullback adds (pullback_add.py only).
 Strong trend: 1h close > EMA20 and Supertrend green, confirmed on daily (close>EMA20, ST green).
 Score = ADX(1h) + 100*MACDhist/close(1h) * 10 + 2*%dist above EMA20(1h) + daily bonus.
 Swap only if best candidate score >= 1.15 x weakest holding AND weakest is weaker/broken."""
@@ -65,15 +67,28 @@ def main():
         if h['value'] > per_cap*1.02:
             tq = int((h['value']-per_cap)/(h['ltp'] or h['close'])) + 1
             acts.append(f"TRIM {h['sym']} sell {tq} (value {h['value']:,} > cap {per_cap:,.0f})")
+    deployed = sum(h['value'] for h in H)
+    freed = sum(h['value'] for h in H if any(a.startswith('CLOSE '+h['sym']+' ') for a in acts))
+    freed += sum(h['value']-per_cap for h in keep if h['value'] > per_cap*1.02)
+    after = deployed - freed; room = max(0.0, 0.5*cap - after)
+    new_room = room/2; reserve = room - new_room
+    print(f"\nMTF deployed {deployed:,.0f} ({100*deployed/cap:.1f}%) | after trims {after:,.0f} | room {room:,.0f} -> new-entry cap {new_room:,.0f}, PULLBACK RESERVE {reserve:,.0f} (not for rotation)")
+    def nq(c):
+        nonlocal new_room
+        amt = min(per_cap, new_room); q = int(amt//c['close']); new_room -= q*c['close']; return q
     ci = 0
     while keep and ci < len(C):
         w = keep[-1]; c = C[ci]
         if c['score'] >= MARGIN*max(w['score'],0.1) and (not w['strong'] or w['score'] < c['score']):
-            acts.append(f"SWAP: CLOSE {w['sym']} ({w['qty']}, score {w['score']}) -> BUY {c['sym']} {int(per_cap//c['close'])} @~{c['close']} (score {c['score']})")
-            keep.pop(); keep.insert(0, dict(c, qty=int(per_cap//c['close']))); keep.sort(key=lambda x:-x['score']); ci += 1
+            new_room += w['value']/2; reserve += w['value']/2; q = nq(c)
+            acts.append(f"SWAP: CLOSE {w['sym']} ({w['qty']}, score {w['score']}) -> BUY {c['sym']} {q} @~{c['close']} (score {c['score']})")
+            keep.pop(); keep.insert(0, dict(c, qty=q)); keep.sort(key=lambda x:-x['score']); ci += 1
         else: break
     while len(keep) < MAXN and ci < len(C):
-        c = C[ci]; ci += 1; acts.append(f"ADD {c['sym']} {int(per_cap//c['close'])} @~{c['close']} (~{per_cap:,.0f})"); keep.append(c)
+        c = C[ci]; ci += 1; q = nq(c)
+        if q <= 0: acts.append(f"SKIP {c['sym']}: new-entry cap used (reserve kept for pullbacks)"); break
+        acts.append(f"ADD {c['sym']} {q} @~{c['close']} (~{q*c['close']:,.0f})"); keep.append(c)
     print("\nPROPOSED ACTIONS (not placed)"); [print(' ', a) for a in acts or ['none']]
+    print(f"New-entry room left {new_room:,.0f} | pullback reserve left {reserve:,.0f}")
     print("\nTARGET BOOK:", ', '.join(k['sym'] for k in keep), f"~{per_cap:,.0f} each")
 if __name__ == '__main__': main()

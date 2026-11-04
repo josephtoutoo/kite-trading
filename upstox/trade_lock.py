@@ -14,7 +14,7 @@ MTF_STOCK_CAP=0.10; MTF_TOTAL_CAP=0.50
 INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FINNIFTY":"NSE_INDEX|Nifty Fin Service",
  "MIDCPNIFTY":"NSE_INDEX|NIFTY MID SELECT","NIFTYNXT50":"NSE_INDEX|Nifty Next 50","SENSEX":"BSE_INDEX|SENSEX","BANKEX":"BSE_INDEX|BANKEX"}
 # ---------------- lock (unchanged API) ----------------
-STOCK_OPT_MAX_UND=2
+STOCK_OPT_MAX_UND=3
 def today(): return datetime.datetime.now(IST).date()
 def next_trading_day(d):
     d=d+datetime.timedelta(days=1)
@@ -53,7 +53,9 @@ def _data(path):
     try: return _get(path).get("data") or []
     except Exception as e: return []
 def sym_of(x): return (x.get("trading_symbol") or x.get("tradingsymbol") or "").upper()
-def is_opt(s): return s.endswith("CE") or s.endswith("PE")
+def is_opt(s):
+    # 4 Nov: a stock named ...CE (e.g. BAJFINANCE) is not an option - require underlying + expiry digits first
+    return bool(re.match(r"^[A-Z&\-]+\d.*(CE|PE)$",(s or "").upper()))
 def underlying(s):
     s=re.sub(r"-EQ$","",s.upper()); m=re.match(r"^([A-Z&\-]+?)(\d{2}[A-Z0-9]{3}|\d{2}N\d{2}|$)",s)
     m2=re.match(r"^[A-Z&\-]+",s); u=m2.group(0) if m2 else s
@@ -91,6 +93,14 @@ def kite_data():
         _cache["_kite"]=(bk.positions(),bk.orders()) if bk.valid() else ([],[])
     except Exception: _cache["_kite"]=([],[])
     return _cache["_kite"]
+def _kite_holdings():
+    """Kite holdings normalized to positions (MTF/CNC) so R8/R6 see settled shares, not just day positions."""
+    if "_kiteh" in _cache: return _cache["_kiteh"]
+    try:
+        import broker_kite as bk
+        _cache["_kiteh"]=bk.holdings() if bk.valid() and hasattr(bk,"holdings") else []
+    except Exception: _cache["_kiteh"]=[]
+    return _cache["_kiteh"]
 def _decisions(filled,now):
     """Index-option BUY decisions today across brokers: an Upstox+Kite pair (same index, same CE/PE, within 5 min,
     different brokers) counts as ONE decision."""
@@ -118,7 +128,8 @@ def check_order(order,broker="upstox"):
     kpos,kord=kite_data()
     filled=[o for o in orders+kord if o.get("status")=="complete" and (_ts(o) or now)<=now]
     upos=pos
-    if broker=="kite": pos=kpos; mtf=[]
+    if broker=="kite":
+        pos=kpos+_kite_holdings(); mtf=[]
     block=[]; flags=[]; adj=qty
     allpos=pos+[m for m in mtf if m.get("instrument_token") not in {p.get("instrument_token") for p in pos}]
     held=[p for p in allpos if p.get("instrument_token")==k or (sym and sym_of(p)==sym)]
@@ -168,13 +179,14 @@ def check_order(order,broker="upstox"):
         # rule 11: stock options - max 2 underlyings, max 1 lot per underlying (incl. holdings)
         if opt and not idx_opt and ((k or "").startswith(("NSE_FO","BSE_FO")) or not k):
             longs={}
+            # 4 Nov: per-broker count (user: Kite has no stock options, so its slots are free)
             for p in pos:
                 sp=sym_of(p); q=int(p.get("quantity") or 0)
                 if q>0 and is_opt(sp) and not is_index(sp):
                     longs.setdefault(underlying(sp),[]).append(p)
             others=[u for u in longs if u!=und]
             if und not in longs and len(others)>=STOCK_OPT_MAX_UND:
-                block.append(f"R11: already long options in {len(others)} stocks ({', '.join(sorted(others))}) - max {STOCK_OPT_MAX_UND}, no third")
+                block.append(f"R11: already long options in {len(others)} stocks ({', '.join(sorted(others))}) - max {STOCK_OPT_MAX_UND}")
             lot=lot_size(k,sym) if k else None
             if not lot: block.append("R11: lot size not found for "+(k or sym)+" - cannot verify 1-lot cap")
             else:
