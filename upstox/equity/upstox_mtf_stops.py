@@ -134,6 +134,10 @@ def main():
 
     rec = load_stops()
     stops = rec.setdefault('stops', {})
+    # t331u: only names this bot opened may have their stop trailed. A name the user bought
+    # themselves gets a plain protective stop, placed once and never raised (rule 7 / rule 4).
+    # mine_upstox() is fail-closed and raises if the order book can't be read.
+    mine = ms.mine_upstox()
     acts = []
     for sym in sorted(held):
         h = held[sym]
@@ -152,6 +156,13 @@ def main():
         if stx and d == 1 and stx < ltp and stx > pct_stop:
             cand = stx                                  # Supertrend nearer, still below price
         cur = live_sl.get(sym) or []
+        own = sym in mine
+        if not own and cur:
+            # The user's own holding already has a live stop: leave it exactly as it is.
+            acts.append(dict(sym=sym, action='KEEP', order=cur[0]['order_id'],
+                             trigger=cur[0].get('trigger_price'), ltp=ltp,
+                             why="user's own MTF holding: protective stop only, never trailed"))
+            continue
         floor = max([float(stops.get(sym) or 0)] + [float(o.get('trigger_price') or 0) for o in cur])
         floor_note = None
         if floor >= ltp:
@@ -211,26 +222,35 @@ def main():
                          'cancel': [o['order_id'] for o in stale] or None,
                          'why': 'would cancel stale SL(s) and place fresh SL SELL' if stale else 'would place SL SELL'})
             continue
-        # An overnight GTT and a day SL on the same position would both fire and sell twice.
-        # The GTT goes first; if it cannot be cancelled, no day SL is placed and the GTT stays as cover.
+        # New stop FIRST, old stops cancelled only after it is confirmed live. Cancelling first
+        # left the position naked whenever the placement failed (circuit, R9, dropped connection).
+        r = req('https://api-hft.upstox.com/v2/order/place', {
+            'quantity': int(qty2), 'product': 'MTF', 'validity': 'DAY', 'price': limit, 'tag': 'trailsl',
+            'instrument_token': key, 'order_type': 'SL', 'transaction_type': 'SELL',
+            'disclosed_quantity': 0, 'trigger_price': trig, 'is_amo': False}, 'POST')
+        oid = (r.get('data') or {}).get('order_id')
+        if not oid:
+            # The old stops are untouched, so the position is still covered.
+            acts.append({**info, 'action': 'FAIL', 'qty': qty2, 'old_stops_kept': [o['order_id'] for o in stale] or None,
+                         'why': str(r.get('body') or r)[:200]})
+            continue
+        # The day SL is confirmed live, so the position is covered. Only now retire the overnight GTT:
+        # a GTT plus a day SL on one position would both fire and sell the quantity twice.
         try:
             import gtt_overnight as gtt
             ok_g, det_g = gtt.cancel_for_day('upstox', sym, key=key)
         except Exception as e:
             ok_g, det_g = False, f'{type(e).__name__}: {e}'
         if not ok_g:
-            acts.append({**info, 'action': 'GTT_FAIL', 'qty': qty2,
-                         'why': f'overnight GTT could not be cancelled, day SL not placed: {det_g}'})
+            # Two live stops is a double-sell. Undo the day SL and leave the GTT as the protection.
+            req('https://api-hft.upstox.com/v2/order/cancel?order_id=' + oid, None, 'DELETE')
+            acts.append({**info, 'action': 'GTT_FAIL', 'qty': qty2, 'day_sl_removed': oid,
+                         'why': f'overnight GTT could not be cancelled, new day SL removed so nothing sells twice: {det_g}'})
             continue
         cancelled = []
         for o in stale:
-            r = req('https://api-hft.upstox.com/v2/order/cancel?order_id=' + o['order_id'], None, 'DELETE')
-            cancelled.append({'order': o['order_id'], 'resp': r.get('status') or r})
-        r = req('https://api-hft.upstox.com/v2/order/place', {
-            'quantity': int(qty2), 'product': 'MTF', 'validity': 'DAY', 'price': limit, 'tag': 'trailsl',
-            'instrument_token': key, 'order_type': 'SL', 'transaction_type': 'SELL',
-            'disclosed_quantity': 0, 'trigger_price': trig, 'is_amo': False}, 'POST')
-        oid = (r.get('data') or {}).get('order_id')
+            r2 = req('https://api-hft.upstox.com/v2/order/cancel?order_id=' + o['order_id'], None, 'DELETE')
+            cancelled.append({'order': o['order_id'], 'resp': r2.get('status') or r2})
         if oid:
             stops[sym] = trig
             acts.append({**info, 'action': 'PLACE', 'qty': qty2, 'order': oid, 'cancelled': cancelled or None})

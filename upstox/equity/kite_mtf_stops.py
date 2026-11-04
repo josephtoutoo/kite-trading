@@ -121,7 +121,14 @@ def main():
             acts.append(dict(sym=sym, action='SKIP', why='no quote')); continue
         exch = 'BSE' if key.startswith('BSE_') else 'NSE'
         mtf = int((next((h.get('mtf') or {} for h in kh if h['tradingsymbol'] == sym), {}) or {}).get('quantity') or 0)
-        want = mtf or int(round(held[sym] / max(ltp, 1e-9)))
+        # held[sym] is a COST (qty x average price), not a share count: dividing it by LTP gave a
+        # meaningless quantity whenever the price had moved. Use the real MTF share count, and when
+        # holdings do not carry one, fall back to the live day position instead of a price division.
+        posq = int(next((p.get('quantity') or 0 for p in (k.positions().get('net') or [])
+                         if p.get('tradingsymbol') == sym and p.get('product') == 'MTF'), 0) or 0)
+        want = mtf or posq
+        if not want:
+            acts.append(dict(sym=sym, action='SKIP', why='no MTF share count (holdings and positions both blank)')); continue
         stx, d = st_1h(key)
         pct_stop = ltp * (1 - PCT / 100.0)
         cand = pct_stop
@@ -154,8 +161,28 @@ def main():
                 continue
             if DRY:
                 acts.append(dict(sym=sym, action='RAISE(dry)', frm=cur['trigger_price'], to=trig, ltp=ltp)); continue
-            bk.modify(cur['order_id'], want, limit, trig, order_type='SL')
-            acts.append(dict(sym=sym, action='RAISE', frm=cur['trigger_price'], to=trig, ltp=ltp, order=cur['order_id']))
+            # Verify the modify: an unchecked call reported RAISE even when Kite rejected it, so the
+            # stop stayed at the old level while the log said it had moved.
+            try:
+                res = bk.modify(cur['order_id'], want, limit, trig, order_type='SL')
+            except Exception as e:
+                res = None
+                acts.append(dict(sym=sym, action='FAIL', why=f'modify raised {type(e).__name__}: {e}',
+                                 frm=cur['trigger_price'], to=trig, ltp=ltp, order=cur['order_id']))
+                continue
+            try:
+                live = {o['order_id']: o for o in k.orders()} if isinstance(k.orders(), list) else {}
+            except Exception:
+                live = {}
+            now_trig = float(((live.get(cur['order_id']) or {}).get('trigger_price')) or 0)
+            if now_trig and abs(now_trig - trig) <= max(tick, 0.01):
+                acts.append(dict(sym=sym, action='RAISE', frm=cur['trigger_price'], to=trig, ltp=ltp, order=cur['order_id']))
+            elif res in (None, False) and not live:
+                acts.append(dict(sym=sym, action='RAISE?', frm=cur['trigger_price'], to=trig, ltp=ltp,
+                                 order=cur['order_id'], why='modify sent, order book unreadable to confirm - check'))
+            else:
+                acts.append(dict(sym=sym, action='FAIL', frm=cur['trigger_price'], to=trig, ltp=ltp,
+                                 order=cur['order_id'], why=f'modify not applied (stop reads {now_trig or "unknown"})'))
         else:
             if DRY:
                 acts.append(dict(sym=sym, action='PLACE(dry)', qty=want, trigger=trig, limit=limit, ltp=ltp)); continue

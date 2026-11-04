@@ -55,10 +55,21 @@ def _get(path):
     """GET api.upstox.com + path, cached for the life of this process (one decision per run)."""
     if path in _cache: return _cache[path]
     _cache[path]=api.get(path); return _cache[path]
-def _data(path):
-    try: return _get(path).get("data") or []
+class ReadFailed(RuntimeError):
+    """A broker read this decision depends on failed. Never treat that as 'nothing there'
+    (5 Nov 2026): an empty positions/orders list silently zeroes the day-P&L breaker, the
+    index-decision count and the MTF caps, so a BUY would pass every check it should fail."""
+
+
+def _data(path, strict=False):
+    try:
+        r=_get(path)
+        if strict and (not isinstance(r,dict) or r.get("status")!="success" or r.get("data") is None):
+            raise ReadFailed(f"{path.split('?')[0]} returned no usable data")
+        return r.get("data") or []
     except Exception as e:
         print(f"trade_lock: read failed for {path.split('?')[0]}: {type(e).__name__}: {str(e)[:160]}",file=sys.stderr)
+        if strict: raise
         return []
 def sym_of(x): return (x.get("trading_symbol") or x.get("tradingsymbol") or "").upper()
 def is_opt(s):
@@ -110,14 +121,21 @@ def _lotmap(f):
     _cache[("lotmap",f)]=lm
     return lm
 # ---------------- rules ----------------
+_kite_err=[]   # why the Kite book is unusable this run ([] = a clean read). A BUY is refused on any entry.
 def kite_data():
-    """Kite positions/orders (normalized) or ([],[]) when Kite token invalid - never raises."""
+    """Kite positions/orders (normalized) or ([],[]) when Kite token invalid - never raises.
+    Every failure is recorded in _kite_err so a BUY fails closed on it instead of seeing an empty book."""
     if "_kite" in _cache: return _cache["_kite"]
     try:
         import broker_kite as bk
-        _cache["_kite"]=(bk.positions(),bk.orders()) if bk.valid() else ([],[])
+        if not bk.valid():
+            _kite_err.append(f"Kite token invalid ({getattr(bk,'why',lambda:'')() or 'no session'})")
+            _cache["_kite"]=([],[])
+        else:
+            _cache["_kite"]=(bk.positions(),bk.orders())
     except Exception as e:
         print(f"trade_lock: Kite positions/orders unavailable: {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
+        _kite_err.append(f"Kite positions/orders unreadable: {type(e).__name__}: {str(e)[:120]}")
         _cache["_kite"]=([],[])
     return _cache["_kite"]
 def _kite_holdings():
@@ -128,6 +146,7 @@ def _kite_holdings():
         _cache["_kiteh"]=bk.holdings() if bk.valid() and hasattr(bk,"holdings") else []
     except Exception as e:
         print(f"trade_lock: Kite holdings unavailable: {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
+        _kite_err.append(f"Kite holdings unreadable: {type(e).__name__}: {str(e)[:120]}")
         _cache["_kiteh"]=[]
     return _cache["_kiteh"]
 def _kite_mtf():
@@ -152,6 +171,7 @@ def _kite_mtf():
             rows=list(seen.values())
     except Exception as e:
         print(f"trade_lock: Kite MTF rows unavailable (R10 reads empty): {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
+        _kite_err.append(f"Kite MTF book unreadable: {type(e).__name__}: {str(e)[:120]}")
         rows=[]
     _cache["_kitemtf"]=rows
     return rows
@@ -176,8 +196,15 @@ def check_order(order,broker="upstox"):
     sym=sym_of(order); side=(order.get("transaction_type") or "").upper(); ot=(order.get("order_type") or "").upper()
     prod=(order.get("product") or "").upper(); qty=int(order.get("quantity") or 0); k=order.get("instrument_token")
     und=underlying(sym); opt=is_opt(sym); idx_opt=opt and is_index(sym)
-    orders=_data("/v2/order/retrieve-all"); pos=_data("/v2/portfolio/short-term-positions")
-    mtf=_data("/v3/portfolio/mtf-positions")
+    # A BUY passes only on a complete picture of the book. If any read fails we cannot know the
+    # day P&L, today's decisions or the MTF exposure, so the honest answer is "not allowed".
+    # SELLs keep the old lenient behaviour: R8 already blocks an unprotected sell.
+    strict = side=="BUY"
+    try:
+        orders=_data("/v2/order/retrieve-all",strict=strict); pos=_data("/v2/portfolio/short-term-positions",strict=strict)
+        mtf=_data("/v3/portfolio/mtf-positions",strict=strict)
+    except ReadFailed as e:
+        return False,[f"R0: broker read failed ({e}) - a BUY cannot be cleared without the full book"],0
     funds=_data("/v2/user/get-funds-and-margin") or {}
     eq=funds.get("equity",{}) if isinstance(funds,dict) else {}
     capital=float(eq.get("available_margin") or 0)+float(eq.get("used_margin") or 0)
@@ -196,6 +223,12 @@ def check_order(order,broker="upstox"):
     if broker=="kite":
         pos=kpos+_kite_holdings(); mtf=_kite_mtf()
     block=[]; flags=[]; adj=qty
+    if side=="BUY":
+        # Every cap below is a fraction of capital, so a funds read that failed quietly sets capital
+        # to 0 and the caps still "work" - but R2's day-loss breaker and the Kite half of it are then
+        # blind. Refuse the BUY instead of clearing it on a partial picture.
+        if capital<=0: block.append("R0: capital unreadable (funds call returned nothing) - a BUY cannot be sized")
+        for e in _kite_err: block.append(f"R0: {e} - a BUY needs the Kite book readable")
     allpos=pos+[m for m in mtf if m.get("instrument_token") not in {p.get("instrument_token") for p in pos}]
     held=[p for p in allpos if p.get("instrument_token")==k or (sym and sym_of(p)==sym)]
     held_q=sum(int(p.get("quantity") or 0) for p in held)
@@ -270,19 +303,50 @@ def check_order(order,broker="upstox"):
         px=float(order.get("price") or 0) or ltp or 0
         if prod=="MTF":
             # 4 Nov 2026 (t292u): R10 caps are measured on the MTF MARGIN the broker blocks, not on price x qty.
-            mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
-            this=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf if m.get("instrument_token")==k or sym_of(m)==und)
-            ratio=1.0
+            # 5 Nov 2026 (t304u): only names THIS bot opened count toward the caps, and each holding is
+            # converted to margin at its OWN rate. The single ratio taken from the new order used to be
+            # applied to every holding, which over- or under-stated the book whenever the names differed
+            # (a 4x-leverage stock and a 5x-leverage one do not share a margin rate).
+            rows=mtf
+            qty_by={}
+            for m in rows:
+                q0=int(m.get("quantity") or 0)
+                if q0>0:
+                    nm=sym_of(m).replace("-EQ","")
+                    qty_by[nm]=qty_by.get(nm,0)+q0
             try:
                 sys.path.insert(0,"/workspace/equity")
                 import mtf_sizing as _ms
+                mine=_ms.mine_upstox() if broker=="upstox" else _ms.mine_kite()
                 q=_ms.margin_quote(broker,und,qty,px)
                 if q.get("ok") and px and qty: ratio=float(q["margin"])/(px*qty)
-                else: block.append(f"R10: MTF margin quote failed ({q.get('why','no quote')}) - cannot size on margin")
-            except Exception as e: block.append(f"R10: MTF margin sizing unavailable ({type(e).__name__}: {e})")
-            this_m=this*ratio; total_m=mtf_total*ratio; new_m=px*qty*ratio
+                else:
+                    ratio=1.0
+                    block.append(f"R10: MTF margin quote failed ({q.get('why','no quote')}) - cannot size on margin")
+                new_m=float(q["margin"]) if q.get("ok") else px*qty*ratio
+                # margin already blocked by the same name (mine or the user's own: buying it makes it mine)
+                held_here=[(nm,qq) for nm,qq in qty_by.items() if nm==und]
+                avg_here=next((float(m.get("average_price") or 0) for m in rows
+                               if sym_of(m).replace("-EQ","")==und and int(m.get("quantity") or 0)>0),0.0)
+                this_m=0.0
+                for nm,qq in held_here:
+                    hq=_ms.margin_quote(broker,nm,qq,avg_here)
+                    this_m+=float(hq["margin"]) if hq.get("ok") else qq*avg_here*ratio
+                # everything else this bot owns, at each name's own margin
+                total_m=0.0; unpriced=[]
+                for nm,qq in qty_by.items():
+                    if nm==und or nm not in mine: continue
+                    av=next((float(m.get("average_price") or 0) for m in rows
+                             if sym_of(m).replace("-EQ","")==nm and int(m.get("quantity") or 0)>0),0.0)
+                    hq=_ms.margin_quote(broker,nm,qq,av)
+                    if hq.get("ok"): total_m+=float(hq["margin"])
+                    else: total_m+=qq*av*ratio; unpriced.append(nm)
+                if unpriced: flags.append(f"R10: margin quote unavailable for {','.join(unpriced)} - counted at this order's rate")
+            except Exception as e:
+                ratio=1.0; new_m=px*qty; this_m=0.0; total_m=0.0
+                block.append(f"R10: MTF margin sizing unavailable ({type(e).__name__}: {e})")
             if this_m+new_m>capital*MTF_STOCK_CAP: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > 10% cap Rs {capital*MTF_STOCK_CAP:,.0f}")
-            if total_m+new_m>capital*MTF_TOTAL_CAP: block.append(f"R10: total MTF margin Rs {total_m+new_m:,.0f} > 50% cap Rs {capital*MTF_TOTAL_CAP:,.0f}")
+            if total_m+new_m>capital*MTF_TOTAL_CAP: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > 50% cap Rs {capital*MTF_TOTAL_CAP:,.0f}")
         elif opt or sym.endswith("FUT"):
             mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
             fno_lim=min(capital*0.5,capital-mtf_total)

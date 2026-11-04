@@ -4,7 +4,19 @@ import os, sys, time, json, subprocess, requests, pyotp
 from playwright.sync_api import sync_playwright
 
 BASE = "/workspace/upstox"; TOKEN = f"{BASE}/token.json"; SHOT = f"{BASE}/auto_login_fail.png"
-MOBILE = os.environ["UPSTOX_MOBILE"]; SERVER = "http://127.0.0.1:8001"
+SERVER = "http://127.0.0.1:8001"
+# The login mobile is personal data, so it is NOT in this file: it comes from the environment, or from
+# a local 0600 file beside this script that is never committed (.upstox_mobile, git-ignored).
+def _mobile():
+    m = (os.environ.get("UPSTOX_MOBILE") or "").strip()
+    if m: return m
+    try:
+        return open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".upstox_mobile")).read().strip()
+    except Exception:
+        return ""
+MOBILE = _mobile()
+if not MOBILE:
+    raise SystemExit("UPSTOX_MOBILE is not set (env var or .upstox_mobile beside this script)")
 
 def server_up():
     try: requests.get(SERVER + "/", timeout=3); return True

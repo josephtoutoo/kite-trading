@@ -63,7 +63,9 @@ import sl_confirm as sc  # clears SL_CONFIRM_FAILED once a live SL is seen
 # (5 Nov) include Upstox MTF equity P&L: it is not in short-term-positions, so the breaker used to
 # miss it. One bad MTF day could cross the Rs 30,000 cutoff without ever locking the account.
 try:
-    _mtfp=(req("https://api.upstox.com/v3/portfolio/mtf-positions").get("data") or [])
+    _mr0=req("https://api.upstox.com/v3/portfolio/mtf-positions")
+    _mtfp=(_mr0.get("data") or [])
+    if _mr0.get("status")!="success": _mtfp=[]
 except Exception:
     _mtfp=[]
 day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos+_mtfp)
@@ -134,9 +136,15 @@ for p in pos:
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
         acts.append({"sym":sym,"action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"pnl_est":round((lim-avg)*q),"resp":r.get("status"),"err":r.get("body")})
         continue
+    # 5 Nov (audit #8): the target roll used to raise the stop floor above entry, i.e. a trailing stop.
+    # That contradicts the rule for options (t288u): a FIXED 30% stop under entry that never trails from
+    # the peak, with the trend exit being the only thing that moves an index option out of a winner.
+    # Futures keep the floor they were designed with; options get it only as a plain %-of-entry stop.
     while ltp>=s["target"]:
-        prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,round(prev-avg*STEP,2),avg)  # stop = target two steps back (1st roll: breakeven)
-        acts.append({**{"sym":sym},"action":"ROLL_TARGET","from":prev,"to":s["target"],"trend":why})
+        prev=s["target"]; s["target"]=round(prev+avg*STEP,2)
+        if fut: floor=max(floor,round(prev-avg*STEP,2),avg)
+        acts.append({**{"sym":sym},"action":"ROLL_TARGET","from":prev,"to":s["target"],"trend":why,
+                     "stop_floor_moved":bool(fut)})
     if True:
         # 30% fixed floor under entry (never lowered); floor rises only when a target rolls
         stop=tick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
@@ -166,7 +174,7 @@ for p in pos:
 # or the 1h Supertrend when nearer, never lowered, clamped inside the circuit band), and having
 # two writers on the same orders made whichever ran last win. risk_manager keeps only the
 # bookkeeping job: cancel a leftover MTF SELL SL on a name that is no longer held.
-mtf_longs=set()
+mtf_longs=set(); mtf_known=False
 try:
     mr=req("https://api.upstox.com/v3/portfolio/mtf-positions")
     if mr.get("status")!="success":
@@ -175,9 +183,28 @@ try:
         for p in mr.get("data") or []:
             k=p.get("instrument_token")
             if k and int(p.get("quantity") or 0)>0: mtf_longs.add(k)
+        # 5 Nov: an empty/partial MTF list is NOT proof that every MTF SL is stray. It has happened
+        # (a truncated payload, or a real book that reads [] for a moment) and this sweep then
+        # cancelled live stops on every MTF holding. Only sweep when the book either shows something
+        # or short-term positions independently agree the name is gone.
+        st_keys={p.get("instrument_token") for p in pos if int(p.get("quantity") or 0)>0}
+        mtf_known=bool(mtf_longs)
+        if not mtf_known:
+            acts.append({"action":"MTF_EMPTY","why":"MTF book read empty - stray MTF stop sweep skipped (an empty book is not proof a position closed)"})
         for o in orders:
-            if o["transaction_type"]=="SELL" and (o.get("product") or "").upper()=="MTF" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and o["instrument_token"] not in mtf_longs:
-                acts.append({"sym":o.get("trading_symbol"),"action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
+            if not (o["transaction_type"]=="SELL" and (o.get("product") or "").upper()=="MTF"
+                    and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M")):
+                continue
+            if o["instrument_token"] in mtf_longs: continue
+            if not mtf_known and o["instrument_token"] in st_keys:
+                acts.append({"sym":o.get("trading_symbol"),"action":"KEEP_SL","order":o["order_id"],
+                             "why":"MTF book read empty but short-term positions still hold it"})
+                continue
+            if not mtf_known:
+                acts.append({"sym":o.get("trading_symbol"),"action":"KEEP_SL","order":o["order_id"],
+                             "why":"MTF book read empty - not cancelling a stop on an unconfirmed close"})
+                continue
+            acts.append({"sym":o.get("trading_symbol"),"action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
 except Exception as e: acts.append({"action":"MTF_ERROR","why":f"{type(e).__name__}: {e}"})
 # stray SELL SLs on option contracts with no long position -> cancel (prevents accidental shorts)
 for o in orders:
@@ -226,8 +253,10 @@ try:
                 kacts.append({"sym":sym,"broker":"kite","action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"resp":r})
                 continue
             while ltp>=s["target"]:
-                prev=s["target"]; s["target"]=round(prev+avg*STEP,2); floor=max(floor,round(prev-avg*STEP,2),avg)
-                kacts.append({"sym":sym,"broker":"kite","action":"ROLL_TARGET","from":prev,"to":s["target"],"trend":why})
+                prev=s["target"]; s["target"]=round(prev+avg*STEP,2)
+                if fut: floor=max(floor,round(prev-avg*STEP,2),avg)
+                kacts.append({"sym":sym,"broker":"kite","action":"ROLL_TARGET","from":prev,"to":s["target"],
+                              "trend":why,"stop_floor_moved":bool(fut)})
             if True:
                 stop=tick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
                 if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))

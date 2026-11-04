@@ -41,6 +41,8 @@ JITTER = 0.25               # +- fraction on each backoff, so routines that fail
 ERRLF = os.path.join(D, 'api_errors.log')   # one line per GET that exhausted its retries
 
 _pool = {}                  # (host, proxy) -> http.client.HTTPSConnection
+_last_used = {}             # (host, proxy) -> monotonic time of the last completed request
+WRITE_IDLE = 30.0           # seconds: a write on a connection idle longer than this starts fresh
 _tok = {'stamp': None, 'value': None}
 _ctx = None
 
@@ -111,6 +113,7 @@ def _conn(host, proxy, timeout):
 
 
 def _drop(key):
+    _last_used.pop(key, None)
     c = _pool.pop(key, None)
     if c is not None:
         try:
@@ -134,6 +137,13 @@ def _attempt(url, body, method, proxy, timeout, extra_headers):
     if extra_headers:
         hdrs.update(extra_headers)
     c, key = _conn(host, proxy, timeout)
+    # 5 Nov 2026: an order POST on a connection that has been idle for a while is the one call where a
+    # dead keep-alive socket is expensive - the write may have reached the broker before the read side
+    # failed, and a POST is never retried. Open a fresh connection for it instead of gambling.
+    if method in ('POST', 'PUT', 'DELETE', 'PATCH') and key in _last_used \
+            and time.monotonic() - _last_used[key] > WRITE_IDLE:
+        _drop(key)
+        c, key = _conn(host, proxy, timeout)
     try:
         c.timeout = timeout
         c.request(method, path, body=data, headers=hdrs)
@@ -141,7 +151,9 @@ def _attempt(url, body, method, proxy, timeout, extra_headers):
         text = resp.read().decode('utf-8', 'replace')
     except Exception:
         _drop(key)          # stale keep-alive or broken socket: never put it back
+        _last_used.pop(key, None)
         raise
+    _last_used[key] = time.monotonic()
     if resp.will_close:
         _drop(key)
     return resp.status, text

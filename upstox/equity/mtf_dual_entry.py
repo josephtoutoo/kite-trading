@@ -54,6 +54,95 @@ def quote(key):
     return list(d.values())[0] if d else {}
 
 
+LOCK = os.path.join(D, 'mtf_dual_entry.lock')
+LIVE_STATUS = ('open', 'open pending', 'trigger pending', 'put order req received',
+               'validation pending', 'modify pending', 'complete', 'amo req received')
+
+
+class AlreadyPlaced(RuntimeError):
+    """A BUY for this name is already live or complete today. Two runs racing, or a retry after a
+    write whose answer was lost, must never buy the same MTF name twice on one broker."""
+
+
+class _RunLock:
+    """One mtf_dual_entry run at a time. Two concurrent runs (a scan and a mirror, or a routine
+    overlapping a manual call) would each read the same pre-order book and each buy the same name."""
+
+    def __enter__(self):
+        for _ in range(2):
+            try:
+                fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - os.path.getmtime(LOCK)
+                    pid = int(open(LOCK).read().strip() or 0)
+                except Exception:
+                    age, pid = 999, 0
+                alive = False
+                if pid:
+                    try:
+                        os.kill(pid, 0)
+                        alive = True
+                    except Exception:
+                        alive = False
+                if age > 900 or not alive:      # stale lock from a killed run
+                    try:
+                        os.remove(LOCK)
+                    except Exception:
+                        pass
+                    continue
+                raise RuntimeError(f'another mtf_dual_entry run holds the lock (pid {pid}, {age:.0f}s old)')
+        raise RuntimeError('could not take the entry lock')
+
+    def __exit__(self, *a):
+        try:
+            os.remove(LOCK)
+        except Exception:
+            pass
+        return False
+
+
+def _orders_today():
+    """(upstox, kite) order lists for today. Raises on a failed read: this feeds the
+    "did my order actually go through?" question, where an empty list is the wrong answer."""
+    u = req('https://api.upstox.com/v2/order/retrieve-all')
+    if u.get('status') != 'success':
+        raise RuntimeError(f"Upstox order book unreadable: {u.get('code')} {(u.get('body') or '')[:120]}")
+    import broker_kite as bk
+    if not bk.valid():
+        raise RuntimeError('Kite token invalid')
+    return (u.get('data') or []), bk.orders(strict=True)
+
+
+def _already(symbol, broker=None):
+    """An order of MINE still live or already filled today for this name, on one broker or both."""
+    u, k = _orders_today()
+    tag = 'rotation'
+    hits = []
+    if broker in (None, 'upstox'):
+        want = symbol if symbol.endswith('-EQ') else symbol + '-EQ'
+        for o in u:
+            if (o.get('transaction_type') == 'BUY' and o.get('product') == 'MTF'
+                    and (o.get('tag') or '') in ms.MY_TAGS
+                    and o.get('trading_symbol', '').upper() == want.upper()
+                    and (o.get('status') or '').lower() in LIVE_STATUS):
+                hits.append({'broker': 'upstox', 'order_id': o.get('order_id'),
+                             'status': o.get('status'), 'qty': o.get('quantity')})
+    if broker in (None, 'kite'):
+        for o in k:
+            if ((o.get('transaction_type') or '').upper() == 'BUY' and (o.get('product') or '') == 'MTF'
+                    and (o.get('tag') or '') in ms.MY_TAGS
+                    and (o.get('tradingsymbol') or '').upper() == symbol.upper()
+                    and (o.get('status') or '').lower() in LIVE_STATUS):
+                hits.append({'broker': 'kite', 'order_id': o.get('order_id'),
+                             'status': o.get('status'), 'qty': o.get('quantity')})
+    return hits
+
+
 def load():
     try:
         return json.load(open(REC))
@@ -110,7 +199,36 @@ def sl_level(key, ltp, entry):
         return round(ltp * 0.95, 2), None
 
 
-def buy(symbol, price, mode='new', qty=None):
+def buy(symbol, price, mode='new', qty=None, _p=None):
+    with _RunLock():
+        return _buy(symbol, price, mode, qty)
+
+
+def _placed_leg(resp, symbol, tag):
+    """Did this write land? A timeout/connection reset gives no order id but the order may well be
+    live on the broker, so ask the order book by tag+symbol before concluding nothing happened."""
+    oid = (resp.get('data') or {}).get('order_id') if isinstance(resp, dict) else None
+    if oid:
+        return oid, 'placed'
+    try:
+        hits = _already(symbol)
+    except Exception as e:
+        return None, f'write answer unclear and the order book is unreadable ({type(e).__name__}: {e}) - CHECK THE BROKER before retrying'
+    same = [h for h in hits if h['broker'] == 'upstox']
+    if same:
+        return same[0]['order_id'], 'recovered from the order book after an unclear write'
+    return None, (resp.get('body') if isinstance(resp, dict) else str(resp)) or 'no order id'
+
+
+def _buy(symbol, price, mode='new', qty=None):
+    try:
+        prior = _already(symbol)
+    except Exception as e:
+        # cannot prove the name is not already being bought, so do not buy it
+        return {'symbol': symbol, 'action': f'NOT PLACED: could not read the order book to rule out a duplicate buy ({type(e).__name__}: {e})'}
+    if prior:
+        return {'symbol': symbol, 'action': 'NOT PLACED: a BUY of this name is already live/filled today - ' +
+                ', '.join(f"{h['broker']} {h['order_id']} ({h['status']})" for h in prior), 'already': prior}
     p = plan(symbol, price, mode, qty)
     if not p['both_ok']:
         p['action'] = 'NOT PLACED: one leg cannot take it (mirror must be whole)'
@@ -136,10 +254,10 @@ def buy(symbol, price, mode='new', qty=None):
             'instrument_token': key, 'order_type': 'LIMIT', 'transaction_type': 'BUY',
             'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}
     r = req('https://api-hft.upstox.com/v2/order/place', body, 'POST')
-    oid = (r.get('data') or {}).get('order_id')
+    oid, how = _placed_leg(r, symbol, 'rotation')
     ms.forget()          # the book has moved: never let the next read reuse a pre-order snapshot
     p['legs']['upstox']['order_id'] = oid
-    p['legs']['upstox']['response'] = {'code': r.get('code'), 'body': r.get('body')} if not oid else 'placed'
+    p['legs']['upstox']['response'] = how if oid else {'code': r.get('code'), 'body': r.get('body')}
     # --- Kite leg ---
     if oid:
         import broker_kite as bk
@@ -159,29 +277,55 @@ def buy(symbol, price, mode='new', qty=None):
             p['legs']['kite']['trade_lock'] = {'allowed': kok, 'reasons': kre, 'adjusted_qty': kadj}
             if kok and kadj > 0:
                 kid = bk.place(m['exchange'], m['tradingsymbol'], 'BUY', kadj, price, tag='rotation', product='MTF')
+                if not kid:
+                    # Same rule as the Upstox write: a None here can hide an order that did land.
+                    try:
+                        hits = [h for h in _already(symbol, broker='kite')]
+                    except Exception as e:
+                        hits = []
+                        p['legs']['kite']['error'] = f'Kite write answer lost and the book is unreadable ({e}) - CHECK KITE'
+                    if hits:
+                        kid = hits[0]['order_id']
+                        p['legs']['kite']['recovered'] = 'order found in the Kite book after an unclear write'
                 p['legs']['kite']['order_id'] = kid
                 kq = kadj
             else:
                 p['legs']['kite']['error'] = 'trade_lock refused: ' + '; '.join(kre)
     if not kid:
-        # never leave a half mirror: cancel the Upstox order and say so
+        # never leave a half mirror: undo the Upstox leg, by cancelling it if it is still live or by
+        # selling back whatever already filled, and say exactly which happened
         if oid:
-            req('https://api-hft.upstox.com/v2/order/cancel?order_id=' + oid, None, 'DELETE')
-            p['action'] = 'Upstox order cancelled: the Kite leg could not be placed'
+            ms.forget()
+            d0 = (req('https://api.upstox.com/v2/order/details?order_id=' + oid).get('data') or {})
+            st0 = (d0.get('status') or '').lower()
+            fq = int(d0.get('filled_quantity') or 0)
+            if fq > 0:
+                r3 = req('https://api-hft.upstox.com/v2/order/place', {
+                    'quantity': fq, 'product': 'MTF', 'validity': 'DAY', 'price': price, 'tag': 'rotation',
+                    'instrument_token': key, 'order_type': 'LIMIT', 'transaction_type': 'SELL',
+                    'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}, 'POST')
+                p['unwind_upstox'] = {'qty': fq, 'sell_order': (r3.get('data') or {}).get('order_id'),
+                                      'resp': None if (r3.get('data') or {}).get('order_id') else r3}
+                p['action'] = (f'Kite leg failed AFTER Upstox filled {fq}: sold {fq} back on Upstox to keep the '
+                               f'mirror whole - check that the sell-back filled')
+            else:
+                req('https://api-hft.upstox.com/v2/order/cancel?order_id=' + oid, None, 'DELETE')
+                p['action'] = f'Upstox order cancelled ({st0}): the Kite leg could not be placed'
         else:
             p['action'] = 'nothing placed'
+        save({**load(), f"{symbol}:{datetime.datetime.now(IST).date().isoformat()}": p})
         return p
     p['action'] = f'PLACED both legs: Upstox {uq} @ {price}, Kite {kq} @ {price}'
     # --- fills + stops ---
-    time.sleep(8)
-    p['fills'] = {}
-    d = (req('https://api.upstox.com/v2/order/details?order_id=' + oid).get('data') or {})
+    # Wait for the fills to settle before sizing the stop. Placing it on the first partial slice
+    # (the old fixed 8 s sleep) left the rest of the order naked whenever the fill was slower than
+    # that, which on a thin MTF name is common. Bounded so the run still reports promptly.
+    p['fills'], d, ks, settled = _settle(oid, kid, price)
     ufill = int(d.get('filled_quantity') or 0); uavg = float(d.get('average_price') or price)
-    p['fills']['upstox'] = {'status': d.get('status'), 'qty': ufill, 'avg': uavg}
-    import broker_kite as bk2
-    ks = bk2.order_status(kid) or {}
     kfill = int(ks.get('filled') or 0); kavg = float(ks.get('avg') or price)
-    p['fills']['kite'] = {'status': ks.get('status'), 'qty': kfill, 'avg': kavg}
+    if not settled:
+        p['partial'] = ('fill did not finish while this run watched: the stop covers what filled, and '
+                        'the stop scripts pick up the rest on their next pass')
     st, _ = sl_level(key, uavg, uavg)
     p['stop_plan'] = {'upstox': st, 'kite': st}
     if ufill:
@@ -203,13 +347,51 @@ def buy(symbol, price, mode='new', qty=None):
             m2 = bk2.from_upstox(key)
             ktick = bk2.tick_for(m2['exchange'], m2['tradingsymbol'])
             ktrig = round(round(st / ktick) * ktick, 2)
-            ksid = bk2.place(m2['exchange'], m2['tradingsymbol'], 'SELL', kfill, ktrig, order_type='SL',
+            # limit a few ticks BELOW the trigger: an SL whose limit equals its trigger goes unfilled in
+            # a gap, which is exactly when a stop is needed. Same offset the Upstox leg already uses.
+            klim = round(round((ktrig - 5 * ktick) / ktick) * ktick, 2)
+            ksid = bk2.place(m2['exchange'], m2['tradingsymbol'], 'SELL', kfill, klim, order_type='SL',
                              trigger=ktrig, tag='trailsl', product='MTF')
-            p['stop_order_kite'] = {'order_id': ksid, 'trigger': ktrig}
+            p['stop_order_kite'] = {'order_id': ksid, 'trigger': ktrig, 'limit': klim}
         except Exception as e:
             p['stop_order_kite'] = {'error': f'{type(e).__name__}: {e}'}
     save({**load(), f"{symbol}:{datetime.datetime.now(IST).date().isoformat()}": p})
     return p
+
+
+def _settle(oid, kid, price, budget=75.0, step=5.0):
+    """Poll both orders until each is terminal or `budget` seconds pass. Returns
+    (fills, upstox_details, kite_status, settled). Never raises."""
+    end = time.time() + budget
+    d = {}; ks = {}
+    terminal = ('complete', 'cancelled', 'rejected', 'complete', 'trigger pending', 'open pending')
+    while True:
+        try:
+            d = (req('https://api.upstox.com/v2/order/details?order_id=' + oid).get('data') or {}) or d
+        except Exception:
+            pass
+        try:
+            import broker_kite as bk
+            ks = bk.order_status(kid) or ks
+        except Exception:
+            pass
+        ust = (d.get('status') or '').lower()
+        kst = (ks.get('status') or '').lower()
+        u_done = ust in ('complete', 'cancelled', 'rejected', 'partially filled') and \
+            int(d.get('filled_quantity') or 0) >= int(d.get('quantity') or 0)
+        k_done = kst in ('complete', 'cancelled', 'rejected') and \
+            int(ks.get('filled') or 0) >= int(ks.get('quantity') or ks.get('filled') or 0)
+        if (ust in ('complete', 'cancelled', 'rejected') and kst in ('complete', 'cancelled', 'rejected')):
+            return ({'upstox': {'status': d.get('status'), 'qty': int(d.get('filled_quantity') or 0),
+                                'avg': float(d.get('average_price') or price)},
+                     'kite': {'status': ks.get('status'), 'qty': int(ks.get('filled') or 0),
+                              'avg': float(ks.get('avg') or price)}}, d, ks, True)
+        if time.time() >= end:
+            return ({'upstox': {'status': d.get('status'), 'qty': int(d.get('filled_quantity') or 0),
+                                'avg': float(d.get('average_price') or price)},
+                     'kite': {'status': ks.get('status'), 'qty': int(ks.get('filled') or 0),
+                              'avg': float(ks.get('avg') or price)}}, d, ks, False)
+        time.sleep(step)
 
 
 def _kite_eq(symbol):
@@ -289,8 +471,26 @@ def mirror(apply=False):
         return out
 
     # ---- buy the missing legs ----
+    with _RunLock():
+        return _apply_plan(out)
+
+
+def _apply_plan(out):
     placed = []
     for leg in out['plan']:
+        # the plan was computed before the lock was taken, so re-check the book per name right before
+        # buying: a leg that another run already filled must not be bought again
+        try:
+            dup = _already(leg['symbol'], broker=leg['broker'])
+        except Exception as e:
+            placed.append({'symbol': leg['symbol'], 'broker': leg['broker'], 'order_id': None,
+                           'resp': f'skipped: could not rule out a duplicate buy ({type(e).__name__}: {e})'})
+            continue
+        if dup:
+            placed.append({'symbol': leg['symbol'], 'broker': leg['broker'], 'order_id': None,
+                           'resp': f"skipped: already {'/'.join(sorted({d['broker'] for d in dup}))} "
+                                   f"{dup[0]['order_id']} ({dup[0]['status']})"})
+            continue
         res = _place_mirror_leg(leg)
         placed.append(res)
     out['placed'] = placed
@@ -312,10 +512,11 @@ def _mirror_leg(sym, broker, books, count, committed):
         if sym in (st.get('held') or {}) and sym not in (st.get('mine') or set()):
             leg['skip'] = f'{sym} is the user\'s own holding on {b} - not touched'
             return leg
-    # hard guard 2: never buy a name a broker already holds
+    # hard guard 2: never buy a name a broker already holds (either book, mine or the user's)
     if sym in books[broker]['held']:
         leg['skip'] = f'{broker} already holds {sym}'
         return leg
+
     # hard guard 3: the 6-name cap, counted on MY names only
     cap = books[broker]['slots'].get('cap') or ms.MAX_STOCKS
     if count[broker] >= cap:
