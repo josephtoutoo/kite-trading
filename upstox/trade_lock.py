@@ -1,4 +1,11 @@
 """Account-wide trade lock + pre-trade rules (3 Nov 2026).
+Two-day autonomy override (4 Nov 2026 t339u): on 5 and 6 Nov only, equity/autonomy.py swaps a
+handful of limits for the bot's own. Every rule reads its value through _lim(), so the override is
+applied where the rule is EVALUATED, not by rewriting these constants at import time - a global
+rewritten at import is invisible to the next reader and would silently outlive its expiry.
+On any other date _lim() returns the constant below untouched, so the user's rules return by
+themselves. The Rs 30,000 account day-loss breaker (R2b), the fail-closed reads (R0), R8/R9 and
+the 6-name MTF slot cap have no override entry and cannot move.
 Entry scripts MUST call check_order(order) before placing any order (and can_enter() still works).
 Lock file: trade_lock.json {date, reason, loss, next_day_reduced, next_day_date}
 CLI: python3 trade_lock.py check '<json order>'   (order keys: trading_symbol, instrument_token,
@@ -17,6 +24,29 @@ INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FIN
  "MIDCPNIFTY":"NSE_INDEX|NIFTY MID SELECT","NIFTYNXT50":"NSE_INDEX|Nifty Next 50","SENSEX":"BSE_INDEX|SENSEX","BANKEX":"BSE_INDEX|BANKEX"}
 # ---------------- lock (unchanged API) ----------------
 STOCK_OPT_MAX_UND=3
+STOCK_OPT_LOTS=1        # R11: lots per stock-option underlying (the 2-lot cap is 5-6 Nov only)
+# ---------------- two-day rule override (t339u) ----------------
+# The module is loaded by path and /workspace/equity is NOT left on sys.path: this folder's own
+# modules must keep resolving to this folder first, whatever order scripts import things in.
+_autonomy=None
+try:
+    import importlib.util as _ilu
+    _af=os.path.join(os.path.dirname(D),"equity","autonomy.py")
+    _spec=_ilu.spec_from_file_location("autonomy",_af)
+    _autonomy=_ilu.module_from_spec(_spec); _spec.loader.exec_module(_autonomy)
+    sys.modules.setdefault("autonomy",_autonomy)   # so a later plain `import autonomy` agrees
+except Exception as _e:      # no module -> the user's own rules, which is the safe default
+    _autonomy=None
+    print(f"trade_lock: autonomy module unavailable, user's rules apply on every day: {type(_e).__name__}: {_e}",file=sys.stderr)
+def _lim(name,default,when):
+    """The value a rule should use at decision time `when`: DEFAULT unless the two-day override
+    is active on that date, in which case autonomy's own number. DEFAULT is always what the
+    user's rules say, so an inactive override is indistinguishable from having no module."""
+    if _autonomy is None or when is None: return default
+    try: return _autonomy.effective(name,default,when)
+    except Exception as e:
+        print(f"trade_lock: override lookup failed for {name}, keeping the user's rule: {type(e).__name__}: {e}",file=sys.stderr)
+        return default
 def today(): return datetime.datetime.now(IST).date()
 def next_trading_day(d):
     try:
@@ -111,6 +141,39 @@ def _download(dest,url):
     import urllib.request
     data=urllib.request.urlopen(urllib.request.Request(url,headers={"User-Agent":"Mozilla/5.0"}),timeout=60).read()
     open(dest,"wb").write(data)
+
+
+def _expiry_today(und,when):
+    """Does any option on `und` expire on `when`'s date? True / False / None (unknown).
+
+    Read from the newest instrument master already on disk, like _lotmap - no download is
+    triggered from inside a rule check, because a rule must not depend on a network read it
+    did not ask for. None means the master could not be read: the caller applies the tighter
+    branch, since this check only ever ADDS a restriction."""
+    exch="BSE" if und in ("SENSEX","BANKEX") else "NSE"
+    try:
+        import glob
+        files=sorted(glob.glob(os.path.join(D,f"instruments_{exch}_*.json.gz")))
+        if not files: return None
+        f=files[-1]
+        d=when.date().isoformat()
+        # the KEY carries the date: keyed on the file alone, an earlier day's answer would be
+        # served for a later day and the 13:00 cutoff would fire on the wrong session.
+        key=("expiry",f,d,und)
+        hit=_cache.get(key)
+        if hit is None:
+            for x in api.gzip_json(f):
+                if x.get("instrument_type") in ("CE","PE") and (x.get("underlying_symbol") or x.get("name"))==und and x.get("expiry"):
+                    try:
+                        if datetime.datetime.fromtimestamp(x["expiry"]/1000,IST).date().isoformat()==d:
+                            hit=True; break
+                    except Exception: pass
+            hit=bool(hit)
+            _cache[key]=hit
+        return hit
+    except Exception as e:
+        print(f"trade_lock: expiry calendar unreadable for {und}: {type(e).__name__}: {str(e)[:120]}",file=sys.stderr)
+        return None
 
 
 def _lotmap(f):
@@ -249,18 +312,48 @@ def check_order(order,broker="upstox"):
             # counts only this order's own underlying - a NIFTY loss or a third NIFTY decision must never
             # block BANKNIFTY or SENSEX. (MCX crude is a separate script and never enters this path.)
             # rule 1
-            n=len([d for d in _decisions(filled,now) if d["u"]==und])
-            if n>=INDEX_OPT_MAX and not order.get("_paired"): block.append(f"R1: {n} {und} option trade decisions already today across Upstox+Kite (max {INDEX_OPT_MAX} per index)")
+            # t339u (4 Nov): every limit below is read at decision time through _lim(), so the
+            # two-day override moves it only on 5-6 Nov and the user's constant is back on 7 Nov.
+            _max=_lim("INDEX_OPT_MAX",INDEX_OPT_MAX,now)
+            _dec=[d for d in _decisions(filled,now) if d["u"]==und]
+            n=len(_dec)
+            if n>=_max and not order.get("_paired"): block.append(f"R1: {n} {und} option trade decisions already today across Upstox+Kite (max {_max} per index)")
+            # t339u: two extra index checks, live ONLY while the override is on. Both can only
+            # refuse a trade the count would have allowed, never allow one it refused.
+            _gap=_lim("INDEX_OPT_GAP_MIN",None,now)
+            if _gap and _dec:
+                # The mirror leg of one decision must not count against its own partner: _decisions
+                # already calls an Upstox+Kite pair of the same index and side within 5 min ONE
+                # decision, so the gap is measured from the last decision that is not this order's
+                # partner. Without this, a Kite leg retried a minute after its Upstox leg filled
+                # would be refused by a rule that only exists to slow the bot down.
+                _other="kite" if broker=="upstox" else "upstox"
+                _prev=[d for d in _dec if not (d["b"]=={_other} and d["sd"]==sym[-2:] and timedelta_min(now,d["t"])<=5)]
+                if _prev:
+                    _last=max(d["t"] for d in _prev)
+                    if timedelta_min(now,_last)<_gap:
+                        block.append(f"R1: last {und} decision {_last:%H:%M} is {timedelta_min(now,_last):.0f} min ago (<{_gap} min) - too soon for another")
+            _cut=_lim("INDEX_OPT_EXPIRY_CUTOFF",None,now)
+            if _cut:
+                try: _ch,_cm=str(_cut).split(":")
+                except Exception: _ch,_cm="13","00"
+                if now.time()>datetime.time(int(_ch),int(_cm)):
+                    exp=_expiry_today(und,now)
+                    if exp is not False:   # True, or unknown -> the tighter branch (this only restricts)
+                        block.append(f"R1: {und} options expire today and it is {now:%H:%M} (>={_cut}) - no NEW index-option decision"
+                                     + ("" if exp else " (expiry calendar unreadable, treating it as expiry day)"))
             # rule 2a
+            _loss=_lim("INDEX_OPT_LOSS",INDEX_OPT_LOSS,now)
             bl=sum(float(p.get("realised") or 0) for p in upos+kpos
                    if is_opt(sym_of(p)) and is_index(sym_of(p)) and underlying(sym_of(p))==und)
-            if bl< -INDEX_OPT_LOSS: block.append(f"R2: {und} option booked loss Rs {bl:,.0f} < -{INDEX_OPT_LOSS:,} - no more {und} option trades today")
+            if bl< -_loss: block.append(f"R2: {und} option booked loss Rs {bl:,.0f} < -{_loss:,} - no more {und} option trades today")
             # rule 3
+            _win=_lim("WINDOW_MIN",WINDOW_MIN,now)
             other="PE" if sym.endswith("CE") else "CE"
             for o in filled:
                 t=_ts(o); s2=sym_of(o)
-                if o["transaction_type"]=="BUY" and underlying(s2)==und and s2.endswith(other) and t and timedelta_min(now,t)<=WINDOW_MIN:
-                    block.append(f"R3: {und} {other} bought {t:%H:%M} (<30 min ago) - no opposite side"); break
+                if o["transaction_type"]=="BUY" and underlying(s2)==und and s2.endswith(other) and t and timedelta_min(now,t)<=_win:
+                    block.append(f"R3: {und} {other} bought {t:%H:%M} (<{_win} min ago) - no opposite side"); break
             # rule 4
             try:
                 sys.path.insert(0,D); import ind
@@ -277,11 +370,16 @@ def check_order(order,broker="upstox"):
             if ltp and avg and ltp>avg*1.20: block.append(f"R6: add-on after >20% run (LTP {ltp} > avg*1.2 {avg*1.2:.2f})")
             if qty>held_q: adj=min(adj,held_q); flags.append(f"R6: add-on qty capped at original {held_q}")
         # rule 7
+        _win7=_lim("WINDOW_MIN",WINDOW_MIN,now)
         for o in filled:
             t=_ts(o)
-            if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=WINDOW_MIN:
-                block.append(f"R7: {und} exit filled {t:%H:%M} (<30 min ago) - cooldown"); break
-        # rule 11: stock options - max 2 underlyings, max 1 lot per underlying (incl. holdings)
+            if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=_win7:
+                block.append(f"R7: {und} exit filled {t:%H:%M} (<{_win7} min ago) - cooldown"); break
+        # rule 11: stock options - max 3 underlyings, max 1 lot per underlying (incl. holdings)
+        # t339u: 4 x 2 lots on 5-6 Nov only (stock options are the one book with a positive
+        # measured record), back to 3 x 1 on 7 Nov. Both values are read per decision.
+        _und_max=_lim("STOCK_OPT_MAX_UND",STOCK_OPT_MAX_UND,now)
+        _lot_max=_lim("STOCK_OPT_MAX_LOTS",STOCK_OPT_LOTS,now)
         if opt and not idx_opt and ((k or "").startswith(("NSE_FO","BSE_FO")) or not k):
             longs={}
             # 4 Nov: per-broker count (user: Kite has no stock options, so its slots are free)
@@ -290,15 +388,15 @@ def check_order(order,broker="upstox"):
                 if q>0 and is_opt(sp) and not is_index(sp):
                     longs.setdefault(underlying(sp),[]).append(p)
             others=[u for u in longs if u!=und]
-            if und not in longs and len(others)>=STOCK_OPT_MAX_UND:
-                block.append(f"R11: already long options in {len(others)} stocks ({', '.join(sorted(others))}) - max {STOCK_OPT_MAX_UND}")
+            if und not in longs and len(others)>=_und_max:
+                block.append(f"R11: already long options in {len(others)} stocks ({', '.join(sorted(others))}) - max {_und_max}")
             lot=lot_size(k,sym) if k else None
-            if not lot: block.append("R11: lot size not found for "+(k or sym)+" - cannot verify 1-lot cap")
+            if not lot: block.append(f"R11: lot size not found for {k or sym} - cannot verify the {_lot_max}-lot cap")
             else:
                 have=sum(int(p.get("quantity") or 0) for p in longs.get(und,[]))
-                room=max(lot-have,0)
-                if room<=0: block.append(f"R11: {und} already holds {have} qty (= {have/lot:g} lot, lot {lot}) - cap 1 lot per stock"); adj=0
-                elif adj>room: adj=room; flags.append(f"R11: qty capped to {room} (1 lot {lot} minus held {have})")
+                room=max(lot*_lot_max-have,0)
+                if room<=0: block.append(f"R11: {und} already holds {have} qty (= {have/lot:g} lot, lot {lot}) - cap {_lot_max} lot{'s' if _lot_max!=1 else ''} per stock"); adj=0
+                elif adj>room: adj=room; flags.append(f"R11: qty capped to {room} ({_lot_max} lot{'s' if _lot_max!=1 else ''} of {lot} minus held {have})")
         # rule 10
         px=float(order.get("price") or 0) or ltp or 0
         if prod=="MTF":
@@ -345,8 +443,11 @@ def check_order(order,broker="upstox"):
             except Exception as e:
                 ratio=1.0; new_m=px*qty; this_m=0.0; total_m=0.0
                 block.append(f"R10: MTF margin sizing unavailable ({type(e).__name__}: {e})")
-            if this_m+new_m>capital*MTF_STOCK_CAP: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > 10% cap Rs {capital*MTF_STOCK_CAP:,.0f}")
-            if total_m+new_m>capital*MTF_TOTAL_CAP: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > 50% cap Rs {capital*MTF_TOTAL_CAP:,.0f}")
+            # t339u: 10% -> 12% per stock on 5-6 Nov; the 50% total is NOT raised (the override
+            # table states it at 0.50, and this line reads it, so the cap cannot drift by accident).
+            _per=_lim("MTF_PER_STOCK",MTF_STOCK_CAP,now); _tot=_lim("MTF_TOTAL",MTF_TOTAL_CAP,now)
+            if this_m+new_m>capital*_per: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > {_per*100:g}% cap Rs {capital*_per:,.0f}")
+            if total_m+new_m>capital*_tot: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > {_tot*100:g}% cap Rs {capital*_tot:,.0f}")
         elif opt or sym.endswith("FUT"):
             mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
             fno_lim=min(capital*0.5,capital-mtf_total)

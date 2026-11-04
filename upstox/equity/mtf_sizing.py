@@ -6,6 +6,7 @@ Rules it enforces, per broker, on every proposed MTF BUY:
   MTF MARGIN the broker blocks for the order, not on price x qty. MTF margin runs ~24% of
   notional (4.1x leverage), so the same 10% cap now funds roughly 4x the notional it used to.
   R10a  stock cap      margin(symbol held) + margin(new) <= 10% of that broker's capital
+                       (12% on 5-6 Nov 2026 only - equity/autonomy.py, t339u)
   R10b  total cap      MTF margin used + margin(new) <= 50% of capital
   R10c  reserve        a NEW stock may use at most half of the remaining room;
                        the other half is kept for pullback adds into existing
@@ -45,6 +46,49 @@ _margin_memo = {}             # (broker, symbol, qty, price) -> (expires_at, quo
 _state_memo = {}              # broker -> (expires_at, state)
 PER_STOCK = 0.10
 TOTAL = 0.50
+# t339u (4 Nov 2026): the per-stock cap is 12% on 5-6 Nov only, via equity/autonomy.py. Read it at
+# decision time, never by rewriting PER_STOCK - a module global rewritten at import would outlive
+# its own expiry and quietly raise this cap for ever. TOTAL is deliberately NOT overridden: it
+# stays 50%, and the override table says so, so the total cannot drift.
+# Loaded by path (a sibling file of THIS one), not by name: mtf_sizing is imported from several
+# scripts, and one of them may not have this folder on sys.path - in which case a plain
+# `import autonomy` would silently fall back to the user's caps ON an override day, which is
+# the one failure this whole change exists to avoid.
+_autonomy = None
+try:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        'autonomy', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autonomy.py'))
+    _autonomy = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_autonomy)
+    sys.modules.setdefault('autonomy', _autonomy)
+except Exception as _ae:      # missing module -> the user's caps, which is the safe default
+    _autonomy = None
+    print(f'mtf_sizing: autonomy module unavailable, user caps apply: {type(_ae).__name__}: {_ae}', file=sys.stderr)
+
+
+def per_stock_cap(when=None):
+    """The per-stock MTF cap in force now: 0.10, or 0.12 on 5-6 Nov 2026."""
+    if _autonomy is None:
+        return PER_STOCK
+    try:
+        return float(_autonomy.effective('MTF_PER_STOCK', PER_STOCK, when))
+    except Exception as e:
+        print(f'mtf_sizing: override lookup failed, keeping the user cap: {type(e).__name__}: {e}',
+              file=sys.stderr)
+        return PER_STOCK
+
+
+def total_cap(when=None):
+    """The total MTF cap in force now. Never above the 0.50 ceiling, whatever any table says -
+    this number is a hard guard, not only a preference (t339u did not raise it)."""
+    if _autonomy is None:
+        return min(TOTAL, 0.50)
+    try:
+        return min(float(_autonomy.effective('MTF_TOTAL', TOTAL, when)), 0.50)
+    except Exception as e:
+        print(f'mtf_sizing: override lookup failed, keeping the user total: {type(e).__name__}: {e}',
+              file=sys.stderr)
+        return min(TOTAL, 0.50)
 NEW_SHARE = 0.50          # new stocks may use half of the remaining room
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_sizing_cache.json')
 # (t304u) The 5-stock MTF cap and the MTF budget count ONLY names this bot opened. Holdings the
@@ -286,15 +330,16 @@ def margin_quote(broker, symbol, qty, price):
 
 
 # ---------------- the gate ----------------
-def limits(st, symbol, mode='new', ratio=1.0):
+def limits(st, symbol, mode='new', ratio=1.0, when=None):
     """Margin limits for one order (4 Nov 2026: caps are on MTF margin, not on notional).
     ratio = margin / notional for this symbol, so existing holdings stored at cost can be
-    converted to the margin they consume."""
+    converted to the margin they consume. `when` is the decision date for the two-day
+    override (None = now); it only selects which cap applies, never widens one."""
     cap = st['capital']
-    per = PER_STOCK * cap
+    per = per_stock_cap(when) * cap        # 10%, or 12% on 5-6 Nov 2026 (t339u)
     already = st['held'].get(symbol, 0.0) * ratio          # cost -> margin it blocks
     used_m = st['used'] * ratio                            # portfolio at cost -> margin
-    room_total = max(TOTAL * cap - used_m, 0.0)
+    room_total = max(total_cap(when) * cap - used_m, 0.0)
     room = (room_total * NEW_SHARE if mode == 'new' and symbol not in st['held'] else room_total)
     by_stock = max(per - already, 0.0)
     return dict(per_stock=round(per), already=round(already), by_stock=round(by_stock),
@@ -302,7 +347,7 @@ def limits(st, symbol, mode='new', ratio=1.0):
                 reserve_after=round(room_total - min(room_total, room)))
 
 
-def size(broker, symbol, price, mode='new', step=None):
+def size(broker, symbol, price, mode='new', step=None, when=None):
     st = state_mine(broker)
     probe = margin_quote(broker, symbol, 1, price)     # margin for ONE share at the proposed price
     if not probe['ok']:
@@ -310,7 +355,7 @@ def size(broker, symbol, price, mode='new', step=None):
                     reason='margin quote failed: ' + probe.get('why', ''), state=st, quote=probe)
     per_share = probe['margin']
     ratio = per_share / price if price else 1.0
-    lim = limits(st, symbol, mode, ratio)
+    lim = limits(st, symbol, mode, ratio, when)
     amt_cap = min(lim['by_stock'], lim['room'])        # rupees of MARGIN the caps allow
     qty_by_margin = int(amt_cap // per_share) if per_share > 0 else 0
     q = qty_by_margin
@@ -331,23 +376,24 @@ def size(broker, symbol, price, mode='new', step=None):
                state=dict(capital=round(st['capital']), free=round(st['free']), used=round(st['used'])),
                limits=lim)
     if q == 0:
-        out['reason'] = 'no room under the 10% stock cap / MTF room'
+        out['reason'] = f'no room under the {per_stock_cap(when) * 100:g}% stock cap / MTF room'
     return out
 
 
-def check(broker, symbol, qty, price, mode='new'):
+def check(broker, symbol, qty, price, mode='new', when=None):
     st = state_mine(broker)
     probe = margin_quote(broker, symbol, 1, price)
     ratio = (probe['margin'] / price) if probe.get('ok') and price else 1.0
-    lim = limits(st, symbol, mode, ratio)
+    lim = limits(st, symbol, mode, ratio, when)
     q = margin_quote(broker, symbol, qty, price)
     m_new = q['margin'] if q.get('ok') else qty * price * ratio
     notional = qty * price
     blocks, warns = [], []
     if m_new > lim['by_stock']:
-        blocks.append(f"R10a: {symbol} margin {m_new:,.0f} > 10% stock cap room {lim['by_stock']:,.0f} (cap {lim['per_stock']:,.0f}, already {lim['already']:,.0f})")
-    if st['used'] * ratio + m_new > TOTAL * st['capital']:
-        blocks.append(f"R10b: total MTF margin {st['used'] * ratio + m_new:,.0f} > 50% cap {TOTAL * st['capital']:,.0f}")
+        blocks.append(f"R10a: {symbol} margin {m_new:,.0f} > {per_stock_cap(when) * 100:g}% stock cap room {lim['by_stock']:,.0f} (cap {lim['per_stock']:,.0f}, already {lim['already']:,.0f})")
+    _tot = total_cap(when)
+    if st['used'] * ratio + m_new > _tot * st['capital']:
+        blocks.append(f"R10b: total MTF margin {st['used'] * ratio + m_new:,.0f} > {_tot * 100:g}% cap {_tot * st['capital']:,.0f}")
     if mode == 'new' and symbol not in st['held'] and m_new > lim['room']:
         blocks.append(f"R10c: new entry margin {m_new:,.0f} > half of remaining room {lim['room']:,.0f} (reserve {lim['reserve_after']:,.0f} kept for pullback adds)")
     if not q['ok']:
@@ -359,7 +405,7 @@ def check(broker, symbol, qty, price, mode='new'):
     return dict(broker=broker, symbol=symbol, qty=qty, price=price, mode=mode, notional=round(notional),
                 margin=round(m_new),
                 allowed=not blocks, blocks=blocks, warns=warns, quote=q,
-                max_qty=size(broker, symbol, price, mode)['qty'],
+                max_qty=size(broker, symbol, price, mode, when=when)['qty'],
                 state=dict(capital=round(st['capital']), free=round(st['free']), used=round(st['used'])),
                 limits=lim)
 

@@ -50,6 +50,23 @@ IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO"},
      "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO"}}
 SF=os.path.join(D,"risk_state.json"); SEEN=os.path.join(D,"seen_entries.json")
 out={"now":now.strftime("%Y-%m-%d %H:%M IST"),"dry_run":DRY,"rules":f"fresh 5m cross EMA20+Supertrend, MACD hist in direction, ADX>={ADX_MIN} (anti-chop)","indices":{}}
+# t339u: say which rule set this run is under. On 5-6 Nov 2026 the limit checks in trade_lock
+# move to the two-day values (equity/autonomy.py) and this block names them; from 7 Nov it is the
+# user's own rules again and the block says so. Nothing else in this script changes.
+def _ruleset():
+    try:
+        sys.path.insert(0,"/workspace/equity")
+        import autonomy
+        return autonomy.rule_set(now)
+    except Exception as e:
+        return {"rule_set":"user rules","override":"unavailable ("+type(e).__name__+")",
+                "note":"trade_lock falls back to the user's constants"}
+out["rule_set"]=_ruleset()
+# the brief was explicit that the existing `rules` line should say which set it is on, so append
+# it rather than making a reader join two fields. The signal logic text above is untouched.
+_R=out["rule_set"]
+out["rules"]+=(" | "+("OVERRIDE ACTIVE ("+_R["rule_set"]+", "+out["now"][:10]+")" if _R["rule_set"]!="user rules"
+                       else "rule set: user's own"))
 def done(): print(json.dumps(out,indent=1,default=str)); sys.exit(0)
 if not DRY and not market_calendar.is_trading_day(now.date()):
     out["skipped"]="exchange holiday / market closed ("+now.date().isoformat()+")"; done()

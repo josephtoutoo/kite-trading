@@ -47,7 +47,7 @@ def test_free_capital():
         lots, note = bs.index_option_lots(150, 50, cap, 26, True, False, 1 / 3)
         check(f'zero/negative capital {cap} -> 0 lots', lots == 0, f'got {lots}')
         check(f'zero/negative capital {cap} -> note says so', 'free capital' in note.lower(), note)
-    lots, note = bs.stock_option_lots(50, 500, 0, 1 / 3)
+    lots, note = bs.stock_option_lots(50, 500, 0, 1 / 3, when='2026-11-09T10:00')
     check('stock option zero capital -> 0 lots', lots == 0, f'got {lots}')
     q, note = bs.mtf_qty('X', 100.0, 'upstox', 0, 1 / 3)
     check('mtf zero capital -> 0 shares', q == 0, f'got {q}')
@@ -68,7 +68,7 @@ def test_unaffordable_lot():
     check('premium too expensive -> 0 lots', lots == 0, f'got {lots}')
     check('premium too expensive -> note says cannot afford 1 lot',
           'cannot afford 1 lot' in note, note)
-    lots, note = bs.stock_option_lots(100000, 25, 100000, 1 / 3)
+    lots, note = bs.stock_option_lots(100000, 25, 100000, 1 / 3, when='2026-11-09T10:00')
     check('stock option premium too expensive -> 0 lots', lots == 0, f'got {lots}')
     check('stock option note names the premium cap', 'premium cap' in note, note)
 
@@ -236,11 +236,16 @@ def test_single_lot_and_r11():
     lots, note = bs.index_option_lots(10.0, 50, 20000, 18.0, False, False, 1 / 3)
     check('small budget still returns at least 1 lot when affordable', lots == 1, f'{lots} {note}')
     check('the 1-lot floor is explained', '1 lot' in note, note)
-    # stock options are hard-capped at 1 lot by R11 whatever the capital says
-    lots, note = bs.stock_option_lots(10.0, 50, 10_000_000, 0.50)
+    # stock options are hard-capped at 1 lot by R11 whatever the capital says.
+    # The cap is date-aware since t339u (2 lots on 5-6 Nov 2026 only), so pin the date: these
+    # assertions are about the USER's rule set, and must not change on the two override days.
+    _user_day = '2026-11-09T10:00'
+    lots, note = bs.stock_option_lots(10.0, 50, 10_000_000, 0.50, when=_user_day)
     check('stock option never exceeds 1 lot (R11)', lots == 1, f'{lots}')
     check('stock option note names R11', 'R11' in note, note)
     check('STOCK_OPT_MAX_LOTS is 1', bs.STOCK_OPT_MAX_LOTS == 1, str(bs.STOCK_OPT_MAX_LOTS))
+    lots, _ = bs.stock_option_lots(10.0, 50, 10_000_000, 0.50, when='2026-11-05T10:00')
+    check('R11 cap is 2 lots on the 5-6 Nov override days only', lots == 2, f'{lots}')
 
 
 # ---------------------------------------------------------------- h) explain() + defaults

@@ -49,6 +49,14 @@ def save(s):
 def main():
     now = datetime.datetime.now(IST)
     out = {'now': now.strftime('%Y-%m-%d %H:%M IST'), 'dry': DRY}
+    # t339u: which rule set this run is under. This book has no 5-6 Nov override of its own
+    # (MCX is history only - Upstox blocks MCX API orders), but the line still states which
+    # set trade_lock is applying, so a log never has to be guessed at.
+    try:
+        import autonomy
+        out['rule_set'] = autonomy.rule_set(now)
+    except Exception as e:
+        out['rule_set'] = {'rule_set': 'user rules', 'override': f'unavailable ({type(e).__name__})'}
     st = load()
     fut = quote(FUT_KEY)
     pe = quote(PE_KEY)

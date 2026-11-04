@@ -158,9 +158,19 @@ def usym(sym):
     return sym if sym.endswith('-EQ') else sym + '-EQ'
 
 
+def _ruleset():
+    """t339u: which rule set this run is under (user's own, or the 5-6 Nov two-day override)."""
+    try:
+        import autonomy
+        return autonomy.rule_set()
+    except Exception as e:
+        return {'rule_set': 'user rules', 'override': f'unavailable ({type(e).__name__})'}
+
+
 def plan(symbol, price, mode='new', qty=None):
     """Size and gate both legs, no orders."""
-    out = {'symbol': symbol, 'price': price, 'mode': mode, 'now': datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST')}
+    out = {'symbol': symbol, 'price': price, 'mode': mode, 'now': datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST'),
+           'rule_set': _ruleset()}
     legs = {}
     for b in ('upstox', 'kite'):
         try:
@@ -230,6 +240,7 @@ def _buy(symbol, price, mode='new', qty=None):
         return {'symbol': symbol, 'action': 'NOT PLACED: a BUY of this name is already live/filled today - ' +
                 ', '.join(f"{h['broker']} {h['order_id']} ({h['status']})" for h in prior), 'already': prior}
     p = plan(symbol, price, mode, qty)
+    p.setdefault('rule_set', _ruleset())
     if not p['both_ok']:
         p['action'] = 'NOT PLACED: one leg cannot take it (mirror must be whole)'
         return p
@@ -424,7 +435,8 @@ def _holdings(broker):
 
 def mirror(apply=False):
     """Make the two books hold the same MTF names, without touching the user's own names."""
-    out = {'now': datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST'), 'apply': apply}
+    out = {'now': datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST'), 'apply': apply,
+           'rule_set': _ruleset()}
     books = {}
     for b in ('upstox', 'kite'):
         try:

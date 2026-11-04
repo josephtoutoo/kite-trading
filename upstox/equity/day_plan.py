@@ -166,6 +166,13 @@ def conditions():
 def main():
     now = datetime.datetime.now(IST)
     out = {'now': now.strftime('%Y-%m-%d %H:%M IST'), 'weekday': now.strftime('%A')}
+    # t339u: the pre-market snapshot states which rule set the day will be traded under, so the
+    # 9:05 decision reads it from the same place the rules do (equity/autonomy.py).
+    try:
+        import autonomy
+        out['rule_set'] = autonomy.rule_set(now)
+    except Exception as e:
+        out['rule_set'] = {'rule_set': 'user rules', 'override': f'unavailable ({type(e).__name__})'}
     try:
         out['upstox'] = upstox_capital()
     except Exception as e:

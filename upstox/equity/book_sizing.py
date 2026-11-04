@@ -60,6 +60,30 @@ PREMIUM_CAP = 0.30       # total premium outlay per trade, as a fraction of free
 STOP_FRAC = 0.30         # risk_manager's fixed stop: 30% under entry
 MAX_LOTS = 10            # hard ceiling on one index-option decision
 STOCK_OPT_MAX_LOTS = 1   # trade_lock R11: 1 lot per underlying
+# t339u (4 Nov 2026): R11 allows 2 lots per stock option on 5-6 Nov only. Read through
+# equity/autonomy.py at call time so the sizer agrees with trade_lock on those days and returns
+# to 1 on 7 Nov - this module still only aims INSIDE the cap, it never sets one.
+# Loaded by path for the same reason as mtf_sizing: a caller may not have this folder on
+# sys.path, and falling back to the user's 1-lot cap on an override day would be silent.
+_autonomy = None
+try:
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location(
+        'autonomy', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autonomy.py'))
+    _autonomy = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_autonomy)
+    sys.modules.setdefault('autonomy', _autonomy)
+except Exception:      # no module -> the user's 1 lot
+    _autonomy = None
+
+
+def stock_opt_max_lots(when=None):
+    """The R11 per-underlying lot cap in force now: 1, or 2 on 5-6 Nov 2026."""
+    if _autonomy is None:
+        return STOCK_OPT_MAX_LOTS
+    try:
+        return int(_autonomy.effective('STOCK_OPT_MAX_LOTS', STOCK_OPT_MAX_LOTS, when))
+    except Exception:
+        return STOCK_OPT_MAX_LOTS
 THIN_TRADES = 10         # below this many closed trades a book's record is shrunk toward equal
 W_MIN, W_MAX = 0.15, 0.50
 
@@ -350,13 +374,14 @@ def index_option_lots(premium, lot_size, free_capital, adx, daily_aligned, expir
 
 
 # ---------------------------------------------------------------- stock options
-def stock_option_lots(premium, lot_size, free_capital, weight):
+def stock_option_lots(premium, lot_size, free_capital, weight, when=None):
     """(lots, note) for one stock-option decision.
 
     The same rupee-risk arithmetic as an index option, but trade_lock R11 caps a stock option at
     1 lot per underlying and at 3 underlyings in total, so R11 - not capital - is normally the
-    binding constraint here. This function therefore never returns more than 1 lot, and says when
-    capital would have allowed more.
+    binding constraint here (2 lots on 5-6 Nov 2026 only, t339u). This function never returns more
+    than R11's cap for the date, and says when capital would have allowed more.
+    `when` (optional) is the decision date for the R11 cap; None = now.
     """
     try:
         prem = float(premium)
@@ -381,12 +406,13 @@ def stock_option_lots(premium, lot_size, free_capital, weight):
         return 0, (f'cannot afford 1 lot: premium Rs {_fmt(per_lot_prem)} > premium cap '
                    f'Rs {_fmt(prem_cap)} -> 0 lots (R11 would also allow only 1 lot)')
     by_risk = int(risk_budget // per_lot_risk) if per_lot_risk > 0 else 0
-    lots = max(1, min(by_risk, int(prem_cap // per_lot_prem), STOCK_OPT_MAX_LOTS))
+    _cap = stock_opt_max_lots(when)
+    lots = max(1, min(by_risk, int(prem_cap // per_lot_prem), _cap))
     parts = [f'free capital Rs {_fmt(cap)}', f'weight {weight:.2f} ({scale:.2f}x)',
              f'risk budget Rs {_fmt(risk_budget)} vs Rs {_fmt(per_lot_risk)} risk per lot',
-             f'-> {lots} lot (R11: max {STOCK_OPT_MAX_LOTS} lot per underlying, max 3 underlyings, '
+             f'-> {lots} lot(s) (R11: max {_cap} lot(s) per underlying, max 3 underlyings, '
              f'counting this broker\'s existing positions)']
-    if by_risk > STOCK_OPT_MAX_LOTS:
+    if by_risk > _cap:
         parts.append(f'capital alone would have allowed {by_risk} lots, but R11 caps it - the binding rule is R11')
     return lots, '; '.join(parts)
 
