@@ -108,12 +108,25 @@ def order_status(oid):
         return {"status":(h.get("status") or "").lower(),"filled":int(h.get("filled_quantity") or 0),"avg":float(h.get("average_price") or 0)}
     except Exception as e: log(f"history fail {oid} {e}"); return None
 # ---------- writes ----------
+def tick_for(exch,tsym,default=0.05):
+    """Tick size for a contract; Kite rejects prices off the grid (16283), so round every price to this."""
+    for r in dump(exch):
+        if r["tradingsymbol"]==tsym:
+            try: return float(r.get("tick_size") or default)
+            except Exception: return default
+    return default
+def snap(p,ts):
+    """Round p onto the tick grid ts."""
+    if p is None or not ts: return p
+    return round(round(float(p)/ts)*ts,4)
 def place(exch,tsym,side,qty,price,order_type="LIMIT",trigger=None,tag="auto_entry",product="NRML",dry=False):
-    """-> order_id | 'DRY' | None. LIMIT/SL only."""
+    """-> order_id | 'DRY' | None. LIMIT/SL only. Prices snapped to the contract tick."""
     if order_type not in("LIMIT","SL"): log(f"refused {order_type} {tsym}"); return None
+    ts=tick_for(exch,tsym)
+    price=snap(price,ts); trigger=snap(trigger,ts)
     body=dict(variety="regular",exchange=exch,tradingsymbol=tsym,transaction_type=side,quantity=int(qty),product=product,
-              order_type=order_type,price=round(price,2),validity="DAY",tag=tag[:20])
-    if order_type=="SL": body["trigger_price"]=round(trigger,2)
+              order_type=order_type,price=price,validity="DAY",tag=tag[:20])
+    if order_type=="SL": body["trigger_price"]=trigger
     if dry: log("DRY place "+json.dumps(body)); return "DRY"
     if not valid(): log("skip place (kite invalid) "+tsym); return None
     try: oid=client().place_order(**body); log(f"placed {oid} {json.dumps(body)}"); return oid
