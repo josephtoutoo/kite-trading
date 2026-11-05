@@ -155,7 +155,12 @@ def snap(now):
 def candles(key, day):
     """5-minute candles for one contract on `day` (works intraday and after the close)."""
     f = day.isoformat()
-    url = f'https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe="")}/minutes/5/{f}/{f}'
+    q = urllib.parse.quote(key, safe="")
+    # The dated historical endpoint has no rows for the current session; today's candles come from /intraday.
+    if day == datetime.date.today():
+        url = f'https://api.upstox.com/v3/historical-candle/intraday/{q}/minutes/5'
+    else:
+        url = f'https://api.upstox.com/v3/historical-candle/{q}/minutes/5/{f}/{f}'
     try:
         d = api.get(url).get('data') or {}
     except Exception as e:
@@ -178,10 +183,10 @@ def close(now):
             continue
         for name, v in (r.get('indices') or {}).items():
             for kind, leg in (v.get('legs') or {}).items():
-                seen[(name, kind)] = leg
-    for (name, kind), leg in seen.items():
+                seen[(name, kind, leg['key'])] = leg  # every ATM strike captured, not just the last
+    for (name, kind, _k), leg in seen.items():
         cs = candles(leg['key'], day)
-        out[f'{name} {kind}'] = {'symbol': leg['symbol'], 'key': leg['key'], 'atm_strike': leg['strike'],
+        out[f"{name} {int(leg['strike'])} {kind}"] = {'symbol': leg['symbol'], 'key': leg['key'], 'atm_strike': leg['strike'],
                                  'candles': cs, 'n': len(cs)}
     dest = os.path.join(OUT, f'{day.isoformat()}.json')
     json.dump(out, open(dest, 'w'), indent=1)

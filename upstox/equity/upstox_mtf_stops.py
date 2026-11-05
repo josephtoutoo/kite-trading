@@ -178,8 +178,16 @@ def main():
                 acts.append(dict(sym=sym, action='SKIP', why=f'stop {cand} at/above ltp {ltp}')); continue
         t = tick_for(ltp)
         trig = snap(cand, t)
-        limit = snap(trig, t)                           # trigger and limit both at the computed level
+        # Upstox now rejects SL SELL with limit == trigger (UDAPI1038): limit must sit strictly below.
+        # Use a 1% buffer (at least one tick) so the stop still fills in a fast drop.
+        limit = snap(trig * 0.99, t)
+        if limit >= trig:
+            limit = round(trig - t, 2)
         clamped = False
+        if lcl and limit < lcl and trig > lcl + t / 2:
+            limit = snap(lcl, tick_for(lcl))            # keep trigger, pull limit up to the band edge
+            if limit >= trig:
+                limit = round(trig - t, 2)
         if lcl and limit < lcl:
             # The whole 5%/Supertrend stop sits outside today's band and Upstox RMS rejects a limit
             # below it. Place the tightest stop the band allows instead (same fallback as
