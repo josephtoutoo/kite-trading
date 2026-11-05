@@ -102,11 +102,20 @@ def upstox_targets():
         if r.get('status') != 'success' or r.get('data') is None:
             raise RuntimeError(f'Upstox book unreadable: {str(r)[:120]}')
     mine = ms.mine_upstox()          # fail-closed: raises if the order book cannot be read
+    # Day-stop book also gets overnight GTT cover (plain protective only). Tags age out of
+    # today's order book, so mine alone drops names like GAIL/UNITDSPR that upstox_mtf_stops
+    # still protects. Never add those to mtf_managed.json - that would turn trailing back on
+    # for excluded_existing holdings (t264u). mtf_stops_upstox.json is the durable tracker.
+    try:
+        day = set((json.load(open(os.path.join(D, 'mtf_stops_upstox.json'))).get('stops') or {}))
+    except Exception:
+        day = set()
+    cover = mine | day
     rows = []
     for p in mtf.get('data') or []:
         q = int(p.get('quantity') or 0)
         s = p['trading_symbol'].replace('-EQ', '')
-        if q > 0 and s in mine:
+        if q > 0 and s in cover:
             rows.append(dict(broker='upstox', book='MTF', sym=s, key=p.get('instrument_token'),
                              qty=q, entry=float(p.get('average_price') or 0),
                              ltp=float(p.get('last_price') or 0), product='MTF', kind='eq'))
@@ -262,7 +271,7 @@ def place_one(row, trig, rec):
     try:
         g = bk.client().place_gtt(
             trigger_type=bk.client().GTT_TYPE_SINGLE, tradingsymbol=row['sym'],
-            exchange='NSE' if row['book'] == 'MTF' else ('NFO' if row['sym'].endswith('CE') or row['sym'].endswith('PE') else 'NFO'),
+            exchange='NSE' if row['book'] == 'MTF' else ('BFO' if row['sym'].startswith(('SENSEX', 'BANKEX')) else 'NFO'),
             trigger_values=[trig], last_price=row['ltp'],
             orders=[dict(transaction_type='SELL', quantity=int(row['qty']), product=row['product'],
                          order_type='LIMIT', price=limit)])

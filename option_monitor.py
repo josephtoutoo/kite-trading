@@ -17,7 +17,7 @@ for p in pos:
     row=[r for r in b.dump(ex) if r['tradingsymbol']==ts][0]
     q=ind.get('/v2/market-quote/ltp?instrument_key='+urllib.parse.quote(uk))['data']; ltp=list(q.values())[0]['last_price']
     # high since entry from 1m candles
-    entry_time=min(o['order_timestamp'] for o in ords if o['trading_symbol']==ts and o['transaction_type']=='BUY' and o['status']=='complete')
+    entry_time=min([o['order_timestamp'] for o in ords if o['trading_symbol']==ts and o['transaction_type']=='BUY' and o['status']=='complete'] or [dt.date.today().isoformat()+' 09:15:00'])  # carried-over positions have no BUY today
     try:
         cs=ind.get('/v3/historical-candle/intraday/'+urllib.parse.quote(uk,safe='')+'/minutes/1')['data']['candles']
         hi=max([c[2] for c in cs if c[0][:19].replace('T',' ')>=entry_time[:16]] or [ltp])
