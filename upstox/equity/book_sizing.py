@@ -91,6 +91,109 @@ PNL_PATH = '/workspace/equity/book_pnl.json'
 MTF_SIZING = '/workspace/equity/mtf_sizing.py'
 
 
+# ---------------------------------------------------------------- day streak (t351u)
+# User (5 Nov 2026): "Previous days loss continuous try to reduce position sizing, as vice versa."
+# Each streak book (NIFTY, SENSEX, BANKNIFTY index options separately; stock options; MTF) gets a
+# multiplier from its run of consecutive losing / winning CLOSED days (realised P&L per day, from
+# book_pnl.json 'daily'; today is excluded - it is not closed). Flat days (P&L 0) end a streak.
+# It multiplies the RISK BUDGET only. Every cap is untouched: the 30% premium cap, MAX_LOTS, the
+# R11 per-underlying cap, the 1-lot floor, the autonomy limits and the Rs 30k breaker downstream.
+# FAIL-SAFE: an unreadable file, a missing series or a failed source read never gives more than 1.0.
+STREAK_BOOKS = ('NIFTY', 'SENSEX', 'BANKNIFTY', 'stock_options', 'mtf')
+STREAK_LOSS = {1: 0.85, 2: 0.70, 3: 0.50}     # 3 = "3 or more"
+STREAK_WIN = {1: 1.00, 2: 1.10, 3: 1.20}
+STREAK_MIN, STREAK_MAX = 0.50, 1.20
+# which book_pnl source each streak book's history depends on; if that read failed, cap at 1.0
+_STREAK_SRC = {'NIFTY': 'upstox_fo', 'SENSEX': 'upstox_fo', 'BANKNIFTY': 'upstox_fo',
+               'stock_options': 'upstox_fo', 'mtf': 'upstox_eq'}
+
+
+def streak_of(daily, today=None):
+    """Signed streak from {date_iso: pnl}: -n = n losing closed days in a row, +n = n winning, 0 none.
+    Days on/after `today` (ISO string) are ignored - only closed days count."""
+    days = sorted(d for d in (daily or {}) if today is None or d < today)
+    n = 0
+    for d in reversed(days):
+        try:
+            v = float(daily[d])
+        except (TypeError, ValueError):
+            break
+        if v == 0:
+            break
+        sgn = 1 if v > 0 else -1
+        if n == 0 or (n > 0) == (sgn > 0):
+            n += sgn
+        else:
+            break
+    return n
+
+
+def streak_multiplier(streak):
+    """Multiplier for a signed streak, clamped to [STREAK_MIN, STREAK_MAX]."""
+    try:
+        k = int(streak)
+    except (TypeError, ValueError):
+        return 1.0
+    if k < 0:
+        m = STREAK_LOSS[min(-k, 3)]
+    elif k > 0:
+        m = STREAK_WIN[min(k, 3)]
+    else:
+        m = 1.0
+    return max(STREAK_MIN, min(STREAK_MAX, m))
+
+
+def streak_multipliers(path=None, today=None):
+    """{book: {'streak', 'mult', 'note'}} for every STREAK_BOOK. Never above 1.0 on bad data."""
+    import datetime as _dt
+    path = path or PNL_PATH
+    if today is None:
+        today = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=5, minutes=30))).date().isoformat()
+    out = {}
+    try:
+        raw = json.load(open(path))
+        daily = raw.get('daily')
+        ok = raw.get('daily_sources_ok') or {}
+        if not isinstance(daily, dict):
+            raise ValueError('no daily series in book P&L file')
+    except Exception as e:
+        for b in STREAK_BOOKS:
+            out[b] = dict(streak=0, mult=1.0, note=f'streak unknown ({type(e).__name__}) -> 1.00x')
+        return out
+    for b in STREAK_BOOKS:
+        ser = daily.get(b)
+        if not isinstance(ser, dict) or not ser:
+            out[b] = dict(streak=0, mult=1.0, note='no closed-day history -> 1.00x')
+            continue
+        k = streak_of(ser, today)
+        m = streak_multiplier(k)
+        why = (f'{-k} losing day(s) in a row' if k < 0 else f'{k} winning day(s) in a row' if k > 0
+               else 'no streak')
+        if not ok.get(_STREAK_SRC[b], False) and m > 1.0:
+            m = 1.0
+            why += ' (history read failed - capped at 1.00x)'
+        out[b] = dict(streak=k, mult=m, note=f'{why} -> {m:.2f}x')
+    return out
+
+
+def streak_mult(book, path=None, today=None):
+    """One book's multiplier (float); 1.0 on any doubt, never higher on a failure."""
+    try:
+        return float(streak_multipliers(path, today).get(book, {}).get('mult', 1.0))
+    except Exception:
+        return 1.0
+
+
+def _sm(x):
+    try:
+        v = float(x)
+        if v != v:
+            return 1.0
+        return max(STREAK_MIN, min(STREAK_MAX, v))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 # ---------------------------------------------------------------- weights
 def _num(d, *names):
     """First numeric value among `names` in dict d, else None."""
@@ -312,7 +415,8 @@ def _fmt(x):
 
 
 # ---------------------------------------------------------------- index options
-def index_option_lots(premium, lot_size, free_capital, adx, daily_aligned, expire_today, weight):
+def index_option_lots(premium, lot_size, free_capital, adx, daily_aligned, expire_today, weight,
+                      streak_mult=1.0):
     """(lots, note) for one index-option decision.
 
     premium       option premium per unit at the price we would pay (the ask, not the LTP)
@@ -343,7 +447,8 @@ def index_option_lots(premium, lot_size, free_capital, adx, daily_aligned, expir
         # Never size on a trend reading we do not have: the caller keeps its fixed size on 0+this note.
         return 0, f'cannot size: {conv_note} - use the fixed size'
     exp_mult = 1.15 if expire_today else 1.0
-    risk_budget = cap * BASE_RISK * conv * exp_mult * scale
+    sm = _sm(streak_mult)
+    risk_budget = cap * BASE_RISK * conv * exp_mult * scale * sm
     per_lot_risk = prem * STOP_FRAC * lot
     prem_cap = cap * PREMIUM_CAP * scale
     per_lot_prem = prem * lot
@@ -358,6 +463,7 @@ def index_option_lots(premium, lot_size, free_capital, adx, daily_aligned, expir
     if expire_today:
         parts.append(f'expiry day {exp_mult:g}x (moves run further on the same 30% stop)')
     parts.append(f'weight {weight:.2f} ({scale:.2f}x)')
+    parts.append(f'day streak {sm:.2f}x')
     parts.append(f'risk budget Rs {_fmt(risk_budget)} vs Rs {_fmt(per_lot_risk)} risk per lot')
     parts.append(f'premium cap Rs {_fmt(prem_cap)} vs Rs {_fmt(per_lot_prem)} per lot')
     if lots == 0:
@@ -374,7 +480,7 @@ def index_option_lots(premium, lot_size, free_capital, adx, daily_aligned, expir
 
 
 # ---------------------------------------------------------------- stock options
-def stock_option_lots(premium, lot_size, free_capital, weight, when=None):
+def stock_option_lots(premium, lot_size, free_capital, weight, when=None, streak_mult=1.0):
     """(lots, note) for one stock-option decision.
 
     The same rupee-risk arithmetic as an index option, but trade_lock R11 caps a stock option at
@@ -398,7 +504,8 @@ def stock_option_lots(premium, lot_size, free_capital, weight, when=None):
     scale = _scale(weight)
     if scale is None:
         return 0, f'book weight {weight!r} unusable -> 0 lots'
-    risk_budget = cap * BASE_RISK * scale
+    sm = _sm(streak_mult)
+    risk_budget = cap * BASE_RISK * scale * sm
     per_lot_risk = prem * STOP_FRAC * lot
     per_lot_prem = prem * lot
     prem_cap = cap * PREMIUM_CAP * scale
@@ -408,7 +515,7 @@ def stock_option_lots(premium, lot_size, free_capital, weight, when=None):
     by_risk = int(risk_budget // per_lot_risk) if per_lot_risk > 0 else 0
     _cap = stock_opt_max_lots(when)
     lots = max(1, min(by_risk, int(prem_cap // per_lot_prem), _cap))
-    parts = [f'free capital Rs {_fmt(cap)}', f'weight {weight:.2f} ({scale:.2f}x)',
+    parts = [f'free capital Rs {_fmt(cap)}', f'weight {weight:.2f} ({scale:.2f}x)', f'day streak {sm:.2f}x',
              f'risk budget Rs {_fmt(risk_budget)} vs Rs {_fmt(per_lot_risk)} risk per lot',
              f'-> {lots} lot(s) (R11: max {_cap} lot(s) per underlying, max 3 underlyings, '
              f'counting this broker\'s existing positions)']
@@ -418,7 +525,7 @@ def stock_option_lots(premium, lot_size, free_capital, weight, when=None):
 
 
 # ---------------------------------------------------------------- MTF
-def mtf_qty(symbol, price, broker, free_capital, weight):
+def mtf_qty(symbol, price, broker, free_capital, weight, streak_mult=1.0):
     """(qty, note): the MTF quantity allowed for this stock at this book weight.
 
     Deliberately thin. The 10%-per-stock / 50%-total caps on the broker's MTF MARGIN, the half-room
@@ -445,10 +552,11 @@ def mtf_qty(symbol, price, broker, free_capital, weight):
     except Exception as e:
         return 0, f'MTF size failed ({type(e).__name__}: {e}) -> 0 shares'
     allowed = int(r.get('qty') or 0)
-    qty = int(allowed * scale)
+    sm = _sm(streak_mult)
+    qty = min(allowed, int(allowed * scale * sm))   # never above what the caps allow
     note = (f'{symbol} {broker}: caps allow {allowed} share(s) (10% stock cap / 50% total on MTF margin, '
             f'half-room reserve, {ms.MAX_STOCKS}-name limit); weight {weight:.2f} ({scale:.2f}x) '
-            f'-> {qty} share(s)')
+            f'day streak {sm:.2f}x -> {qty} share(s)')
     if r.get('reason'):
         note += f'; {r["reason"]}'
     return qty, note
@@ -462,12 +570,15 @@ def explain(free_capital, indexes, weights=None, path=PNL_PATH):
     indexes       {name: {premium, lot_size, adx, daily_aligned, expire_today}} - one per index
     """
     w = weights or book_weights(path)
+    sk = streak_multipliers(path)
     out = {'free_capital': round(float(free_capital)), 'weights': {b: w[b] for b in BOOKS},
-           'weights_note': w.get('_note'), 'trades': w.get('_trades') or {}, 'indexes': {}}
+           'weights_note': w.get('_note'), 'trades': w.get('_trades') or {}, 'indexes': {},
+           'streak': sk}
     for name, ix in (indexes or {}).items():
         lots, note = index_option_lots(ix.get('premium'), ix.get('lot_size'), free_capital,
                                        ix.get('adx'), ix.get('daily_aligned'), ix.get('expire_today'),
-                                       w['index_options'])
+                                       w['index_options'],
+                                       (sk.get(name) or {}).get('mult', 1.0))
         out['indexes'][name] = dict(lots=lots, note=note,
                                     premium=ix.get('premium'), lot_size=ix.get('lot_size'),
                                     premium_outlay=None if not ix.get('premium') or not ix.get('lot_size')
@@ -570,6 +681,7 @@ def main():
           f"{(d.get('kite') or {}).get('free', 0) or 0:,.0f}")
     print(f"book weights: " + ', '.join(f"{b} {w[b]:.0%}" for b in BOOKS))
     print(f"  why: {w.get('_note')}")
+    print("day streak: " + ', '.join(f"{b} {v['mult']:.2f}x ({v['streak']:+d})" for b, v in d['streak'].items()))
     print("\nindex options (lots at this capital, premium and trend):")
     for name, r in d['indexes'].items():
         if not r.get('lots') and r.get('premium') is None:

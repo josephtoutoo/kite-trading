@@ -173,6 +173,12 @@ def main():
         out['rule_set'] = autonomy.rule_set(now)
     except Exception as e:
         out['rule_set'] = {'rule_set': 'user rules', 'override': f'unavailable ({type(e).__name__})'}
+    # t351u: per-book day-streak sizing multiplier (losing days shrink size, winning days grow it)
+    try:
+        import book_sizing
+        out['streak'] = book_sizing.streak_multipliers()
+    except Exception as e:
+        out['streak'] = {'error': f'{type(e).__name__}: {e} (sizing uses 1.0)'}
     try:
         out['upstox'] = upstox_capital()
     except Exception as e:

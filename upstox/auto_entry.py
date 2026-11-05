@@ -160,7 +160,18 @@ def book_weight(book="index_options"):
     return w.get(book)
 
 
-def sized_lots(premium, lot_size, adx, daily_aligned, expire_today, fallback_lots, fallback_note):
+def streak_mult(index_name):
+    """t351u: this index book's day-streak multiplier from book_sizing (1.0 on any failure)."""
+    try:
+        sys.path.insert(0,"/workspace/equity")
+        import book_sizing as bsz
+        return float(bsz.streak_mult(index_name))
+    except Exception as e:
+        print(f"auto_entry: streak multiplier unavailable, using 1.0: {type(e).__name__}: {e}",file=sys.stderr)
+        return 1.0
+
+
+def sized_lots(premium, lot_size, adx, daily_aligned, expire_today, fallback_lots, fallback_note, index_name=None):
     """(lots, note) from book_sizing, or exactly (fallback_lots, fallback_note) when anything is
     missing or the module raises. A sizing bug must never stop the entry routine, and must never
     produce a size the caps do not allow - trade_lock still re-checks every order downstream."""
@@ -172,7 +183,8 @@ def sized_lots(premium, lot_size, adx, daily_aligned, expire_today, fallback_lot
             return fallback_lots, (fallback_note or f"{fallback_lots} lots")+" | fixed size (sizing input missing)"
         sys.path.insert(0,"/workspace/equity")
         import book_sizing as bsz
-        lots,note=bsz.index_option_lots(premium,lot_size,cap,adx,daily_aligned,expire_today,wgt)
+        sm=streak_mult(index_name) if index_name else 1.0
+        lots,note=bsz.index_option_lots(premium,lot_size,cap,adx,daily_aligned,expire_today,wgt,sm)
         lots=int(lots)
         if lots<0 or lots>bsz.MAX_LOTS:
             return fallback_lots, (fallback_note or f"{fallback_lots} lots")+f" | fixed size (sized {lots} outside 0..{bsz.MAX_LOTS})"
@@ -241,13 +253,14 @@ for name,cfg in IDX.items():
         dd=daily_dir(cfg["key"]) if sig else None
         d_aligned=bool(dd is not None and raw is not None and ((dd==1 and raw=="CE") or (dd==-1 and raw=="PE")))
         if quoted:
-            lots,size_note=sized_lots(px,lot,a["adx"],d_aligned,expire_today,lots,r.get("size"))
+            lots,size_note=sized_lots(px,lot,a["adx"],d_aligned,expire_today,lots,r.get("size"),name)
         else:
             size_note=(r.get("size") or f"{lots} lots")+" | fixed size (no usable quote: ltp "+str(ltp)+", ask "+str(ask)+")"
         r["size"]=size_note; r["size_lots"]=lots
         r["size_inputs"]={"premium":px,"lot_size":lot,"adx":a["adx"],"daily_aligned":d_aligned,
                           "expire_today":expire_today,"weight":book_weight("index_options"),
-                          "free_capital":free_capital(),"fixed_size":FIXED}
+                          "free_capital":free_capital(),"fixed_size":FIXED,
+                          "streak_mult":streak_mult(name)}
         qty=lots*lot; r["option"]["qty"]=qty
         ekw=in_expiry_week(exp)
         r["expiry_week"]=ekw

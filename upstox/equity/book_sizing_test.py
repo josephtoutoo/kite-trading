@@ -283,11 +283,64 @@ def test_no_side_effects():
         check(f'book_sizing.py contains no order call: {bad}', bad not in src.split('def _live')[0],
               'found in the library section')
 
+# ---------------------------------------------------------------- j) day-streak multiplier (t351u)
+def test_streak():
+    import tempfile
+    sm = bs.streak_multiplier
+    for k, want in ((-1, .85), (-2, .70), (-3, .50), (-7, .50), (0, 1.0), (1, 1.0), (2, 1.10), (3, 1.20), (9, 1.20)):
+        check(f'streak {k:+d} -> {want}', abs(sm(k) - want) < 1e-9, str(sm(k)))
+    check('bad streak -> 1.0', sm('x') == 1.0 and sm(None) == 1.0)
+    so = bs.streak_of
+    check('3 losses', so({'2026-11-02': -5, '2026-11-03': -1, '2026-11-04': -2}, '2026-11-05') == -3)
+    check('win breaks losses', so({'2026-11-02': -5, '2026-11-03': 9, '2026-11-04': 2}, '2026-11-05') == 2)
+    check('today excluded', so({'2026-11-04': -2, '2026-11-05': 50}, '2026-11-05') == -1)
+    check('flat day ends streak', so({'2026-11-03': -2, '2026-11-04': 0}, '2026-11-05') == 0)
+    check('empty -> 0', so({}, '2026-11-05') == 0)
+    d = tempfile.mkdtemp()
+    def write(obj):
+        f = os.path.join(d, 'p.json'); json.dump(obj, open(f, 'w')); return f
+    ok = {'upstox_fo': True, 'upstox_eq': True, 'kite': True}
+    f = write({'daily': {'NIFTY': {'2026-11-03': -1, '2026-11-04': -1}, 'SENSEX': {'2026-11-03': 5, '2026-11-04': 5, '2026-11-02': 1},
+                         'BANKNIFTY': {}, 'stock_options': {'2026-11-04': 3}}, 'daily_sources_ok': ok})
+    m = bs.streak_multipliers(f, '2026-11-05')
+    check('books separate: NIFTY 0.70', m['NIFTY']['mult'] == 0.70, str(m))
+    check('books separate: SENSEX 1.20', m['SENSEX']['mult'] == 1.20, str(m))
+    check('no history -> 1.0', m['BANKNIFTY']['mult'] == 1.0 and m['mtf']['mult'] == 1.0, str(m))
+    check('every book present', set(m) == set(bs.STREAK_BOOKS))
+    # failures never above 1.0
+    check('missing file -> all 1.0', all(v['mult'] == 1.0 for v in bs.streak_multipliers(os.path.join(d, 'nope.json')).values()))
+    check('no daily key -> all 1.0', all(v['mult'] == 1.0 for v in bs.streak_multipliers(write({'books': {}})).values()))
+    f2 = write({'daily': {'SENSEX': {'2026-11-03': 5, '2026-11-04': 5}, 'NIFTY': {'2026-11-04': -5}},
+                'daily_sources_ok': {'upstox_fo': False}})
+    m2 = bs.streak_multipliers(f2, '2026-11-05')
+    check('failed source caps a win streak at 1.0', m2['SENSEX']['mult'] == 1.0, str(m2))
+    check('failed source still allows a cut', m2['NIFTY']['mult'] == 0.85, str(m2))
+    garbage = os.path.join(d, 'g.json'); open(garbage, 'w').write('{not json')
+    check('garbage file -> 1.0', bs.streak_mult('NIFTY', garbage) == 1.0)
+    # applied to the risk budget, caps kept
+    base, _ = bs.index_option_lots(100, 75, 600_000, 40, True, False, 0.5)
+    hi, _ = bs.index_option_lots(100, 75, 600_000, 40, True, False, 0.5, 1.2)
+    lo, n = bs.index_option_lots(100, 75, 600_000, 40, True, False, 0.5, 0.5)
+    check('loss streak shrinks lots', lo < base, f'{lo} vs {base}')
+    check('win streak never shrinks lots', hi >= base, f'{hi} vs {base}')
+    check('note shows streak', 'day streak 0.50x' in n, n)
+    big, _ = bs.index_option_lots(10, 75, 50_000_000, 40, True, True, 0.5, 1.2)
+    check('MAX_LOTS kept under 1.2x', big <= bs.MAX_LOTS, str(big))
+    hugem, _ = bs.index_option_lots(100, 75, 600_000, 40, True, False, 0.5, 99)
+    check('multiplier input clamped to 1.2', hugem == hi, f'{hugem} vs {hi}')
+    one, _ = bs.index_option_lots(100, 75, 100_000, 10, False, False, 0.15, 0.5)
+    check('1-lot floor kept under 0.5x', one == 1, str(one))
+    none, _ = bs.index_option_lots(1000, 75, 100_000, 40, True, False, 0.15, 1.2)
+    check('premium cap kept under 1.2x (cannot afford -> 0)', none == 0, str(none))
+    so_hi, _ = bs.stock_option_lots(10, 100, 50_000_000, 0.5, None, 1.2)
+    check('R11 cap kept under 1.2x', so_hi <= bs.stock_opt_max_lots(), str(so_hi))
+    check('nan multiplier -> 1.0', bs._sm(float('nan')) == 1.0 and bs._sm('x') == 1.0)
+
 
 if __name__ == '__main__':
     for fn in (test_free_capital, test_unaffordable_lot, test_capital_scaling,
                test_weights_thin_and_missing, test_weight_clamp, test_adx_monotonic,
-               test_single_lot_and_r11, test_explain, test_no_side_effects):
+               test_single_lot_and_r11, test_explain, test_no_side_effects, test_streak):
         try:
             fn()
         except Exception as e:

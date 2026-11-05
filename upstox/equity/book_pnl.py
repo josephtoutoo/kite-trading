@@ -197,6 +197,23 @@ for b in BOOKS:
         open_now=(dict(positions=o['n'], cost=round(o['cost'], 2),
                        capital_blocked=round(o['margin'], 2) if o['margin_known'] else
                        (f"partial: {round(o['margin'], 2)} known + unknown" if o['margin'] else 'unknown')) if o else dict(positions=0)))
+# t351u (5 Nov 2026): realised P&L per CLOSED DAY per streak book, for the day-streak sizing
+# multiplier in book_sizing.py. Index options are split by underlying (NIFTY / SENSEX / BANKNIFTY
+# are separate books); stock options and MTF are one series each. MTF history before today is not
+# separable on Upstox (equity_unsplit), so its series only has days the APIs tag as MTF.
+def _streak_book(t):
+    if t['book'] == 'index_options':
+        r = UPX_INDEX_ALIAS.get(underlying_of(t['sym']), underlying_of(t['sym']))
+        return r if r in ('NIFTY', 'SENSEX', 'BANKNIFTY') else None
+    return {'stock_options': 'stock_options', 'mtf_equity': 'mtf'}.get(t['book'])
+_daily = collections.defaultdict(lambda: collections.defaultdict(float))
+for t in trades:
+    sb = _streak_book(t)
+    if sb: _daily[sb][t['date']] += t['pnl']
+res['daily'] = {b: {d: round(v, 2) for d, v in sorted(_daily[b].items())}
+                for b in ('NIFTY', 'SENSEX', 'BANKNIFTY', 'stock_options', 'mtf')}
+res['daily_sources_ok'] = dict(upstox_fo=bool(upx_hist_ok.get('FO')), upstox_eq=bool(upx_hist_ok.get('EQ')),
+                               kite=kite_funds is not None)
 res['since_inception_note'] = 'since_inception = earliest row the Upstox P&L report returns (FY2026-27 from 1 Apr 2026) + Kite today'
 json.dump(res, open('/workspace/equity/book_pnl.json', 'w'), indent=1, default=str)
 
