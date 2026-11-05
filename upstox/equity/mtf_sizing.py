@@ -410,9 +410,9 @@ def check(broker, symbol, qty, price, mode='new', when=None):
                 limits=lim)
 
 
-# 6, not 5 (t305u/t306u, 5 Nov 2026): Upstox and Kite must hold the SAME trades from tomorrow, and
-# Upstox already holds 6 of my MTF names - 6 is the lowest level at which the two books can align.
-MAX_STOCKS = 6
+# 5 (t383u, 5 Nov 2026): user cap is back to 5 managed MTF names per broker. Was briefly 6
+# (t305u/t306u) so the two books could mirror while Upstox already held 6; now trim to 5 and stay there.
+MAX_STOCKS = 5
 
 
 def slots(broker):

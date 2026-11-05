@@ -130,7 +130,7 @@ def rule_set(when=None):
                          f"stock options {o['STOCK_OPT_MAX_UND']} underlyings x {o['STOCK_OPT_MAX_LOTS']} lots, "
                          f"MTF per stock {o['MTF_PER_STOCK'] * 100:g}% (total {o['MTF_TOTAL'] * 100:g}% unchanged)")
         d["unchanged"] = ("Rs 30,000 account day-loss breaker; fail-closed reads; R8/R9; "
-                          "mirrored MTF names; 6 MTF names per broker")
+                          "mirrored MTF names; 5 MTF names per broker")
     else:
         d["override"] = "none - user's own rules apply"
     return d

@@ -529,7 +529,7 @@ def mtf_qty(symbol, price, broker, free_capital, weight, streak_mult=1.0):
     """(qty, note): the MTF quantity allowed for this stock at this book weight.
 
     Deliberately thin. The 10%-per-stock / 50%-total caps on the broker's MTF MARGIN, the half-room
-    reserve for pullback adds, the 6-name limit and the free-margin check all live in
+    reserve for pullback adds, the 5-name limit and the free-margin check all live in
     mtf_sizing.size(); this asks it for the allowed quantity and then only scales that answer DOWN
     to the book's weight. It never re-derives - let alone widens - a cap.
     """

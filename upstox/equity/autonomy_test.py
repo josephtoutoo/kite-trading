@@ -434,7 +434,7 @@ def test_mtf_caps():
     check('mtf_sizing.per_stock_cap(5 Nov) is 0.12', ms.per_stock_cap('2026-11-05T10:00') == 0.12)
     check('mtf_sizing.total_cap never leaves 0.50',
           ms.total_cap('2026-11-05T10:00') == 0.50 and ms.total_cap('2026-11-09T10:00') == 0.50)
-    check('MAX_STOCKS (6 per broker) is untouched', ms.MAX_STOCKS == 6, str(ms.MAX_STOCKS))
+    check('MAX_STOCKS (5 per broker)', ms.MAX_STOCKS == 5, str(ms.MAX_STOCKS))
     # the cap really is the binding number: a 110,000 margin order fits 12% and not 10%
     lim5 = ms.limits(st, 'X', 'new', 1.0, when='2026-11-05T10:00')
     lim9 = ms.limits(st, 'X', 'new', 1.0, when='2026-11-09T10:00')

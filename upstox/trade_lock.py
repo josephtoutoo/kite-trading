@@ -5,7 +5,7 @@ applied where the rule is EVALUATED, not by rewriting these constants at import 
 rewritten at import is invisible to the next reader and would silently outlive its expiry.
 On any other date _lim() returns the constant below untouched, so the user's rules return by
 themselves. The Rs 30,000 account day-loss breaker (R2b), the fail-closed reads (R0), R8/R9 and
-the 6-name MTF slot cap have no override entry and cannot move.
+the 5-name MTF slot cap have no override entry and cannot move.
 Entry scripts MUST call check_order(order) before placing any order (and can_enter() still works).
 Lock file: trade_lock.json {date, reason, loss, next_day_reduced, next_day_date}
 CLI: python3 trade_lock.py check '<json order>'   (order keys: trading_symbol, instrument_token,

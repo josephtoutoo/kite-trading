@@ -278,6 +278,9 @@ def _buy(symbol, price, mode='new', qty=None):
             print(f'mtf_dual_entry: Kite symbol map failed for {key}: {type(e).__name__}: {e}', file=sys.stderr)
             m = None
         if not m:
+            # Equity cash keys are not in the F&O map; resolve via NSE dump (same as _kite_eq).
+            m = _kite_eq(symbol)
+        if not m:
             p['legs']['kite']['order_id'] = None
             p['legs']['kite']['error'] = 'no Kite symbol for ' + key
         else:
@@ -355,13 +358,16 @@ def _buy(symbol, price, mode='new', qty=None):
             p['stop_order_upstox'] = {'error': '; '.join(why2)}
     if kfill:
         try:
-            m2 = bk2.from_upstox(key)
-            ktick = bk2.tick_for(m2['exchange'], m2['tradingsymbol'])
+            import broker_kite as bk
+            m2 = bk.from_upstox(key) or _kite_eq(symbol)
+            if not m2:
+                raise RuntimeError('no Kite symbol for stop on ' + symbol)
+            ktick = bk.tick_for(m2['exchange'], m2['tradingsymbol'])
             ktrig = round(round(st / ktick) * ktick, 2)
             # limit a few ticks BELOW the trigger: an SL whose limit equals its trigger goes unfilled in
             # a gap, which is exactly when a stop is needed. Same offset the Upstox leg already uses.
             klim = round(round((ktrig - 5 * ktick) / ktick) * ktick, 2)
-            ksid = bk2.place(m2['exchange'], m2['tradingsymbol'], 'SELL', kfill, klim, order_type='SL',
+            ksid = bk.place(m2['exchange'], m2['tradingsymbol'], 'SELL', kfill, klim, order_type='SL',
                              trigger=ktrig, tag='trailsl', product='MTF')
             p['stop_order_kite'] = {'order_id': ksid, 'trigger': ktrig, 'limit': klim}
         except Exception as e:
@@ -529,7 +535,7 @@ def _mirror_leg(sym, broker, books, count, committed):
         leg['skip'] = f'{broker} already holds {sym}'
         return leg
 
-    # hard guard 3: the 6-name cap, counted on MY names only
+    # hard guard 3: the 5-name cap, counted on MY names only
     cap = books[broker]['slots'].get('cap') or ms.MAX_STOCKS
     if count[broker] >= cap:
         leg['skip'] = f'{broker} is at the cap ({count[broker]}/{cap} of my MTF names) - no free slot'
