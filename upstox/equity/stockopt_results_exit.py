@@ -4,8 +4,10 @@
 Calendar: ROOT/stockopt_calendar.json (copy the committed .example to deploy).
 Only long stock options are considered. They must be marked results_entry in
 risk_state.json (or risk_seeds.json) or have a completed BUY tagged results_entry.
-At/after 15:10 IST on the due date, live sell stops are cancelled before a LIMIT
-SELL near LTP is sent on the same broker. --dry-run never cancels or sells.
+At/after 15:10 IST on the due date, the overnight GTT and live sell stops are
+cancelled before a LIMIT SELL near LTP is sent on the same broker. If that GTT
+cannot be cleared, no SELL is sent (avoiding a double exit). --dry-run never
+cancels or sells.
 
 TATASTEEL's expected date is Sat 2026-11-07, so its due session is Fri 6 Nov.
 Schedule every 5 minutes from 15:10 through 15:20 IST; repeat runs see flat books.
@@ -93,6 +95,17 @@ def main(argv=None):
             if args.dry_run:
                 item.update(action='DRY-RUN: cancel protective stops then SELL', stop_order_ids=[o['order_id'] for o in stops], limit=limit)
             else:
+                try:
+                    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+                    import gtt_overnight
+                    gtt_ok, gtt_detail = gtt_overnight.cancel_for_day(broker, sym, key=key)
+                except Exception as e:
+                    gtt_ok, gtt_detail = False, '%s: %s' % (type(e).__name__, e)
+                item['gtt_clear'] = {'ok': gtt_ok, 'detail': gtt_detail}
+                if not gtt_ok:
+                    item['error'] = 'GTT not cleared; no SELL sent'
+                    out['actions'].append(item)
+                    continue
                 item['cancelled_stops'] = []
                 for o in stops:
                     if broker == 'upstox':
