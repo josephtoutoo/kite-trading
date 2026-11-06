@@ -10,6 +10,10 @@ The pair is one decision: if either broker cannot take the trade at all, neither
 broker fills and the other does not, the fill is reported loudly and the unfilled leg is cancelled -
 a half-filled mirror is a bug, not a position.
 
+Same-day MTF sell block (6 Nov 2026 post-market): if either broker already SOLD this name on MTF
+today (mtf_trim / mtf_clear / trailsl / etc.), do not attempt a dual buy. Kite rejects the rebuy for
+the rest of the day; placing the Upstox leg alone produced INDHOTEL and TITAN unwinds.
+
 Each leg also gets a protective SL (5% below the fill or the 1-hour Supertrend when nearer, never
 above price), placed right after the fill and reported.
 
@@ -143,6 +147,46 @@ def _already(symbol, broker=None):
     return hits
 
 
+
+def mtf_sell_today(symbol, u_orders, k_orders):
+    """Return brokers that already SOLD this name on MTF today (complete fills).
+
+    Kite refuses a same-day MTF rebuy after any MTF holding sell in that stock
+    ("MTF buy order is not allowed for the day as there is an MTF holding sell
+    position in this stock"). Upstox may still accept the buy, which is how we
+    got half-filled mirrors on 6 Nov (INDHOTEL, TITAN) that then had to unwind.
+    Pure: callers pass order lists so unit tests never need a live broker.
+    """
+    base = symbol.upper().removesuffix('-EQ')
+    want_u = base + '-EQ'
+    hits = []
+    for o in u_orders or []:
+        if ((o.get('transaction_type') or '').upper() == 'SELL'
+                and (o.get('product') or '').upper() == 'MTF'
+                and (o.get('trading_symbol') or '').upper() == want_u
+                and (o.get('status') or '').lower() == 'complete'
+                and int(o.get('filled_quantity') or o.get('quantity') or 0) > 0):
+            hits.append({'broker': 'upstox', 'order_id': o.get('order_id'),
+                         'qty': o.get('filled_quantity') or o.get('quantity'),
+                         'tag': o.get('tag')})
+    for o in k_orders or []:
+        if ((o.get('transaction_type') or '').upper() == 'SELL'
+                and (o.get('product') or '').upper() == 'MTF'
+                and (o.get('tradingsymbol') or '').upper() == base
+                and (o.get('status') or '').lower() == 'complete'
+                and int(o.get('filled_quantity') or o.get('quantity') or 0) > 0):
+            hits.append({'broker': 'kite', 'order_id': o.get('order_id'),
+                         'qty': o.get('filled_quantity') or o.get('quantity'),
+                         'tag': o.get('tag')})
+    return hits
+
+
+def _mtf_sell_blocked(symbol):
+    """Fail-closed: if either broker sold this MTF name today, dual buy is blocked."""
+    u, k = _orders_today()
+    return mtf_sell_today(symbol, u, k)
+
+
 def load():
     try:
         return json.load(open(REC))
@@ -239,6 +283,14 @@ def _buy(symbol, price, mode='new', qty=None):
     if prior:
         return {'symbol': symbol, 'action': 'NOT PLACED: a BUY of this name is already live/filled today - ' +
                 ', '.join(f"{h['broker']} {h['order_id']} ({h['status']})" for h in prior), 'already': prior}
+    try:
+        sold = _mtf_sell_blocked(symbol)
+    except Exception as e:
+        return {'symbol': symbol, 'action': f'NOT PLACED: could not read the order book to rule out a same-day MTF sell ({type(e).__name__}: {e})'}
+    if sold:
+        return {'symbol': symbol, 'action': 'NOT PLACED: same-day MTF sell on ' +
+                ', '.join(f"{h['broker']} {h['order_id']}" for h in sold) +
+                ' - Kite refuses rebuy today; mirror would be half-filled', 'mtf_sell_today': sold}
     p = plan(symbol, price, mode, qty)
     p.setdefault('rule_set', _ruleset())
     if not p['both_ok']:
@@ -533,6 +585,18 @@ def _mirror_leg(sym, broker, books, count, committed):
     # hard guard 2: never buy a name a broker already holds (either book, mine or the user's)
     if sym in books[broker]['held']:
         leg['skip'] = f'{broker} already holds {sym}'
+        return leg
+
+    # hard guard 2b: never rebuy a name either broker sold on MTF today (Kite day-block;
+    # otherwise Upstox fills alone and we unwind the mirror — INDHOTEL/TITAN 6 Nov)
+    try:
+        sold = _mtf_sell_blocked(sym)
+    except Exception as e:
+        leg['skip'] = f'could not rule out same-day MTF sell ({type(e).__name__}: {e})'
+        return leg
+    if sold:
+        leg['skip'] = 'same-day MTF sell on ' + ', '.join(f"{h['broker']} {h['order_id']}" for h in sold)
+        leg['mtf_sell_today'] = sold
         return leg
 
     # hard guard 3: the 5-name cap, counted on MY names only
