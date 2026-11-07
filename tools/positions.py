@@ -2,8 +2,12 @@ import os,json,requests
 def p(t,x): print("==",t); print(json.dumps(x)) if "holdings" not in t else print(len([y for y in x if y["quantity"]]), "held; pnl", round(sum(y["pnl"] for y in x if y["quantity"])), "; top:", sorted([(y.get("tradingsymbol") or y.get("trading_symbol"),round(y["pnl"])) for y in x if y["quantity"]],key=lambda z:z[1])[:3], sorted([(y.get("tradingsymbol") or y.get("trading_symbol"),round(y["pnl"])) for y in x if y["quantity"]],key=lambda z:-z[1])[:3])
 K=("tradingsymbol","quantity","average_price","last_price","pnl")
 try:
-  tok=json.load(open("/workspace/kite/token.json"))["access_token"]
-  h={"X-Kite-Version":"3","Authorization":"token %s:%s"%(os.environ["KITE_API_KEY"],tok)}
+  import sys
+  sys.path.insert(0,"/workspace/upstox")
+  import broker_kite
+  key=(os.environ.get("KITE_API_KEY") or "").strip()
+  tok=broker_kite.load_access_token(key)
+  h={"X-Kite-Version":"3","Authorization":"token %s:%s"%(key,tok)}
   for u in ["portfolio/positions","portfolio/holdings"]:
     r=requests.get("https://api.kite.trade/"+u,headers=h).json()
     if r.get("status")=="success":

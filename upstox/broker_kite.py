@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Kite (Zerodha) broker adapter for the Upstox automation (4 Nov 2026).
-- Token: /workspace/kite/token.json {"access_token"} ; api key from env KITE_API_KEY. Never printed.
+- Token: KITE_TOKEN_FILE or /workspace/kite/token.json {"access_token", "api_key"} ; key from env KITE_API_KEY. Never printed.
+  A stored api_key must match KITE_API_KEY or the session is refused before any broker call. Old files with only access_token still load.
 - All Kite API calls go through UPSTOX_PROXY_URL (static IP). If token/key/proxy invalid -> valid()=False and
   every write/read helper no-ops (returns None / []), so callers never break.
 - Orders: LIMIT (or SL for stops) only, NRML for options, tag auto_entry by default. MARKET/SL-M refused.
@@ -10,7 +11,7 @@ CLI: python3 broker_kite.py status | map NSE_FO|50978 | positions | orders"""
 import os,sys,json,csv,io,datetime,urllib.request
 D=os.path.dirname(os.path.abspath(__file__))
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
-TOKF=os.environ.get("KITE_TOKEN_FILE","/workspace/kite/token.json")
+DEFAULT_TOKEN="/workspace/kite/token.json"
 SEG={"NSE_FO":"NFO","BSE_FO":"BFO","MCX_FO":"MCX"}; RSEG={v:k for k,v in SEG.items()}
 _k=None; _valid=None; _why=""; _dump={}
 # (5 Nov 2026) One run reads the same Kite book several times (trade_lock wants positions+orders,
@@ -27,13 +28,30 @@ _reads={}          # ('orders'|'positions'|'holdings') -> (expires_at, value)
 _idx={}
 def log(msg):
     with open(os.path.join(D,"kite_broker.log"),"a") as f: f.write(f"{datetime.datetime.now(IST):%Y-%m-%d %H:%M:%S} {msg}\n")
+def token_path():
+    return os.environ.get("KITE_TOKEN_FILE") or DEFAULT_TOKEN
+def load_access_token(api_key):
+    """Stored access_token for this api_key. No broker call. The error text never includes the token."""
+    api_key=(api_key or "").strip()
+    with open(token_path()) as f: raw=json.load(f)
+    if not isinstance(raw, dict): raise RuntimeError("token file is not a JSON object")
+    tok=raw.get("access_token")
+    tok=tok.strip() if isinstance(tok, str) else ""
+    if not tok: raise RuntimeError("token file has no access_token")
+    bound=raw.get("api_key")
+    bound=bound.strip() if isinstance(bound, str) else ""
+    if bound and bound!=api_key: raise RuntimeError("token file api_key does not match KITE_API_KEY")
+    return tok
 def client():
     global _k
     if _k is None:
         from kiteconnect import KiteConnect
+        key=(os.environ.get("KITE_API_KEY") or "").strip()
+        if not key: raise RuntimeError("KITE_API_KEY not set")
         px=os.environ.get("UPSTOX_PROXY_URL")
-        _k=KiteConnect(api_key=os.environ["KITE_API_KEY"],proxies={"https":px,"http":px} if px else None,timeout=20)
-        _k.set_access_token(json.load(open(TOKF))["access_token"])
+        k=KiteConnect(api_key=key,proxies={"https":px,"http":px} if px else None,timeout=20)
+        k.set_access_token(load_access_token(key))
+        _k=k
     return _k
 def valid():
     """True only if a live profile call succeeds. Cached per process."""

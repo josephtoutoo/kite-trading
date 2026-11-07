@@ -16,3 +16,5 @@ upstox/alert_state.json
 venv/
 upstox/*.json
 upstox/*.html
+.upstox_mobile
+upstox/.upstox_mobile
