@@ -6,6 +6,9 @@ No broker, network, password, or TOTP. Fake tokens only.
 import datetime, importlib.util, json, os, stat, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+import net_block
+net_block.install()
 sys.path.insert(0, os.path.join(ROOT, "upstox"))
 import broker_kite
 
@@ -14,6 +17,7 @@ login_server = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(login_server)
 
 FAILS = []
+PASSED = [0]
 
 
 def check(name, cond, detail=""):
@@ -21,6 +25,7 @@ def check(name, cond, detail=""):
         FAILS.append(f"{name}: {detail}")
         print(f"FAIL  {name}  {detail}")
     else:
+        PASSED[0] += 1
         print(f"ok    {name}")
 
 
@@ -162,7 +167,7 @@ if __name__ == "__main__":
     test_callback_hides_exchange_errors_and_mismatch()
     test_reader_pairs_key_and_accepts_legacy_file()
     test_import_does_not_open_a_port()
-    if FAILS:
-        print(f"{len(FAILS)} failed")
+    print(f"RESULT login passed={PASSED[0]} failed={len(FAILS)} network_attempts={len(net_block.ATTEMPTS)}")
+    if FAILS or net_block.ATTEMPTS:
         sys.exit(1)
     print("all passed")
