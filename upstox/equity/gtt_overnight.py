@@ -62,6 +62,34 @@ def tick_for(p):
     return 0.10 if float(p) >= 1000 else 0.05
 
 
+def kite_exchange(row):
+    """Exchange for a Kite GTT. The position's own exchange wins (11 Nov 2026: a CRUDEOIL option
+    was sent as NFO and Kite answered "Instrument not found"); the symbol guess is only a fallback."""
+    if row.get('book') == 'MTF':
+        return 'NSE'
+    ex = (row.get('exchange') or '').upper()
+    if ex in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NSE', 'BSE'):
+        return ex
+    return 'BFO' if row['sym'].startswith(('SENSEX', 'BANKEX')) else 'NFO'
+
+
+def contract_tick(row, trig):
+    """Exchange tick for this contract from the daily Kite master; the old price-band guess
+    (0.05 / 0.10) is the fallback. CRUDEOIL options tick 0.10 and BANKNIFTY futures 0.20."""
+    fallback = tick_for(trig)
+    if row.get('kind') == 'eq':
+        return fallback
+    try:
+        import broker_kite as bk
+        if row['broker'] == 'kite':
+            t = float(bk.tick_for(kite_exchange(row), row['sym'], default=fallback) or fallback)
+        else:
+            t = float((bk.from_upstox(row.get('key') or '') or {}).get('tick_size') or fallback)
+        return t if t >= 0.05 else fallback
+    except Exception:
+        return fallback
+
+
 def snap(p, t=None):
     t = t or tick_for(p)
     return round(round(float(p) / t) * t, 2)
@@ -156,7 +184,8 @@ def kite_targets():
             rows.append(dict(broker='kite', book='Option', sym=sym, key=sym, qty=q,
                              entry=float(p.get('average_price') or 0),
                              ltp=float(p.get('last_price') or 0),
-                             product=p.get('product') or 'NRML', kind='opt'))
+                             product=p.get('product') or 'NRML', kind='opt',
+                             exchange=p.get('exchange') or ''))
     return rows
 
 
@@ -246,7 +275,7 @@ def recorded_level(broker, sym):
 # ---------------- actions ----------------
 def place_one(row, trig, rec):
     """Place or raise one GTT. Returns an action dict."""
-    t = tick_for(trig)
+    t = contract_tick(row, trig)
     trig = snap(trig, t)
     if trig >= row['ltp']:
         return dict(sym=row['sym'], broker=row['broker'], action='SKIP', why='trigger at/above ltp',
@@ -271,7 +300,7 @@ def place_one(row, trig, rec):
     try:
         g = bk.client().place_gtt(
             trigger_type=bk.client().GTT_TYPE_SINGLE, tradingsymbol=row['sym'],
-            exchange='NSE' if row['book'] == 'MTF' else ('BFO' if row['sym'].startswith(('SENSEX', 'BANKEX')) else 'NFO'),
+            exchange=kite_exchange(row),
             trigger_values=[trig], last_price=row['ltp'],
             orders=[dict(transaction_type='SELL', quantity=int(row['qty']), product=row['product'],
                          order_type='LIMIT', price=limit)])

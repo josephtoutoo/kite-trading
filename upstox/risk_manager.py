@@ -32,6 +32,21 @@ def write(u,body=None,method=None):
     if DRY: return {"status":"dry-run"}
     return req(u,body,method)
 def tick(p): return round(round(p/0.05)*0.05,2)
+def tick_size_for(key, default=0.05):
+    """Contract tick from the daily Kite master (11 Nov 2026: NIFTY FUT 0.10, BANKNIFTY FUT 0.20,
+    CRUDEOIL options 0.10). Upstox rejected an off-grid futures trigger ("invalid trigger price")
+    and the stop stayed unplaced. Falls back to the old 0.05 grid when the contract is not found."""
+    try:
+        import broker_kite as _bk
+        m = _bk.from_upstox(key)
+        t = float((m or {}).get("tick_size") or 0)
+        return t if t >= 0.05 else default
+    except Exception:
+        return default
+def tick_on(p, ts):
+    """Round p onto the contract grid ts. ts=0.05 (or unknown) gives exactly tick(p)."""
+    if not ts or abs(ts - 0.05) < 1e-9: return tick(p)
+    return round(round(p/ts)*ts, 2)
 def isopt(sym): return len(sym)>2 and sym[-2:] in("CE","PE") and sym[-3].isdigit()  # BAJFINANCE ends in CE: require strike digit
 
 def _gtt_clear(broker, sym, key=None):
@@ -107,6 +122,7 @@ for p in pos:
     if not (isopt(sym) or isfut(sym)) or q<=0: continue
     fut=isfut(sym)
     k=p["instrument_token"]; longs.add(k); ltp=p["last_price"]
+    _ts=tick_size_for(k); _tk=lambda x,_t=_ts: tick_on(x,_t)  # 11 Nov: contract tick grid
     avg=p.get("day_buy_price") if p.get("day_buy_quantity",0)>0 and p.get("overnight_quantity",0)<=0 else None
     avg=avg or p.get("average_price") or p.get("buy_price") or p.get("day_buy_price")
     if not avg or not ltp: acts.append({"sym":sym,"action":"SKIP_NO_PRICE"}); continue
@@ -132,7 +148,7 @@ for p in pos:
         if not gok:
             acts.append({"sym":sym,"action":"GTT_FAIL","why":f"overnight GTT not cancelled, trend exit not sent: {gdet}"}); continue
         for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
-        lim=tick(ltp*0.995)
+        lim=_tk(ltp*0.995)
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
         acts.append({"sym":sym,"action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"pnl_est":round((lim-avg)*q),"resp":r.get("status"),"err":r.get("body")})
         continue
@@ -147,10 +163,10 @@ for p in pos:
                      "stop_floor_moved":bool(fut)})
     if True:
         # 30% fixed floor under entry (never lowered); floor rises only when a target rolls
-        stop=tick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
-        if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))
+        stop=_tk(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
+        if stop>=ltp: stop=_tk(ltp*(0.995 if fut else 0.97))
         else: s["stop"]=stop  # ratchet: never lowered
-        lim=tick(stop*(0.99 if fut else 0.95))
+        lim=_tk(stop*(0.99 if fut else 0.95))
         info={"sym":sym,"qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
         if not sls:
             gok,gdet=_gtt_clear("upstox",sym,key=k)
@@ -164,7 +180,7 @@ for p in pos:
             if not DRY: sc.clear("upstox",sym)
             if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:
                 t2=max(stop,o["trigger_price"])
-                r=write("https://api-hft.upstox.com/v2/order/modify",{"order_id":o["order_id"],"quantity":q,"validity":"DAY","price":tick(t2*(0.99 if fut else 0.95)),"order_type":"SL","trigger_price":t2,"disclosed_quantity":0},method="PUT")
+                r=write("https://api-hft.upstox.com/v2/order/modify",{"order_id":o["order_id"],"quantity":q,"validity":"DAY","price":_tk(t2*(0.99 if fut else 0.95)),"order_type":"SL","trigger_price":t2,"disclosed_quantity":0},method="PUT")
                 acts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":r.get("status"),"err":r.get("body")})
             else: acts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
 # ---------------- Upstox MTF equity: NO stop management here (5 Nov 2026) ----------------
