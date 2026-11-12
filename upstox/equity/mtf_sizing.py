@@ -20,16 +20,24 @@ Capital, matching the existing scripts:
   Upstox  available_margin + used_margin   (equity segment)
   Kite    margins.net + utilised.debits
 
-Scoping (t304u, finished 5 Nov 2026): the stock COUNT cap and the MTF budget count only names
-this bot opened (mine_upstox / mine_kite / mtf_managed.json). Names the user bought themselves are
-excluded from both - they still block real margin, so free margin and the R10d coverage check keep
-using every live holding.
+Scoping (t304u, finished 5 Nov 2026): until 9 Nov 2026 the stock COUNT cap and the MTF budget
+count only names this bot opened (mine_upstox / mine_kite / mtf_managed.json). Names the user
+bought themselves are excluded from both - they still block real margin, so free margin and the
+R10d coverage check keep using every live holding.
+
+Monday 9 Nov 2026 IST onward (equity/mtf_policy.py, capital confirmed 6 Nov 2026 21:36 IST):
+the cap is 5 actual positive MTF names per broker, legacy and user lots included. Initial buys
+and adds share one 25% pool. There is no separate add reserve. The 10% per-stock cap stays
+because it is stricter. Pending buys reserve budget and a slot. A book already over the pool
+refuses new buys and adds and is reported; this module does not liquidate it. The live funds
+figure is margin capacity, not verified capital, so a live size refuses until a verified
+denominator is supplied.
 
 CLI:  python3 mtf_sizing.py state [broker]
       python3 mtf_sizing.py check SYMBOL QTY PRICE [--broker upstox|kite] [--mode new|add]
       python3 mtf_sizing.py size  SYMBOL PRICE [--broker upstox|kite] [--mode new|add]
 """
-import json, sys, os, glob, gzip, time
+import json, sys, os, glob, gzip, time, datetime
 
 sys.path.insert(0, '/workspace/upstox')
 import api                     # one pooled, timed, User-Agent-bearing client (5 Nov 2026)
@@ -78,9 +86,41 @@ def per_stock_cap(when=None):
         return PER_STOCK
 
 
+def _policy():
+    """The Monday rule module. A missing module on/after 9 Nov is a hard stop, not a 50% book."""
+    try:
+        import mtf_policy as pol
+        return pol
+    except Exception as exc:
+        print(f'mtf_sizing: Monday policy module unavailable: {type(exc).__name__}: {exc}', file=sys.stderr)
+        return None
+
+
+def _monday(when):
+    pol = _policy()
+    if pol is None:
+        # No enforcer. Before the boundary this keeps the user's numbers; on/after it, or if the
+        # clock cannot be read, the caller must refuse the buy.
+        return False
+    return pol.policy_active(when)
+
+
 def total_cap(when=None):
-    """The total MTF cap in force now. Never above the 0.50 ceiling, whatever any table says -
-    this number is a hard guard, not only a preference (t339u did not raise it)."""
+    """Total MTF margin cap. 0.50 through 8 Nov 2026 (never raised by the 5-6 Nov override).
+    0.25 shared pool from 9 Nov 2026 IST. An unreadable date, or a missing policy module once
+    that morning has arrived, returns 0 so a buy cannot sneak out under the old ceiling."""
+    pol = _policy()
+    if pol is None:
+        ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+        today = datetime.datetime.now(ist).date()
+        if when is None and today >= datetime.date(2026, 11, 9):
+            return 0.0
+        if when is not None:
+            return 0.0
+    elif not pol.date_readable(when):
+        return 0.0
+    elif pol.policy_active(when):
+        return pol.TOTAL
     if _autonomy is None:
         return min(TOTAL, 0.50)
     try:
@@ -89,6 +129,37 @@ def total_cap(when=None):
         print(f'mtf_sizing: override lookup failed, keeping the user total: {type(e).__name__}: {e}',
               file=sys.stderr)
         return min(TOTAL, 0.50)
+
+
+def initial_fraction(when=None):
+    """Shared MTF pool from 9 Nov (0.25). The same number as the add fraction. None before that morning."""
+    pol = _policy()
+    if pol is None or not pol.date_readable(when) or not pol.policy_active(when):
+        return None
+    return pol.INITIAL
+
+
+def add_fraction(when=None):
+    """Shared MTF pool from 9 Nov (0.25), not a separate add reserve. None before that morning."""
+    pol = _policy()
+    if pol is None or not pol.date_readable(when) or not pol.policy_active(when):
+        return None
+    return pol.ADD
+
+
+def max_names(when=None):
+    """5 bot-opened names per broker through 8 Nov 2026; 5 actual positive names from 9 Nov."""
+    pol = _policy()
+    if pol is None:
+        return MAX_STOCKS
+    if not pol.date_readable(when):
+        return pol.MAX_NAMES
+    return pol.max_names(when)
+
+
+# Flags the refill routine reads to prove this process really enforces the Monday rule.
+COUNTS_ALL_POSITIVE = True
+PENDING_RESERVES = True
 NEW_SHARE = 0.50          # new stocks may use half of the remaining room
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_sizing_cache.json')
 # (t304u) The 5-stock MTF cap and the MTF budget count ONLY names this bot opened. Holdings the
@@ -205,17 +276,41 @@ def keymap():
 
 
 # ---------------- per-broker state ----------------
+def _held_from_rows(rows):
+    """Positive net MTF names at cost, after sold day legs are reconciled. Legacy lots included."""
+    pol = _policy()
+    held, qty, unpriced = {}, {}, []
+    if pol is None:
+        return held, qty, unpriced
+    for sym, row in pol.reconcile_book(rows).items():
+        qty[sym] = row['qty']
+        if row['cost'] is None:
+            unpriced.append(sym)
+            held[sym] = 0.0
+        else:
+            held[sym] = float(row['cost'])
+    return held, qty, unpriced
+
+
 def upstox_state():
     f = _get('/v2/user/get-funds-and-margin')['data']['equity']
     cap = float(f['available_margin']) + float(f['used_margin'])
-    held = {}
-    for p in _get('/v3/portfolio/mtf-positions').get('data') or []:
-        q = int(p.get('quantity') or 0)
-        if q > 0:
-            s = p['trading_symbol'].replace('-EQ', '')
-            held[s] = held.get(s, 0.0) + q * float(p.get('average_price') or 0)
-    return dict(broker='upstox', capital=cap, free=float(f['available_margin']),
-                used=sum(held.values()), held=held, mine=mine_upstox())
+    raw = _get('/v3/portfolio/mtf-positions').get('data') or []
+    pol = _policy()
+    rows = [pol.row_from_upstox(p) for p in raw] if pol is not None else []
+    if pol is None:
+        held = {}
+        for p in raw:
+            q = int(p.get('quantity') or 0)
+            if q > 0:
+                s = p['trading_symbol'].replace('-EQ', '')
+                held[s] = held.get(s, 0.0) + q * float(p.get('average_price') or 0)
+        qty, unpriced = {}, []
+    else:
+        held, qty, unpriced = _held_from_rows(rows)
+    return dict(broker='upstox', capital=cap, capital_verified=False, capital_basis='margin_capacity',
+                free=float(f['available_margin']),
+                used=sum(held.values()), held=held, qty=qty, unpriced=unpriced, mine=mine_upstox())
 
 
 def kite_state():
@@ -227,27 +322,36 @@ def kite_state():
     cap = float(m['net']) + float(m['utilised']['debits'])
     av = m.get('available') or {}
     free = min(float(m['net']), float(av.get('live_balance') or 0) + float(av.get('collateral') or 0))
-    held = {}
     try:
         net = k.positions().get('net')
     except Exception as e:
         raise BookUnavailable(f'Kite positions unreadable: {type(e).__name__}: {e}')
     if net is None:
         raise BookUnavailable('Kite positions returned no data')
-    for p in net:
-        if p['product'] == 'MTF' and p['quantity'] > 0 and p['exchange'] in ('NSE', 'BSE'):
-            held[p['tradingsymbol']] = held.get(p['tradingsymbol'], 0.0) + p['quantity'] * float(p['average_price'])
     try:
-        for h in k.holdings():
-            q = int((h.get('mtf') or {}).get('quantity') or 0)
-            if q > 0 and h['tradingsymbol'] not in held:
-                held[h['tradingsymbol']] = q * float((h.get('mtf') or {}).get('average_price') or h.get('average_price') or 0)
+        holdings = k.holdings()
     except Exception as e:
         # Fail closed. An incomplete `held` is dangerous: mtf_dual_entry's "never buy a name the
         # broker already holds" guard reads this dict, so a swallowed holdings error would let the
         # mirror buy an MTF holding it already owns.
         raise BookUnavailable(f'Kite holdings unreadable: {type(e).__name__}: {e}')
-    return dict(broker='kite', capital=cap, free=free, used=sum(held.values()), held=held, mine=mine_kite())
+    if holdings is None:
+        raise BookUnavailable('Kite holdings returned no data')
+    pol = _policy()
+    if pol is None:
+        held, qty, unpriced = {}, {}, []
+        for p in net:
+            if p['product'] == 'MTF' and p['quantity'] > 0 and p['exchange'] in ('NSE', 'BSE'):
+                held[p['tradingsymbol']] = held.get(p['tradingsymbol'], 0.0) + p['quantity'] * float(p['average_price'])
+        for h in holdings:
+            q = int((h.get('mtf') or {}).get('quantity') or 0)
+            if q > 0 and h['tradingsymbol'] not in held:
+                held[h['tradingsymbol']] = q * float((h.get('mtf') or {}).get('average_price') or h.get('average_price') or 0)
+    else:
+        held, qty, unpriced = _held_from_rows(pol.rows_from_kite(net, holdings))
+    return dict(broker='kite', capital=cap, capital_verified=False, capital_basis='margin_capacity',
+                free=free, used=sum(held.values()), held=held,
+                qty=qty, unpriced=unpriced, mine=mine_kite())
 
 
 def state(broker):
@@ -260,6 +364,8 @@ def state(broker):
         if hit and hit[0] > time.monotonic():
             st = dict(hit[1])
             st['held'] = dict(st['held'])
+            if st.get('qty') is not None:
+                st['qty'] = dict(st['qty'])
             return st
     st = upstox_state() if broker == 'upstox' else kite_state()
     if QUOTE_TTL > 0:
@@ -279,6 +385,58 @@ def state_mine(broker):
     st['held'] = held
     st['used'] = sum(held.values())
     st['not_mine'] = {s: v for s, v in st['held_all'].items() if s not in m}
+    return st
+
+
+def _pending_raw(broker):
+    """Today's order rows. Raises BookUnavailable — an empty guess would free a slot."""
+    if broker == 'upstox':
+        book = _get('/v2/order/retrieve-all')
+        data = book.get('data') if isinstance(book, dict) else None
+        if data is None:
+            raise BookUnavailable('Upstox order book returned no data')
+        return list(data)
+    import broker_kite as bk
+    if not bk.valid():
+        raise BookUnavailable('Kite token invalid')
+    try:
+        data = bk.client().orders()
+    except Exception as exc:
+        raise BookUnavailable(f'Kite order book unreadable: {type(exc).__name__}: {exc}')
+    if data is None:
+        raise BookUnavailable('Kite order book returned no data')
+    return list(data)
+
+
+def cap_state(broker, when=None):
+    """The book the caps count. Before 9 Nov that is still bot-tagged names only.
+    From that morning it is every positive net MTF name, plus pending buy reservations
+    and the initial/add ledger. An unreadable book or ledger raises or is marked closed."""
+    pol = _policy()
+    if pol is None or (pol.date_readable(when) and not pol.policy_active(when)):
+        return state_mine(broker)
+    if pol is None or not pol.date_readable(when):
+        raise BookUnavailable('decision date unreadable — Monday policy fails closed')
+    st = dict(state(broker))
+    st['held_all'] = dict(st['held'])
+    st['not_mine'] = {}
+    st['broker'] = broker
+    raw = _pending_raw(broker)
+    led, err = pol.load_ledger(pol.ledger_path(os.path.dirname(os.path.abspath(__file__))))
+    today = pol.ist_day(when).isoformat()
+    if led is not None:
+        normed = [pol.normalize_order(o) for o in raw]
+        open_ids = [o['order_id'] for o in normed if o['status'] in pol.OPEN_STATUSES and o['order_id']]
+        done_ids = [o['order_id'] for o in normed
+                    if o['status'] in ('complete', 'cancelled', 'rejected') and o['order_id']]
+        pol.reconcile_ledger(led, broker, open_ids, done_ids, today)
+    pending = pol.pending_buys(raw, st.get('qty') or st['held'])
+    st['pending'] = pending
+    st['ledger'] = led
+    st['ledger_error'] = err
+    new_names = {p['symbol'] for p in pending if p['mode'] == 'new' and p['symbol'] not in (st.get('qty') or {})}
+    st['name_count'] = len(st.get('qty') or {}) + len(new_names)
+    st['pending_new'] = sorted(new_names)
     return st
 
 
@@ -330,11 +488,47 @@ def margin_quote(broker, symbol, qty, price):
 
 
 # ---------------- the gate ----------------
+def _limits_monday(st, symbol, mode, ratio, when):
+    """Shared 25% MTF pool for a new name and an add, and the stricter 10% per name."""
+    pol = _policy()
+    positions = {}
+    qty = st.get('qty') or {}
+    for sym, cost in (st.get('held') or {}).items():
+        positions[sym] = {'qty': int(qty.get(sym) or (1 if cost else 0)), 'cost': float(cost)}
+    held_sum = sum(float(p['cost']) for p in positions.values())
+    extra = float(st.get('used') or 0) - held_sum
+    if extra > 1e-6:
+        positions['_carried'] = {'qty': 1, 'cost': extra}
+    view = pol.rooms(
+        st.get('capital') or 0, positions, st.get('pending') or [], st.get('ledger'),
+        ratio, when, broker=st.get('broker') or 'upstox',
+        ledger_error=st.get('ledger_error'), unpriced=list(st.get('unpriced') or []))
+    cap = float(st.get('capital') or 0)
+    per = per_stock_cap(when) * cap
+    already = float((st.get('held') or {}).get(symbol, 0) or 0) * float(ratio or 0)
+    by_stock = max(per - already, 0.0)
+    is_add = mode == 'add' or symbol in (st.get('held') or {})
+    pool = view.get('room_add') if is_add else view.get('room_new')
+    return dict(per_stock=round(per), already=round(already), by_stock=round(by_stock),
+                room=round(pool or 0), room_total=round(view.get('room_total') or 0),
+                room_initial=round(view.get('room_new') or 0), room_add=round(view.get('room_add') or 0),
+                ratio=round(float(ratio or 0), 4),
+                reserve_after=round((view.get('room_add') or 0) if not is_add else 0),
+                policy=view.get('policy'), over_initial=view.get('over_initial'),
+                over_add=view.get('over_add'), over_total=view.get('over_total'),
+                closed=view.get('closed'), name_count=st.get('name_count', view.get('name_count')),
+                reason=view.get('reason'))
+
+
 def limits(st, symbol, mode='new', ratio=1.0, when=None):
     """Margin limits for one order (4 Nov 2026: caps are on MTF margin, not on notional).
     ratio = margin / notional for this symbol, so existing holdings stored at cost can be
     converted to the margin they consume. `when` is the decision date for the two-day
-    override (None = now); it only selects which cap applies, never widens one."""
+    override (None = now); it only selects which cap applies, never widens one.
+    From 9 Nov 2026 a new name and an add draw the same shared 25% pool. Another bucket's
+    unused room is not added to it."""
+    if _monday(when) or (_policy() is not None and not _policy().date_readable(when)):
+        return _limits_monday(st, symbol, mode, ratio, when)
     cap = st['capital']
     per = per_stock_cap(when) * cap        # 10%, or 12% on 5-6 Nov 2026 (t339u)
     already = st['held'].get(symbol, 0.0) * ratio          # cost -> margin it blocks
@@ -347,8 +541,28 @@ def limits(st, symbol, mode='new', ratio=1.0, when=None):
                 reserve_after=round(room_total - min(room_total, room)))
 
 
-def size(broker, symbol, price, mode='new', step=None, when=None):
-    st = state_mine(broker)
+def _no_size(broker, symbol, mode, reason, st=None, **extra):
+    return dict(broker=broker, symbol=symbol, mode=mode, qty=0, verdict='NO SIZE', reason=reason,
+                state=st, **extra)
+
+
+def size(broker, symbol, price, mode='new', step=None, when=None, trend_ok=None, in_loss=False):
+    active = _monday(when) or (_policy() is not None and not _policy().date_readable(when))
+    try:
+        st = cap_state(broker, when) if active else state_mine(broker)
+    except BookUnavailable as exc:
+        return _no_size(broker, symbol, mode, str(exc))
+    if active and st.get('capital_verified') is False:
+        return _no_size(broker, symbol, mode, 'capital denominator is margin capacity, not verified capital', st)
+    if active and trend_ok is not True:
+        return _no_size(broker, symbol, mode, 'trend not confirmed — Monday policy fails closed', st)
+    if active and in_loss and (mode == 'add' or symbol in (st.get('held') or {})):
+        return _no_size(broker, symbol, mode, 'not averaging a loser', st)
+    if active and mode != 'add' and symbol not in (st.get('held') or {}) and int(st.get('name_count') or 0) >= max_names(when):
+        return _no_size(broker, symbol, mode, '%s actual positive MTF names already (pending buys included)' % max_names(when), st)
+    if active and (st.get('unpriced') or st.get('ledger_error')):
+        return _no_size(broker, symbol, mode,
+                        'book is not priceable (%s)' % (st.get('ledger_error') or ','.join(st.get('unpriced') or [])), st)
     probe = margin_quote(broker, symbol, 1, price)     # margin for ONE share at the proposed price
     if not probe['ok']:
         return dict(broker=broker, symbol=symbol, mode=mode, qty=0, verdict='NO SIZE',
@@ -371,17 +585,30 @@ def size(broker, symbol, price, mode='new', step=None, when=None):
                     reason='free margin does not cover one lot', state=st, limits=lim, quote=quote)
     out = dict(broker=broker, symbol=symbol, price=price, mode=mode, qty=q,
                amount=round(q * price), margin=round(quote['margin']),
-               margin_pct_of_capital=round(100 * quote['margin'] / st['capital'], 1),
+               margin_pct_of_capital=round(100 * quote['margin'] / st['capital'], 1) if st.get('capital') else None,
                leverage=quote.get('leverage'), verdict='OK' if q else 'NO SIZE',
+               position_qty=int((st.get('qty') or {}).get(symbol) or 0),
                state=dict(capital=round(st['capital']), free=round(st['free']), used=round(st['used'])),
                limits=lim)
+    if active and lim.get('closed'):
+        out['qty'] = 0
+        out['verdict'] = 'NO SIZE'
+        out['reason'] = lim.get('reason') or 'Monday policy fail closed'
     if q == 0:
         out['reason'] = f'no room under the {per_stock_cap(when) * 100:g}% stock cap / MTF room'
     return out
 
 
-def check(broker, symbol, qty, price, mode='new', when=None):
-    st = state_mine(broker)
+def check(broker, symbol, qty, price, mode='new', when=None, trend_ok=None, in_loss=False):
+    active = _monday(when) or (_policy() is not None and not _policy().date_readable(when))
+    try:
+        st = cap_state(broker, when) if active else state_mine(broker)
+    except BookUnavailable as exc:
+        return dict(broker=broker, symbol=symbol, qty=qty, price=price, mode=mode, allowed=False,
+                    blocks=[str(exc)], warns=[], max_qty=0)
+    if active and st.get('capital_verified') is False:
+        return dict(broker=broker, symbol=symbol, qty=qty, price=price, mode=mode, allowed=False,
+                    blocks=['capital denominator is margin capacity, not verified capital'], warns=[], max_qty=0)
     probe = margin_quote(broker, symbol, 1, price)
     ratio = (probe['margin'] / price) if probe.get('ok') and price else 1.0
     lim = limits(st, symbol, mode, ratio, when)
@@ -395,7 +622,20 @@ def check(broker, symbol, qty, price, mode='new', when=None):
     if st['used'] * ratio + m_new > _tot * st['capital']:
         blocks.append(f"R10b: total MTF margin {st['used'] * ratio + m_new:,.0f} > {_tot * 100:g}% cap {_tot * st['capital']:,.0f}")
     if mode == 'new' and symbol not in st['held'] and m_new > lim['room']:
-        blocks.append(f"R10c: new entry margin {m_new:,.0f} > half of remaining room {lim['room']:,.0f} (reserve {lim['reserve_after']:,.0f} kept for pullback adds)")
+        if active:
+            blocks.append(f"R10c: new entry margin {m_new:,.0f} > shared 25% room {lim['room']:,.0f} "
+                          f"(other buckets and unused cash are not added)")
+        else:
+            blocks.append(f"R10c: new entry margin {m_new:,.0f} > half of remaining room {lim['room']:,.0f} (reserve {lim['reserve_after']:,.0f} kept for pullback adds)")
+    if active:
+        pol = _policy()
+        view = dict(active=True, closed=bool(lim.get('closed')), reason=lim.get('reason'),
+                    held=list((st.get('qty') or st.get('held') or {}).keys()),
+                    name_count=st.get('name_count', lim.get('name_count')),
+                    room_new=lim.get('room_initial'), room_add=lim.get('room_add'),
+                    capital=st.get('capital'), over_total=bool(lim.get('over_total')))
+        blocks.extend(pol.order_blocks(view, symbol, 'add' if (mode == 'add' or symbol in st.get('held', {})) else 'new',
+                                       m_new, trend_ok is True, bool(in_loss), lim.get('already')))
     if not q['ok']:
         blocks.append('R10d: margin quote failed - ' + q['why'])
     elif q['margin'] > st['free']:
@@ -405,7 +645,7 @@ def check(broker, symbol, qty, price, mode='new', when=None):
     return dict(broker=broker, symbol=symbol, qty=qty, price=price, mode=mode, notional=round(notional),
                 margin=round(m_new),
                 allowed=not blocks, blocks=blocks, warns=warns, quote=q,
-                max_qty=size(broker, symbol, price, mode, when=when)['qty'],
+                max_qty=size(broker, symbol, price, mode, when=when, trend_ok=trend_ok, in_loss=in_loss)['qty'],
                 state=dict(capital=round(st['capital']), free=round(st['free']), used=round(st['used'])),
                 limits=lim)
 
@@ -415,12 +655,31 @@ def check(broker, symbol, qty, price, mode='new', when=None):
 MAX_STOCKS = 5
 
 
-def slots(broker):
+def slots(broker, when=None):
     """How many new MTF stocks this broker may still open, and whether any
-    today's pending buy will consume one. READ ONLY."""
+    today's pending buy will consume one. READ ONLY.
+    From 9 Nov the count is every positive net name, and a pending buy of a new name
+    takes a slot. An unreadable book reports zero free slots."""
+    cap = max_names(when)
+    if _monday(when) or (_policy() is not None and not _policy().date_readable(when)):
+        try:
+            st = cap_state(broker, when)
+        except BookUnavailable as exc:
+            return dict(broker=broker, held=[], count=0, cap=cap, free_slots=0, pending_buys=[],
+                        not_mine=0, capital=0, used=0, error=str(exc))
+        if st.get('ledger_error') or st.get('unpriced'):
+            return dict(broker=broker, held=sorted(st.get('qty') or st['held']), count=st.get('name_count'),
+                        cap=cap, free_slots=0, pending_buys=st.get('pending_new') or [],
+                        not_mine=0, capital=round(st.get('capital') or 0), used=round(st.get('used') or 0),
+                        error=st.get('ledger_error') or 'unpriced holding')
+        held = sorted(st.get('qty') or [s for s, v in st['held'].items() if v > 0])
+        free = max(cap - int(st.get('name_count') or len(held)), 0)
+        return dict(broker=broker, held=held, count=len(held), cap=cap, free_slots=free,
+                    pending_buys=st.get('pending_new') or [], not_mine=0,
+                    capital=round(st.get('capital') or 0), used=round(st.get('used') or 0))
     st = state_mine(broker)
     held = [s for s, v in st['held'].items() if v > 0]   # only names I opened count toward the stock cap
-    free = max(MAX_STOCKS - len(held), 0)
+    free = max(cap - len(held), 0)
     pending = []
     try:
         if broker == 'upstox':
@@ -438,7 +697,7 @@ def slots(broker):
     # a pending buy of a name I already hold is an add, not a new slot (and drop duplicate legs)
     pending = sorted({str(x).replace('-EQ', '') for x in pending if x} - set(held))
     free -= len(pending)
-    return dict(broker=broker, held=held, count=len(held), cap=MAX_STOCKS, free_slots=max(free, 0),
+    return dict(broker=broker, held=held, count=len(held), cap=cap, free_slots=max(free, 0),
                 pending_buys=pending, not_mine=len(st.get('not_mine') or {}),
                 capital=round(st['capital']), used=round(st['used']))
 
@@ -455,25 +714,38 @@ if __name__ == '__main__':
         for b in ([brk] if brk else ['upstox', 'kite']):
             try:
                 r = slots(b)
-                print(f"{b}: {r['count']}/{r['cap']} MTF stocks of MINE (cap counts only my names), "
+                who = 'actual positive names' if _monday() else 'names this bot opened'
+                print(f"{b}: {r['count']}/{r['cap']} MTF stocks ({who}), "
                       f"{r['free_slots']} free slot(s)"
                       f"{' - pending buys ' + ','.join(map(str, r['pending_buys'])) if r['pending_buys'] else ''}"
-                      f" | not mine (excluded from cap/budget): {r['not_mine']}"
-                      f" | capital {r['capital']:,.0f} | MTF used (mine) {r['used']:,.0f}")
+                      f" | not mine (excluded from cap/budget before 9 Nov): {r['not_mine']}"
+                      f" | capital {r['capital']:,.0f} | MTF used {r['used']:,.0f}"
+                      + (f" | ERROR {r['error']}" if r.get('error') else ''))
                 if r['held']:
-                    print(f"    mine: {', '.join(r['held'])}")
+                    print(f"    held: {', '.join(r['held'])}")
             except Exception as e:
                 print(b, 'ERR', type(e).__name__, str(e)[:120])
     elif a and a[0] == 'state':
         for b in ([brk] if brk else ['upstox', 'kite']):
             try:
-                st = state_mine(b)
-                allm = st['held_all']; nm = st['not_mine']
+                st = cap_state(b) if _monday() else state_mine(b)
+                allm = st.get('held_all') or st['held']; nm = st.get('not_mine') or {}
+                tot = total_cap()
                 print(f"{b}: capital {st['capital']:,.0f} | free margin {st['free']:,.0f} (ALL holdings)")
-                print(f"    MINE    : {len(st['held'])}/{MAX_STOCKS} stock(s) (cap {MAX_STOCKS}), cost {st['used']:,.0f}"
-                      f" -> 50% budget {0.5*st['capital']:,.0f}, room {0.5*st['capital']-st['used']:,.0f}")
-                print(f"    not mine: {len(nm)} stock(s), cost {sum(nm.values()):,.0f}  "
-                      f"(excluded from the cap and the MTF budget, still blocks margin)")
+                if _monday() and st.get('capital_verified') is False:
+                    print(f"    COUNTED : {len(st.get('qty') or st['held'])}/{max_names()} stock(s), cost {st['used']:,.0f}")
+                    print(f"    Monday pool: shared {initial_fraction()*100:g}% for initial and adds | "
+                          f"per stock {per_stock_cap()*100:g}%. Rupee room is not computed: "
+                          f"this capital figure is margin capacity, not verified capital.")
+                else:
+                    print(f"    COUNTED : {len(st.get('qty') or st['held'])}/{max_names()} stock(s), cost {st['used']:,.0f}"
+                          f" -> {tot*100:g}% budget {tot*st['capital']:,.0f}, room {tot*st['capital']-st['used']:,.0f}")
+                    if _monday():
+                        print(f"    Monday pool: shared {initial_fraction()*100:g}% for initial and adds | "
+                              f"per stock {per_stock_cap()*100:g}%")
+                    else:
+                        print(f"    not mine: {len(nm)} stock(s), cost {sum(nm.values()):,.0f}  "
+                              f"(excluded from the cap and the MTF budget until 9 Nov, still blocks margin)")
                 print(f"    all MTF : {len(allm)} stock(s), cost {sum(allm.values()):,.0f}")
                 for s2, v in sorted(allm.items()):
                     print(f"      {'MINE ' if s2 in st['held'] else 'user '} {s2:<12} cost {v:,.0f}")

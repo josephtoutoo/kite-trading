@@ -47,9 +47,10 @@ _OVERRIDES = {
     "INDEX_OPT_LOSS": 6000,         # was: stop this index's options at Rs 2,000 booked loss
     # both windows: an opposite side or a re-entry may follow twice as fast
     "WINDOW_MIN": 15,               # was 30
-    # stock options: the one book with a positive measured record, so it gets the room
-    "STOCK_OPT_MAX_UND": 4,         # was 3 underlyings
-    "STOCK_OPT_MAX_LOTS": 2,        # was 1 lot per underlying (R11)
+    # stock options: lots may be 2 on these two dates. Distinct underlyings stay 3
+    # (t460u withdrew the temporary 4). trade_lock also clamps the cap at 3.
+    "STOCK_OPT_MAX_UND": 3,
+    "STOCK_OPT_MAX_LOTS": 2,        # was 1 lot per underlying (R11); never above 2
     # MTF: a little more per name, the same total
     "MTF_PER_STOCK": 0.12,          # was 0.10 of that broker's capital
     "MTF_TOTAL": 0.50,              # NOT raised - stated here so the record shows it was considered
@@ -57,8 +58,8 @@ _OVERRIDES = {
 
 _WHY = ("5-6 Nov only, off the measured book P&L: index decisions 3->6 but 20 min apart and none "
         "after 13:00 on an expiry day, index booked-loss cutoff Rs 2k->6k, opposite-side and "
-        "re-entry windows 30->15 min, stock options (the only positive book, +7.89%) 3x1 -> 4x2 "
-        "underlyings/lots, MTF per stock 10%->12% with the 50% total unchanged")
+        "re-entry windows 30->15 min, stock options stay 3 underlyings and lots 1->2 "
+        "(the 4-underlying grant is withdrawn), MTF per stock 10%->12% with the 50% total unchanged")
 
 
 def _ist_date(when=None):

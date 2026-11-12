@@ -13,7 +13,8 @@ All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product
 tag auto_entry; cancel if unfilled after 2 min.
 Kite (4 Nov): same signal also buys the same 3 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
 the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffected. On fill: trade_lock.record_entry, risk_state.json
-(entry, target +20%, stop -30%), seen_entries.json. One open position per index max.
+(entry, target +20%, stop -30%), seen_entries.json. One open position per index PER BROKER (t600u, 12 Nov 2026):
+a broker already holding that index is skipped, the other still takes a fresh trigger.
 After a fill the SL is placed and immediately re-verified (sl_confirm.py: re-reads the order book, retries once on a
 tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for the 10-min option monitor to alert on).
 --dry-run: no orders, no state writes, ignores time window.
@@ -30,7 +31,34 @@ import api                     # pooled, timed, proxy-aware client (5 Nov 2026)
 import market_calendar
 import broker_kite as bk
 import sl_confirm as sc
+import index_entry_logic as iel
+import index_futures as ifut
+import index_contract_policy as icp
+import index_capital_check as icc
+import index_size_policy as isp
+import daily_loss_cap as dlc    # 12 Nov 2026: no NEW entry after 2 losing closed trades or Rs10k realised today (both brokers); exits untouched
+import entry_filters as ef      # 12 Nov 2026: India VIX filter, SHADOW ONLY: logs would-skip, never blocks
 DRY="--dry-run" in sys.argv
+# Delayed confirmation of a fresh 5m cross (MACD/ADX may arrive on a later closed candle,
+# and a cooldown must not erase the cross). Off unless the process is started with
+# INDEX_REVERSAL_CONFIRM=1 or --reversal-confirm. A single-session replay is not enough
+# to turn it on. Same-bar entries are unchanged while this is off.
+REVERSAL_CONFIRM=os.environ.get("INDEX_REVERSAL_CONFIRM","")=="1" or "--reversal-confirm" in sys.argv
+# Separate from the reversal flag. Default remains the cash index. Futures is used only
+# when this process is started with INDEX_ENTRY_SOURCE=futures or --futures-signal.
+# A bad value is refused; spot is not assumed. See index_futures.py.
+if "--futures-signal" in sys.argv: os.environ["INDEX_ENTRY_SOURCE"]="futures"
+ENTRY_SOURCE=ifut.entry_source()
+FUTURES_SIGNAL=ENTRY_SOURCE=="futures"
+# Off. When on, the default route is completed 1h. NIFTY/SENSEX 1h buys the
+# listed next-week expiry; 15m is only used if INDEX_ENTRY_TIMEFRAME=15m and
+# then buys the current listed week. BANKNIFTY stays 1h and the futures monthly.
+# 5m is not a fallback. Delayed confirmation is a separate flag and stays off.
+CONTRACT_POLICY=icp.contract_policy_on()
+ENTRY_TF=os.environ.get("INDEX_ENTRY_TIMEFRAME","1h")
+EXECUTE=os.environ.get("INDEX_EXECUTE","").strip()=="1" or "--execute" in sys.argv
+TRIGGERS=os.path.join(D,"index_entry_triggers.json")
+DECISIONS=os.path.join(D,"index_entry_decisions.jsonl")
 # t336u (4 Nov 2026): sizes come from capital + market conditions via equity/book_sizing.py.
 # --fixed-size forces the old 3-lot / 5-on-expiry behaviour; any sizing failure falls back to it too.
 FIXED="--fixed-size" in sys.argv
@@ -45,11 +73,13 @@ LOTS=3; EXPIRY_LOTS=5; ADX_MIN=18; STRONG_LOTS=LOTS  # t327u/t328u (4 Nov): 3 lo
 # The STRONG-trend doubling (t295u) is switched off by setting STRONG_LOTS=LOTS: doubling 3 would be 6 lots,
 # which nobody asked for. Restore it by setting STRONG_LOTS=2*LOTS. trade_lock caps still apply either way.
 # t328u: when the contract being bought expires TODAY (expiry-day trade), size is EXPIRY_LOTS instead.
-IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO"},
-     "BANKNIFTY":{"key":"NSE_INDEX|Nifty Bank","exch":"NSE","seg":"NSE_FO"},
-     "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO"}}
+IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO","kite_exchange":"NFO"},
+     "BANKNIFTY":{"key":"NSE_INDEX|Nifty Bank","exch":"NSE","seg":"NSE_FO","kite_exchange":"NFO"},
+     "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO","kite_exchange":"BFO"}}
 SF=os.path.join(D,"risk_state.json"); SEEN=os.path.join(D,"seen_entries.json")
-out={"now":now.strftime("%Y-%m-%d %H:%M IST"),"dry_run":DRY,"rules":f"fresh 5m cross EMA20+Supertrend, MACD hist in direction, ADX>={ADX_MIN} (anti-chop)","indices":{}}
+out={"now":now.strftime("%Y-%m-%d %H:%M IST"),"dry_run":DRY,"reversal_confirm":REVERSAL_CONFIRM,
+     "entry_source":ENTRY_SOURCE,"contract_policy":CONTRACT_POLICY,"execute":EXECUTE,"sender":bool(EXECUTE),
+     "entry_timeframe":ENTRY_TF if CONTRACT_POLICY else "5m","rules":f"fresh 5m cross EMA20+Supertrend, MACD hist in direction, ADX>={ADX_MIN} (anti-chop)","indices":{}}
 # t339u: say which rule set this run is under. On 5-6 Nov 2026 the limit checks in trade_lock
 # move to the two-day values (equity/autonomy.py) and this block names them; from 7 Nov it is the
 # user's own rules again and the block says so. Nothing else in this script changes.
@@ -68,6 +98,8 @@ _R=out["rule_set"]
 out["rules"]+=(" | "+("OVERRIDE ACTIVE ("+_R["rule_set"]+", "+out["now"][:10]+")" if _R["rule_set"]!="user rules"
                        else "rule set: user's own"))
 def done(): print(json.dumps(out,indent=1,default=str)); sys.exit(0)
+if ENTRY_SOURCE=="invalid":
+    out["skipped"]="INDEX_ENTRY_SOURCE must be spot or futures; spot was not assumed"; done()
 if not DRY and not market_calendar.is_trading_day(now.date()):
     out["skipped"]="exchange holiday / market closed ("+now.date().isoformat()+")"; done()
 if not DRY and (now.weekday()>=5 or not (datetime.time(9,20)<=now.time()<=datetime.time(14,45))):
@@ -96,19 +128,29 @@ def _download(dest,url):
     open(tmp,"wb").write(data)
     os.replace(tmp,dest)
 def signal(a):
-    up=lambda c,e,d: c>e and d==1; dn=lambda c,e,d: c<e and d==-1
-    cur_up=up(a["close"],a["ema20"],a["dir"]); prv_up=up(a["prev_close"],a["prev_ema"],a["prev_dir"])
-    cur_dn=dn(a["close"],a["ema20"],a["dir"]); prv_dn=dn(a["prev_close"],a["prev_ema"],a["prev_dir"])
-    side=None; why=[]
-    if cur_up: side="CE"; why.append("fresh up-cross" if not prv_up else "up-trend but NOT fresh (prev candle already aligned)")
-    elif cur_dn: side="PE"; why.append("fresh down-cross" if not prv_dn else "down-trend but NOT fresh (prev candle already aligned)")
-    else: why.append("no alignment (close vs EMA20 / Supertrend disagree)")
-    fresh=(side=="CE" and not prv_up) or (side=="PE" and not prv_dn)
-    macd_ok=side and ((side=="CE" and a["hist"]>0) or (side=="PE" and a["hist"]<0))
-    adx_ok=a["adx"]>=ADX_MIN
-    if side and not macd_ok: why.append(f"MACD hist {a['hist']} against direction")
-    if not adx_ok: why.append(f"ADX {a['adx']} < {ADX_MIN} (chop)")
-    return (side if side and fresh and macd_ok and adx_ok else None), side, why
+    """Same-bar fresh cross + MACD + ADX. The delayed-confirmation path is index_entry_logic
+    and is not consulted unless REVERSAL_CONFIRM is on."""
+    return iel.baseline_signal(a, adx_min=ADX_MIN)
+def _log_decision(record):
+    if DRY: return
+    try: iel.append_jsonl(DECISIONS, record)
+    except Exception as e:
+        print(f"auto_entry: decision log failed: {type(e).__name__}: {e}", file=sys.stderr)
+def _save_trigger(name, trigger):
+    if DRY or not REVERSAL_CONFIRM or not trigger: return
+    if trigger.get("state") in ("consumed","submitting"): return
+    try: iel.save_trigger(TRIGGERS, name, trigger)
+    except Exception as e:
+        print(f"auto_entry: trigger state not saved for {name}: {type(e).__name__}: {e}", file=sys.stderr)
+def _remember_block(name, rev, r):
+    """A pre-trade block must not consume the cross. The next run can still take it."""
+    if not rev or not rev.get("trigger"): return
+    tr=dict(rev["trigger"]); tr["last_blockers"]=iel.collect_blockers(r)
+    _save_trigger(name, tr)
+    rec=iel.public_record(rev, datetime.datetime.now(IST).isoformat(), DRY)
+    rec["phase"]="pretrade"; rec["blockers"]=tr["last_blockers"]; rec["action"]="blocked"; rec["eligible"]=False
+    r["entry_block"]=rec
+    _log_decision(rec)
 def size_lots(expire_today, strong_aligned, sig, raw=None, sside=None):
     """Index-option size in lots, and the note to show. Pure, so it can be tested off-market.
 
@@ -202,17 +244,23 @@ def daily_dir(key):
         return None
 
 
-def pick(name,cfg,side,spot):
+def pick(name,cfg,side,spot,expiry=None):
     ins=[x for x in master(cfg["exch"]) if x.get("segment")==cfg["seg"] and x.get("instrument_type")==side and x.get("underlying_symbol",x.get("name",""))==name]
     today_ms=int(datetime.datetime.combine(now.date(),datetime.time(0),IST).timestamp()*1000)
-    exps=sorted({x["expiry"] for x in ins if x["expiry"]>=today_ms})
-    exp=exps[0]; chain=[x for x in ins if x["expiry"]==exp]
+    if expiry is not None:
+        chain=[x for x in ins if datetime.datetime.fromtimestamp(x["expiry"]/1000,IST).date()==expiry]
+        if not chain: return None
+        exp=expiry
+    else:
+        exps=sorted({x["expiry"] for x in ins if x["expiry"]>=today_ms})
+        exp=exps[0]; chain=[x for x in ins if x["expiry"]==exp]
+        exp=datetime.datetime.fromtimestamp(exp/1000,IST).date()
     strikes=sorted({x["strike_price"] for x in chain})
     step=min(b-a for a,b in zip(strikes,strikes[1:]) if b>a) if len(strikes)>1 else 50
     std=50 if name=="NIFTY" else 100; step=max(step,std) if step<std else step
     atm=round(spot/std)*std
     best=min(chain,key=lambda x:(abs(x["strike_price"]-atm),x["strike_price"]))
-    return best,datetime.datetime.fromtimestamp(exp/1000,IST).date(),std
+    return best,exp,std
 def quote(k):
     d=req("https://api.upstox.com/v2/market-quote/quotes?instrument_key="+urllib.parse.quote(k,safe="")).get("data") or {}
     for v in d.values():
@@ -223,14 +271,169 @@ def quote(k):
             print(f"auto_entry: no sell depth for {k}, pricing off LTP*1.005: {type(e).__name__}: {e}",file=sys.stderr)
         return float(v.get("last_price") or 0),ask
     return 0,None
-pos=req("https://api.upstox.com/v2/portfolio/short-term-positions").get("data") or []
+_pos_reply=req("https://api.upstox.com/v2/portfolio/short-term-positions")
+pos=_pos_reply.get("data") or []
+def _kite_rows():
+    try: return bk.positions(strict=True)
+    except Exception: return None
+_KPOS=_kite_rows()   # strict Kite read, once per run; None = unreadable/invalid token
+def _open_opt_idx(rows):
+    """Underlyings with a long option open in one broker's book; None when that book was unreadable."""
+    if rows is None: return None
+    return [trade_lock.underlying(trade_lock.sym_of(p)) for p in rows
+            if int(p.get("quantity") or 0)>0 and trade_lock.is_opt(trade_lock.sym_of(p))]
+# 12 Nov 2026 (t600u): the open-position guard is PER BROKER. A fresh trigger is taken by whichever
+# broker has no open option on that index; a broker already holding it is skipped (adds are
+# full_auto_add.py's job). Before this, an Upstox position blocked the Kite leg too.
+U_OPEN=_open_opt_idx(pos if _pos_reply.get("status")=="success" else None)
+K_OPEN=_open_opt_idx(_KPOS)
+LOSS_CAP=dlc.evaluate(pos if _pos_reply.get("status")=="success" else None,_KPOS,now,
+                      state_path=dlc.default_state_path(),persist=not DRY)
+out["daily_loss_cap"]=LOSS_CAP
+_EF=ef.config()
+if _EF["mode"]!="off": _EF["mode"]="shadow"   # user rule 12 Nov 2026: shadow only, enforce is not honoured here
+_VIX=ef.vix_inputs(ind.candles,now) if (_EF["mode"]!="off" and _EF["vix_pct"] is not None) else (None,[])
 for name,cfg in IDX.items():
     r=out["indices"][name]={}
     try:
-        a=ind.analyze(cfg["key"],"minutes",5,5)
-        r["candle"]=a["last_ts"][11:16]; r["5m"]={k:a[k] for k in("close","ema20","st","dir","prev_close","prev_ema","prev_dir","hist","adx")}
-        sig,raw,why=signal(a); r["signal"]=sig or "NONE"; r["trend_side"]=raw; r["why"]=why
-        best,exp,std=pick(name,cfg,raw or "CE",a["close"])
+        claimed_id=None
+        signal_key=cfg["key"]
+        forced_expiry=None
+        tf_meta=None
+        _elig={"upstox":{"ok":True,"reason":None},"kite":{"ok":True,"reason":None}}
+        if CONTRACT_POLICY:
+            _route=icp.route(name, ENTRY_TF)
+            if not _route["ok"]:
+                r["signal"]="NONE"; r["action"]="no entry: "+_route["reason"]; continue
+            if not FUTURES_SIGNAL:
+                r["signal"]="NONE"; r["action"]="no entry: 1h/15m requires futures candles; spot 5m was not used"; continue
+        if FUTURES_SIGNAL:
+            try:
+                krows,kerr=ifut.fetch_kite_master(cfg["kite_exchange"])
+                res=ifut.resolve(name, master(cfg["exch"]), krows, now.date())
+                if krows is None: res["audit"]["kite_master_error"]=kerr
+            except Exception as e:
+                r["signal"]="NONE"; r["action"]=f"no entry: futures master unreadable ({type(e).__name__}); spot was not used"
+                continue
+            r["futures"]=res["audit"]
+            if not res["ok"]:
+                r["signal"]="NONE"; r["action"]="no entry: "+res["reason"]; continue
+            signal_key=res["instrument_key"]
+            try:
+                gate=ifut.assess_candles(ind.candles(signal_key,"minutes",5,5), datetime.datetime.now(IST))
+            except Exception as e:
+                r["signal"]="NONE"; r["action"]=f"no entry: futures candles unreadable ({type(e).__name__}); spot was not used"
+                continue
+            r["futures_candles"]=gate
+            if not gate["ok"]:
+                r["signal"]="NONE"; r["action"]="no entry: "+gate["reason"]+"; spot was not used"; continue
+        if CONTRACT_POLICY:
+            try:
+                built=icp.resample(ind.candles(signal_key,"minutes",5,5), _route["minutes"], datetime.datetime.now(IST))
+            except Exception as e:
+                r["signal"]="NONE"; r["action"]=f"no entry: futures resample failed ({type(e).__name__}); 5m was not used"; continue
+            if not built["ok"]:
+                r["signal"]="NONE"; r["action"]="no entry: "+built["reason"]+"; 5m was not used"; continue
+            bars,forming=iel.bars_from_candles(built["candles"], datetime.datetime.now(IST), "minutes", _route["minutes"])
+            if len(bars)<2:
+                r["signal"]="NONE"; r["action"]="no entry: resampled series has no closed pair"; continue
+            a=iel.analyze_shape(bars[-1], bars[-2]); a["last_ts"]=bars[-1]["ts"]; a["st"]=bars[-1].get("st"); a["prev_hist"]=bars[-2]["hist"]; a["prev_adx"]=bars[-2]["adx"]
+            sig,raw,why=signal(a)
+            monthlies=set()
+            try:
+                for row in master(cfg["exch"]):
+                    if row.get("instrument_type")=="FUT" and (row.get("underlying_symbol") or row.get("name"))==name:
+                        monthlies.add(datetime.datetime.fromtimestamp(row["expiry"]/1000,IST).date())
+                opt_exp=set(); _wk={}
+                for row in master(cfg["exch"]):
+                    if row.get("instrument_type") in ("CE","PE") and (row.get("underlying_symbol") or row.get("name"))==name and row.get("expiry"):
+                        _d=datetime.datetime.fromtimestamp(row["expiry"]/1000,IST).date()
+                        opt_exp.add(_d); _wk.setdefault(_d,set()).add(row.get("weekly"))
+                # 12 Nov 2026 (t601u): pass the master's own weekly/monthly tag so the monthly contract
+                # can serve as NIFTY/SENSEX next-week expiry. A date with mixed or missing tags stays untagged.
+                _rows=[{"expiry":_d,"weekly":next(iter(_f))} if len(_f)==1 and next(iter(_f)) in (True,False) else _d
+                       for _d,_f in _wk.items()]
+                chosen=icp.select_expiry(name, _route["name"], now.date(), _rows, monthlies, None)
+                r["expiry_choice"]={k:(v.isoformat() if hasattr(v,"isoformat") else v) for k,v in chosen.items()}
+            except Exception as e:
+                r["signal"]="NONE"; r["action"]=f"no entry: expiry master unreadable ({type(e).__name__})"; continue
+            if not chosen["ok"]:
+                r["signal"]="NONE"; r["action"]="no entry: "+chosen["reason"]; continue
+            forced_expiry=chosen["expiry"]
+            tf_meta=icp.metadata(name, _route["name"], chosen["expiry"], chosen["role"], signal_key)
+            r["contract"]=tf_meta
+            held=iel.load_trigger(TRIGGERS, "_decisions") or {}
+            today_dec=[row for row in (held.get(now.date().isoformat()) or [])]
+            _elig={"upstox":icp.dedupe_broker(name, "upstox", U_OPEN, today_dec),
+                   "kite":icp.dedupe_broker(name, "kite", K_OPEN, today_dec)}
+            r["broker_eligibility"]=_elig
+            if not _elig["upstox"]["ok"] and not _elig["kite"]["ok"]:
+                r["signal"]="NONE"; r["action"]="no entry: upstox: "+_elig["upstox"]["reason"]+" | kite: "+_elig["kite"]["reason"]; continue
+        else:
+            a=ind.analyze(signal_key,"minutes",5,5)
+            sig,raw,why=signal(a)
+        r["candle"]=a["last_ts"][11:16]; r["5m"]={k:a[k] for k in("close","ema20","st","dir","prev_close","prev_ema","prev_dir","hist","adx") if k in a}
+        r["signal"]=sig or "NONE"; r["trend_side"]=raw; r["why"]=why
+        if CONTRACT_POLICY:
+            # 12 Nov 2026 post-market review: the contract-policy (1h) path only logged pre-trade
+            # blocks, so quiet days left no audit trail. Log one read-only signal row per index.
+            try:
+                _log_decision({"phase":"signal","index":name,"ts":datetime.datetime.now(IST).isoformat(),
+                               "route":_route.get("name"),"candle":a.get("last_ts"),"signal":sig or "NONE",
+                               "trend_side":raw,"why":why,"broker_eligibility":_elig,"dry_run":DRY})
+            except Exception as e:
+                print(f"auto_entry: decision row not built for {name}: {type(e).__name__}: {e}", file=sys.stderr)
+        openp=[p for p in pos if int(p.get("quantity") or 0)>0 and trade_lock.underlying(trade_lock.sym_of(p))==name and trade_lock.is_opt(trade_lock.sym_of(p))]
+        if openp: r["open_position"]=[trade_lock.sym_of(p) for p in openp]
+        rev=None
+        if not CONTRACT_POLICY:
+            try:
+                wall=datetime.datetime.now(IST)
+                cs=ind.candles(signal_key,"minutes",5,5)
+                bars,forming=iel.bars_from_candles(cs, wall, "minutes", 5)
+                stored=iel.load_trigger(TRIGGERS, name)
+                rev=iel.decide(name, bars, stored, position_open=bool(openp) and (K_OPEN is None or name in K_OPEN), blockers=[], gate=REVERSAL_CONFIRM,
+                               forming_dropped=forming, now=wall)
+                latest=bars[-1]["ts"] if bars else None
+                sig,raw,why,mode=iel.select_signal(sig, raw, why, rev, latest)
+                r["signal"]=sig or "NONE"; r["trend_side"]=raw; r["why"]=why
+                if mode=="reversal": r["reversal_entry"]=True
+                if mode=="duplicate_suppressed": r["reversal_duplicate"]=True
+                rec=iel.public_record(rev, wall.isoformat(), DRY)
+                rec["phase"]="signal"; rec["select_mode"]=mode
+                r["entry_decision"]=rec
+                _log_decision(rec)
+                if mode!="duplicate_suppressed": _save_trigger(name, rev.get("trigger"))
+            except Exception as e:
+                # The same-bar signal still stands. A logging failure must not create an order
+                # and must not hide a baseline order either.
+                print(f"auto_entry: reversal check failed for {name}, baseline signal kept: {type(e).__name__}: {e}", file=sys.stderr)
+                r["reversal_error"]=f"{type(e).__name__}: {e}"
+        strike_px=None if FUTURES_SIGNAL else a["close"]
+        if FUTURES_SIGNAL:
+            try:
+                sa=ind.analyze(cfg["key"],"minutes",5,5)
+                strike_px=sa["close"]
+                r["strike_underlying"]={"source":"spot","key":cfg["key"],"close":sa["close"],"candle":sa["last_ts"],"used_for":"atm strike only"}
+            except Exception as e:
+                r["strike_underlying"]={"source":"spot","key":cfg["key"],"error":f"{type(e).__name__}: {e}"}
+                if sig:
+                    r["signal"]="NONE"; r["action"]=f"no entry: spot unavailable for strike selection ({type(e).__name__}); futures price was not used"
+                    continue
+        else:
+            r["strike_underlying"]={"source":"spot","key":cfg["key"],"close":a["close"],"candle":a["last_ts"],
+                                    "used_for":"atm strike and the entry signal"}
+        r["signal_underlying"]={"source":ENTRY_SOURCE,"key":signal_key}
+        if FUTURES_SIGNAL and strike_px is None:
+            if sig:
+                r["signal"]="NONE"; r["action"]="no entry: spot unavailable for strike selection; futures price was not used"
+            else:
+                r["action"]=r.get("action") or "none: no fresh signal"
+            continue
+        picked=pick(name,cfg,raw or "CE",strike_px,forced_expiry)
+        if not picked:
+            r["signal"]="NONE"; r["action"]="no entry: listed expiry "+str(forced_expiry)+" is not in the option master; nearest expiry was not used"; continue
+        best,exp,std=picked
         strong,sside,sdet=ind.strong(a); r["strong"]={"on":strong,"side":sside,**sdet}
         expire_today = (exp == now.date())
         lots, size_note = size_lots(expire_today, bool(strong and sig and sside == raw), sig, raw, sside)
@@ -238,9 +441,30 @@ for name,cfg in IDX.items():
         if size_note: r["size"] = size_note
         qty=lots*int(best["lot_size"])
         r["option"]={"symbol":best["trading_symbol"],"key":best["instrument_key"],"expiry":str(exp),"strike":best["strike_price"],"lot_size":best["lot_size"],"qty":qty,"strike_step":std}
-        openp=[p for p in pos if int(p.get("quantity") or 0)>0 and trade_lock.underlying(trade_lock.sym_of(p))==name and trade_lock.is_opt(trade_lock.sym_of(p))]
-        if openp: r["open_position"]=[trade_lock.sym_of(p) for p in openp]
-        if not sig: r["action"]="none: no fresh signal"; continue
+        if not sig:
+            r["action"]="duplicate: reversal trigger already submitted" if r.get("reversal_duplicate") else "none: no fresh signal"
+            continue
+        if not LOSS_CAP["ok"]:
+            r["signal"]="NONE"; r["action"]="no entry: "+LOSS_CAP["reason"]; continue
+        if _EF["mode"]=="shadow":
+            _flt=ef.check(now,adx=a.get("adx"),vix_current=_VIX[0],vix_prior=_VIX[1],cfg=_EF)
+            r["entry_filters"]=_flt
+            ef.log_shadow({"ts":now.isoformat(),"source":"auto_entry","index":name,"signal":sig,"candle":a.get("last_ts"),
+                           "would_skip":_flt["would_skip"],"inputs":_flt["inputs"],"dry_run":DRY,"blocked":False})
+        # Fresh buys stay closed unless the user has turned the sender on and the
+        # required route is live. Existing stops are not touched. The add and Friday
+        # hedge senders stay unimplemented.
+        missing=[]
+        if not FUTURES_SIGNAL: missing.append("futures source")
+        if not CONTRACT_POLICY: missing.append("timeframe/expiry metadata")
+        if not EXECUTE: missing.append("sender not enabled")
+        if missing:
+            r["fresh_entry"]="fail_closed"
+            r["sender"]=False
+            r["action"]="no entry: fresh index entry is fail-closed until futures source, timeframe/expiry metadata, and a sender is explicitly enabled ("+", ".join(missing)+"); no order sent"
+            continue
+        r["fresh_entry"]="execute_on"
+        r["sender"]=True
         ltp,ask=quote(best["instrument_key"]); t=float(best.get("tick_size") or 0.05)
         if t>1: t=t/100  # some masters give paise
         px=tick(ask if ask else ltp*1.005,t); r["ltp"]=ltp; r["ask"]=ask; r["limit"]=px
@@ -250,12 +474,41 @@ for name,cfg in IDX.items():
         # A degenerate quote (no LTP and no ask -> px would be 5 paise) must NOT be sized: a 5-paise
         # premium would "afford" MAX_LOTS. Keep the fixed size and say why.
         quoted=bool(ltp or ask) and px>0
-        dd=daily_dir(cfg["key"]) if sig else None
+        dd=daily_dir(signal_key) if sig else None
+        if FUTURES_SIGNAL and sig and dd is None: r["daily_trend"]="futures daily unavailable; spot daily was not used"
         d_aligned=bool(dd is not None and raw is not None and ((dd==1 and raw=="CE") or (dd==-1 and raw=="PE")))
         if quoted:
             lots,size_note=sized_lots(px,lot,a["adx"],d_aligned,expire_today,lots,r.get("size"),name)
         else:
             size_note=(r.get("size") or f"{lots} lots")+" | fixed size (no usable quote: ltp "+str(ltp)+", ask "+str(ask)+")"
+        if CONTRACT_POLICY:
+            # Capital and the order share one size. Supertrend-versus-EMA (2 lots when
+            # the completed bar qualifies) and the unused one-shot combine with max().
+            # This loop is NIFTY/BANKNIFTY/SENSEX only. Adds are not sent.
+            # 12 Nov 2026: 3 lots on this index's own expiry day (from the option master's dates).
+            exp_day=isp.is_expiry_day(name, now.date(), opt_exp)
+            r["index_expiry_day"]=exp_day
+            lots=isp.first_entry_lots(sig, a.get("st"), a.get("ema20"), underlying=name, expiry_day=exp_day)
+            r["first_lots_override"]=bool(isp.pending_first_lots())
+            signal_lots=isp.st_vs_ema_lots(sig, a.get("st"), a.get("ema20"))
+            shot=isp.pending_first_lots() or 1
+            size_note=("contract policy: first entry is %s lot%s per broker; Supertrend-versus-EMA is %s, the one-shot is %s and the expiry-day size is %s, combined with max(); an add is not sent" % (
+                lots, "" if lots==1 else "s", signal_lots, shot, isp.EXPIRY_DAY_LOTS if exp_day else 1))
+            u_cap=icc.check_index_option_buy({}, [], [], px*lots, now)
+            k_cap=icc.check_index_option_buy({"broker":"kite"}, [], [], px*lots, now)
+            gate=isp.dual_first_entry((tf_meta or {}).get("_expiry_role") or "next_week", 0, 0, u_cap, k_cap, side=sig, st=a.get("st"), ema=a.get("ema20"), underlying=name, expiry_day=exp_day)
+            r["dual_entry"]=gate
+            if gate.get("ok") and int(gate.get("lots_per_broker") or 0)!=int(lots):
+                r["signal"]="NONE"; r["action"]="no entry: capital check size does not match the first-entry size"; continue
+            if not gate["ok"]:
+                reason=str(gate.get("reason") or "")
+                unverified=("verified" in reason.lower() or "margin capacity" in reason.lower()
+                            or "unverified" in reason.lower() or "not on this branch" in reason.lower()
+                            or "rupee basis" in reason.lower() or "denominator" in reason.lower())
+                if EXECUTE and unverified:
+                    r["capital_note"]="capital denominator is unverified; INDEX_EXECUTE is on, so the %s-lot entry proceeds under trade_lock caps; verified capital was not invented" % lots
+                else:
+                    r["signal"]="NONE"; r["action"]="no entry: "+reason; continue
         r["size"]=size_note; r["size_lots"]=lots
         r["size_inputs"]={"premium":px,"lot_size":lot,"adx":a["adx"],"daily_aligned":d_aligned,
                           "expire_today":expire_today,"weight":book_weight("index_options"),
@@ -272,12 +525,13 @@ for name,cfg in IDX.items():
             else:
                 m=bk.from_upstox(best["instrument_key"])
                 kopen=[p for p in bk.positions() if p["quantity"]>0 and trade_lock.underlying(p["trading_symbol"])==name and trade_lock.is_opt(p["trading_symbol"])]
-                if not m: r["kite"]={"action":"skipped: no Kite symbol for "+best["instrument_key"]}
+                if not _elig["kite"]["ok"]: r["kite"]={"action":"skip: "+_elig["kite"]["reason"]}
+                elif not m: r["kite"]={"action":"skipped: no Kite symbol for "+best["instrument_key"]}
                 elif kopen: r["kite"]={"action":"skip: Kite position already open","open":[p["trading_symbol"] for p in kopen]}
                 else:
                     kq=lots*m["lot_size"]
                     kprod="MIS" if ekw else "NRML"
-                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px}
+                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
                     kok,kre,kadj=trade_lock.check_order(ko,broker="kite"); kadj=(kadj//m["lot_size"])*m["lot_size"]
                     r["kite"]={"symbol":m["tradingsymbol"],"exchange":m["exchange"],"qty":kq,"check":{"allowed":kok,"reasons":kre,"adjusted_qty":kadj}}
                     if kok and kadj>0: kleg={**m,"qty":kadj}
@@ -285,10 +539,11 @@ for name,cfg in IDX.items():
         except Exception as e: r["kite"]={"action":f"skipped: error {type(e).__name__}: {e}"}; kleg=None
         # ---- Upstox leg ----
         uleg=None
-        if openp: r["action"]="skip: position already open in "+name
+        if openp: r["action"]="skip: position already open in "+name+" on Upstox (Kite decided separately)"
+        elif not _elig["upstox"]["ok"]: r["action"]="skip: "+_elig["upstox"]["reason"]
         else:
             csym=f"{name}{exp:%y%m%d}{int(best['strike_price'])}{raw}"  # compact form trade_lock parses (master symbol has spaces)
-            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px}
+            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
             ok,reasons,adj=trade_lock.check_order(o); adj=(adj//lot)*lot
             r["check"]={"allowed":ok,"reasons":reasons,"adjusted_qty":adj}
             if not ok or adj<=0: r["action"]="blocked by pre-trade rules"
@@ -297,7 +552,27 @@ for name,cfg in IDX.items():
             if uleg: r["action"]=f"DRY-RUN: would BUY {uleg} {best['trading_symbol']} LIMIT {px}"
             if kleg: r["kite"]["action"]=f"DRY-RUN: would BUY {kleg['qty']} {kleg['tradingsymbol']} LIMIT {px} NRML on Kite"; bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,dry=True)
             continue
-        if not uleg and not kleg: continue
+        if not uleg and not kleg:
+            _remember_block(name, rev, r)
+            continue
+        if REVERSAL_CONFIRM and rev and (rev.get("trigger") or {}).get("side")==raw:
+            okc,ctr=iel.claim_trigger(TRIGGERS, name, rev["trigger"], datetime.datetime.now(IST).isoformat())
+            if not okc:
+                r["action"]="duplicate: reversal trigger already "+str((ctr or {}).get("state"))
+                continue
+            claimed_id=rev["trigger"]["id"]
+        if CONTRACT_POLICY and not DRY:
+            try:
+                book=iel.load_trigger(TRIGGERS, "_decisions") or {}
+                day=now.date().isoformat()
+                rows=list(book.get(day) or [])
+                rows.append({"index":name,"timeframe":(tf_meta or {}).get("_timeframe"),"expiry":(tf_meta or {}).get("_option_expiry"),"side":raw,
+                             "brokers":[b for b,leg in (("upstox",uleg),("kite",kleg)) if leg]})
+                book[day]=rows
+                iel.save_trigger(TRIGGERS, "_decisions", book)
+            except Exception as e:
+                r["action"]=f"no entry: timeframe decision was not recorded ({type(e).__name__}); order not sent"
+                continue
         oid=None; koid=None
         if uleg:
             body={"quantity":uleg,"product":"I","validity":"DAY","price":px,"tag":"auto_entry","instrument_token":best["instrument_key"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False}
@@ -325,7 +600,10 @@ for name,cfg in IDX.items():
         if koid and not (kst and kst["status"] in("complete","rejected","cancelled")):
             bk.cancel(koid); r["kite"]["cancelled_unfilled"]=True
         kfill=(kst or {}).get("filled",0) if koid else 0
-        if fill>0 or kfill>0: trade_lock.record_entry()  # one decision even if both legs fill
+        if fill>0 or kfill>0:
+            trade_lock.record_entry()  # one decision even if both legs fill
+            if r.get("first_lots_override"):
+                isp.consume_first_lots_override()
         s=json.load(open(SF)) if os.path.exists(SF) else {}; seen=json.load(open(SEEN)) if os.path.exists(SEEN) else {}
         if oid:
             r["status"]=st; r["filled"]=fill
@@ -360,5 +638,19 @@ for name,cfg in IDX.items():
                 r["kite"]["sl_check"]={k:c.get(k) for k in ("ok","sl","sl_trigger","sl_status","target_live","attempts","reasons")}
                 if not c["ok"]: r["kite"]["action"]+=" | SL_CONFIRM_FAILED (see sl_confirm_failures.json)"
             except Exception as e: r["kite"]["sl_check"]={"ok":False,"error":f"{type(e).__name__}: {e}"}
-    except Exception as e: r["error"]=f"{type(e).__name__}: {e}"
+        if claimed_id:
+            sub={"upstox":{"attempted":bool(uleg),"order_id":oid,"status":st if uleg else None,"filled":fill if uleg else 0},
+                 "kite":{"attempted":bool(kleg),"order_id":koid,"status":(kst or {}).get("status") if kleg else None,"filled":kfill if kleg else 0}}
+            iel.mark_consumed(TRIGGERS, name, claimed_id, sub, datetime.datetime.now(IST).isoformat())
+            rec=iel.public_record(rev or {}, datetime.datetime.now(IST).isoformat(), DRY)
+            rec["phase"]="submission"; rec["submission"]=iel.sanitize(sub); rec["action"]="submitted"
+            r["submission"]=rec["submission"]
+            _log_decision(rec)
+            claimed_id=None
+    except Exception as e:
+        r["error"]=f"{type(e).__name__}: {e}"
+        if claimed_id and REVERSAL_CONFIRM and not DRY:
+            try: iel.mark_incomplete(TRIGGERS, name, claimed_id, datetime.datetime.now(IST).isoformat())
+            except Exception as e2:
+                print(f"auto_entry: could not close trigger {claimed_id}: {type(e2).__name__}: {e2}", file=sys.stderr)
 done()

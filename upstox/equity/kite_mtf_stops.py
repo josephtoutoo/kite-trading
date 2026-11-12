@@ -129,13 +129,33 @@ def main():
         want = mtf or posq
         if not want:
             acts.append(dict(sym=sym, action='SKIP', why='no MTF share count (holdings and positions both blank)')); continue
-        stx, d = st_1h(key)
-        pct_stop = ltp * (1 - PCT / 100.0)
-        cand = pct_stop
-        if stx and d == 1 and stx < ltp and stx > pct_stop:
-            cand = stx                      # Supertrend nearer, still below price
-        if cand > ltp * 0.99:               # guard: never a stop within 1% of price
+        cur = stops.get(sym)
+        try:
+            import mtf_policy as _pol
+            _mode = _pol.stop_mode()
+        except Exception:
+            _mode = 'legacy'
+        if _mode == 'daily':
+            _plan = _pol.position_stop(key, ltp, existing_trigger=(cur or {}).get('trigger_price'),
+                                      existing_qty=int((cur or {}).get('quantity') or 0), position_qty=want,
+                                      allow_trail=sym in mine)
+            if not _plan.get('place_stop'):
+                acts.append(dict(sym=sym, action=_plan.get('action') or 'KEEP', ltp=ltp,
+                                 trigger=_plan.get('trigger'), qty=want, source=_plan.get('source'),
+                                 why=_plan.get('reason'), exit=_plan.get('exit'),
+                                 execute_exit=_plan.get('execute_exit')))
+                continue
+            cand = float(_plan['trigger'])
+            stx, d = None, None
+            pct_stop = ltp * (1 - PCT / 100.0)
+        else:
+            stx, d = st_1h(key)
+            pct_stop = ltp * (1 - PCT / 100.0)
             cand = pct_stop
+            if stx and d == 1 and stx < ltp and stx > pct_stop:
+                cand = stx                      # Supertrend nearer, still below price
+            if cand > ltp * 0.99:               # guard: never a stop within 1% of price
+                cand = pct_stop
         tick = bk.tick_for(exch, sym) or 0.05
         trig = bk.snap(cand, tick)
         limit = bk.snap(trig - max(tick, trig * 0.005), tick)

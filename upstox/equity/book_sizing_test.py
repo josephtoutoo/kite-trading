@@ -226,7 +226,7 @@ def test_adx_monotonic():
     lo = bs.index_option_lots(prem, lot, cap, 22.0, True, False, 0.15)[0]
     eq = bs.index_option_lots(prem, lot, cap, 22.0, True, False, 1 / 3)[0]
     hi = bs.index_option_lots(prem, lot, cap, 22.0, True, False, 0.50)[0]
-    check('weight ordering: 0.15 <= 1/3 <= 0.50 in lots', lo <= eq <= hi, f'{lo} {eq} {hi}')
+    check('a heavier book does not take unused room from another', lo <= eq and hi == eq, f'{lo} {eq} {hi}')
 
 
 # ---------------------------------------------------------------- g) one-lot floor and R11

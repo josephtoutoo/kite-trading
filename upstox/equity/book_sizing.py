@@ -19,7 +19,7 @@ THE ARITHMETIC (index options)
   lots          = floor(risk_budget / per_lot_risk)
   premium_cap   = free_capital x PREMIUM_CAP x weight_scale   # total outlay, not just the risk
   lots          = min(lots, floor(premium_cap / (premium x lot_size)), MAX_LOTS)
-  weight_scale  = weight / (1/3), so equal weights = 1.00x, a 0.50 weight = 1.50x.
+  weight_scale  = min(weight / (1/3), 1). A heavier book does not receive another book's unused room.
 
   If that rounds to 0 but one lot's premium still fits the premium cap, it returns 1 lot (a 0-lot
   answer is only honest when even one lot cannot be afforded). If one lot does not fit, 0 lots with
@@ -383,14 +383,17 @@ def book_weights(path=PNL_PATH):
 
 # ---------------------------------------------------------------- shared maths
 def _scale(weight):
-    """Equal weight (1/3) = 1.00x. Guards against a nonsense weight rather than trusting it."""
+    """Equal weight (1/3) = 1.00x. A heavier book does not rise above 1x.
+
+    Unused room in another bucket is not taken. A lighter weight still sizes down.
+    """
     try:
         w = float(weight)
     except (TypeError, ValueError):
         return None
     if not (w > 0):
         return None
-    return w / (1.0 / len(BOOKS))
+    return min(w / (1.0 / len(BOOKS)), 1.0)
 
 
 def _conviction(adx, daily_aligned):
@@ -554,8 +557,9 @@ def mtf_qty(symbol, price, broker, free_capital, weight, streak_mult=1.0):
     allowed = int(r.get('qty') or 0)
     sm = _sm(streak_mult)
     qty = min(allowed, int(allowed * scale * sm))   # never above what the caps allow
-    note = (f'{symbol} {broker}: caps allow {allowed} share(s) (10% stock cap / 50% total on MTF margin, '
-            f'half-room reserve, {ms.MAX_STOCKS}-name limit); weight {weight:.2f} ({scale:.2f}x) '
+    note = (f'{symbol} {broker}: caps allow {allowed} share(s) '
+            f'({ms.per_stock_cap() * 100:g}% stock cap / {ms.total_cap() * 100:g}% total on MTF margin, '
+            f'{ms.max_names()}-name limit); weight {weight:.2f} ({scale:.2f}x) '
             f'day streak {sm:.2f}x -> {qty} share(s)')
     if r.get('reason'):
         note += f'; {r["reason"]}'

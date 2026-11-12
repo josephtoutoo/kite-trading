@@ -5,7 +5,7 @@ applied where the rule is EVALUATED, not by rewriting these constants at import 
 rewritten at import is invisible to the next reader and would silently outlive its expiry.
 On any other date _lim() returns the constant below untouched, so the user's rules return by
 themselves. The Rs 30,000 account day-loss breaker (R2b), the fail-closed reads (R0), R8/R9 and
-the 5-name MTF slot cap have no override entry and cannot move.
+the MTF name cap is 5 bot-opened names through 8 Nov 2026 and 5 actual positive names from 9 Nov (equity/mtf_policy.py). The 5-6 Nov override does not move it.
 Entry scripts MUST call check_order(order) before placing any order (and can_enter() still works).
 Lock file: trade_lock.json {date, reason, loss, next_day_reduced, next_day_date}
 CLI: python3 trade_lock.py check '<json order>'   (order keys: trading_symbol, instrument_token,
@@ -31,7 +31,10 @@ STOCK_OPT_LOTS=1        # R11: lots per stock-option underlying (the 2-lot cap i
 _autonomy=None
 try:
     import importlib.util as _ilu
-    _af=os.path.join(os.path.dirname(D),"equity","autonomy.py")
+    # Historical box: trade_lock lives in /workspace/upstox and autonomy in /workspace/equity.
+    # This repo: both live under the repo root, so equity/ is a child of D as well.
+    _af=next(p for p in (os.path.join(os.path.dirname(D),"equity","autonomy.py"),
+                         os.path.join(D,"equity","autonomy.py")) if os.path.exists(p))
     _spec=_ilu.spec_from_file_location("autonomy",_af)
     _autonomy=_ilu.module_from_spec(_spec); _spec.loader.exec_module(_autonomy)
     sys.modules.setdefault("autonomy",_autonomy)   # so a later plain `import autonomy` agrees
@@ -143,17 +146,38 @@ def _download(dest,url):
     open(dest,"wb").write(data)
 
 
-def _expiry_today(und,when):
+# None: read the on-disk master. A list: that master, for a test. "missing": the master
+# cannot be read. Production leaves this None. It is not a historical expiry calendar.
+_expiry_rows=None
+def _expiry_rows_of(und,when,rows):
+    d=when.date().isoformat()
+    for x in rows:
+        if x.get("instrument_type") not in ("CE","PE"): continue
+        if (x.get("underlying_symbol") or x.get("name"))!=und or not x.get("expiry"): continue
+        try:
+            if datetime.datetime.fromtimestamp(x["expiry"]/1000,IST).date().isoformat()==d: return True
+        except Exception: continue
+    return False
+def _expiry_today(und,when,rows=None,master_dir=None):
     """Does any option on `und` expire on `when`'s date? True / False / None (unknown).
 
     Read from the newest instrument master already on disk, like _lotmap - no download is
     triggered from inside a rule check, because a rule must not depend on a network read it
     did not ask for. None means the master could not be read: the caller applies the tighter
-    branch, since this check only ever ADDS a restriction."""
+    branch, since this check only ever ADDS a restriction. `rows` or `_expiry_rows` supplies
+    a master without touching disk; that is a fixture, not the exchange's history."""
+    if rows is None and _expiry_rows=="missing": return None
+    if rows is None and isinstance(_expiry_rows,list): rows=_expiry_rows
+    if rows is not None:
+        try: return _expiry_rows_of(und,when,rows)
+        except Exception as e:
+            print(f"trade_lock: expiry calendar unreadable for {und}: {type(e).__name__}: {str(e)[:120]}",file=sys.stderr)
+            return None
     exch="BSE" if und in ("SENSEX","BANKEX") else "NSE"
     try:
         import glob
-        files=sorted(glob.glob(os.path.join(D,f"instruments_{exch}_*.json.gz")))
+        root=D if master_dir is None else master_dir
+        files=sorted(glob.glob(os.path.join(root,f"instruments_{exch}_*.json.gz")))
         if not files: return None
         f=files[-1]
         d=when.date().isoformat()
@@ -162,13 +186,7 @@ def _expiry_today(und,when):
         key=("expiry",f,d,und)
         hit=_cache.get(key)
         if hit is None:
-            for x in api.gzip_json(f):
-                if x.get("instrument_type") in ("CE","PE") and (x.get("underlying_symbol") or x.get("name"))==und and x.get("expiry"):
-                    try:
-                        if datetime.datetime.fromtimestamp(x["expiry"]/1000,IST).date().isoformat()==d:
-                            hit=True; break
-                    except Exception: pass
-            hit=bool(hit)
+            hit=_expiry_rows_of(und,when,api.gzip_json(f))
             _cache[key]=hit
         return hit
     except Exception as e:
@@ -213,25 +231,24 @@ def _kite_holdings():
         _cache["_kiteh"]=[]
     return _cache["_kiteh"]
 def _kite_mtf():
-    """Kite MTF rows normalized for R10 (4 Nov: this used to be an empty list, so Kite's
-    10%/50% MTF caps never fired). Uses holdings.mtf.quantity plus open MTF day positions."""
+    """Kite MTF rows for R10. Positive nets only, after a sold day leg is reconciled
+    against the holding. A legacy lot with no bot tag is still a row."""
     if "_kitemtf" in _cache: return _cache["_kitemtf"]
     rows=[]
     try:
         import broker_kite as bk
         if bk.valid():
-            seen={}
-            for p in bk.positions():
-                if p.get("product")=="MTF" and int(p.get("quantity") or 0)>0 and p.get("exchange") in ("NSE","BSE"):
-                    seen[p["trading_symbol"]]=dict(p)
-            for h in bk.holdings():
-                m=h.get("mtf") or {}
-                q=int(m.get("quantity") or 0)
-                if q>0:
-                    d=dict(h); d["quantity"]=q
-                    d["average_price"]=float(m.get("average_price") or h.get("average_price") or 0)
-                    d["product"]="MTF"; seen[h["trading_symbol"]]=d
-            rows=list(seen.values())
+            sys.path.insert(0, os.path.join(os.path.dirname(D), "equity"))
+            # 12 Nov 2026: the deployed runtime keeps mtf_policy in <D>/equity, not ../equity; the
+            # missing path made every BUY fail R0 "Kite MTF book unreadable". Both layouts are searched.
+            if os.path.join(D, "equity") not in sys.path: sys.path.insert(0, os.path.join(D, "equity"))
+            import mtf_policy as _pol
+            rec=_pol.reconcile_book(_pol.rows_from_kite(bk.positions(), bk.holdings()))
+            if any(v.get("cost") is None for v in rec.values()):
+                _kite_err.append("Kite MTF book has a positive name with no price")
+            for sym, row in rec.items():
+                rows.append({"trading_symbol":sym,"quantity":row["qty"],"average_price":row["price"] or 0,
+                             "product":"MTF"})
     except Exception as e:
         print(f"trade_lock: Kite MTF rows unavailable (R10 reads empty): {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
         _kite_err.append(f"Kite MTF book unreadable: {type(e).__name__}: {str(e)[:120]}")
@@ -271,12 +288,13 @@ def check_order(order,broker="upstox"):
     funds=_data("/v2/user/get-funds-and-margin") or {}
     eq=funds.get("equity",{}) if isinstance(funds,dict) else {}
     capital=float(eq.get("available_margin") or 0)+float(eq.get("used_margin") or 0)
+    _kite_margin=None
     if broker=="kite":
         try:
             import broker_kite as bk
             if bk.valid():
-                m=bk.client().margins("equity")
-                capital=float(m.get("net") or 0)+float(m.get("utilised",{}).get("debits") or 0)
+                _kite_margin=bk.client().margins("equity")
+                capital=float(_kite_margin.get("net") or 0)+float(_kite_margin.get("utilised",{}).get("debits") or 0)
         except Exception as e:
             print(f"trade_lock: Kite margins unavailable, using the Upstox capital figure: {type(e).__name__}: {str(e)[:140]}",file=sys.stderr)
     kpos,kord=kite_data()
@@ -292,6 +310,40 @@ def check_order(order,broker="upstox"):
         # blind. Refuse the BUY instead of clearing it on a partial picture.
         if capital<=0: block.append("R0: capital unreadable (funds call returned nothing) - a BUY cannot be sized")
         for e in _kite_err: block.append(f"R0: {e} - a BUY needs the Kite book readable")
+        _cap_active=False; _cap_skip=False
+        try:
+            sys.path.insert(0, os.path.join(D, "equity"))
+            import capital_policy as _cp
+            _cap_active=_cp.active(now)
+        except Exception as _ce:
+            _cp=None
+            if now.date()>=datetime.date(2026,11,9):
+                block.append(f"R10: capital policy missing ({type(_ce).__name__}) - buy refused")
+        if _cap_active and _cp is not None:
+            _vo=_cp.verified_override(broker) if hasattr(_cp,"verified_override") else None
+            _basis=_cp.basis_from_funds(_vo or (_kite_margin if broker=="kite" else eq))
+            if not _basis["ok"]:
+                # 12 Nov 2026 10:38 IST (t598u "Don't block"): with full_auto_flags capital_gate=false an
+                # OPTION buy is not refused for a missing verified capital figure. No capital is invented:
+                # the percentage buckets are skipped and size stays the caller's lot rule (1 lot, 2 on
+                # ST/EMA, 3 on the index's own expiry day, by max). R0 funds, R1-R9, R11 and the daily
+                # loss cap still apply. MTF, BEEs, futures and MCX keep the fail-closed refusal.
+                _gate_on=True
+                try:
+                    if D not in sys.path: sys.path.insert(0, D)
+                    import full_auto_policy as _fap
+                    _gate_on=_fap.flag("capital_gate")
+                except Exception as _fe:
+                    print(f"trade_lock: capital_gate flag unreadable, R10 stays on: {type(_fe).__name__}",file=sys.stderr)
+                if not _gate_on and opt and prod!="MTF":
+                    _cap_skip=True
+                    flags.append(f"R10 skipped: capital_gate off ({_basis['reason']}); option sized by lots, not buckets")
+                    print("trade_lock: R10 skipped: capital_gate off",file=sys.stderr)
+                else:
+                    block.append(f"R10: {_basis['reason']} - buy refused")
+                    capital=0
+            else:
+                capital=_basis["capital"]
     allpos=pos+[m for m in mtf if m.get("instrument_token") not in {p.get("instrument_token") for p in pos}]
     held=[p for p in allpos if p.get("instrument_token")==k or (sym and sym_of(p)==sym)]
     held_q=sum(int(p.get("quantity") or 0) for p in held)
@@ -354,14 +406,21 @@ def check_order(order,broker="upstox"):
                 t=_ts(o); s2=sym_of(o)
                 if o["transaction_type"]=="BUY" and underlying(s2)==und and s2.endswith(other) and t and timedelta_min(now,t)<=_win:
                     block.append(f"R3: {und} {other} bought {t:%H:%M} (<{_win} min ago) - no opposite side"); break
-            # rule 4
+            # rule 4. Spot index, unless this process was started with INDEX_ENTRY_SOURCE=futures.
+            # Then the order must carry the futures key the entry already chose. A missing or spot
+            # key is a block: this rule does not read the cash index as a substitute.
             try:
-                sys.path.insert(0,D); import ind
-                a=ind.analyze(INDEX_KEYS[und],"minutes",5,5)
-                above=a["close"]>a["ema20"] and a["dir"]==1; below=a["close"]<a["ema20"] and a["dir"]==-1
-                trend=f"{und} 5m close {a['close']} ema20 {a['ema20']} ST {'green' if a['dir']==1 else 'red'} @ {a['last_ts'][11:16]}"
-                if sym.endswith("PE") and not below: block.append("R4: PUT needs 5m close < 20 EMA and red Supertrend ("+trend+")")
-                if sym.endswith("CE") and not above: block.append("R4: CALL needs 5m close > 20 EMA and green Supertrend ("+trend+")")
+                sys.path.insert(0,D); import ind, index_futures as _ifut
+                _src=_ifut.entry_source()
+                _key,_why=_ifut.signal_key_for_gate(order, und, INDEX_KEYS, _src)
+                if not _key:
+                    block.append("R4: "+_why)
+                else:
+                    a=ind.analyze(_key,"minutes",5,5)
+                    above=a["close"]>a["ema20"] and a["dir"]==1; below=a["close"]<a["ema20"] and a["dir"]==-1
+                    trend=f"{und} 5m {_src} {_key} close {a['close']} ema20 {a['ema20']} ST {'green' if a['dir']==1 else 'red'} @ {a['last_ts'][11:16]}"
+                    if sym.endswith("PE") and not below: block.append("R4: PUT needs 5m close < 20 EMA and red Supertrend ("+trend+")")
+                    if sym.endswith("CE") and not above: block.append("R4: CALL needs 5m close > 20 EMA and green Supertrend ("+trend+")")
             except Exception as e: block.append(f"R4: trend check failed ({e}) - not allowed without trend confirmation")
         # rule 6
         if held_q>0:
@@ -375,84 +434,216 @@ def check_order(order,broker="upstox"):
             t=_ts(o)
             if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=_win7:
                 block.append(f"R7: {und} exit filled {t:%H:%M} (<{_win7} min ago) - cooldown"); break
-        # rule 11: stock options - max 3 underlyings, max 1 lot per underlying (incl. holdings)
-        # t339u: 4 x 2 lots on 5-6 Nov only (stock options are the one book with a positive
-        # measured record), back to 3 x 1 on 7 Nov. Both values are read per decision.
+        # rule 11: stock options, before the order is sent. t460u: three distinct
+        # underlyings per broker, pending and reserved names included. The old
+        # 4-underlying figure is not applied. Lots stay 1, or 2 only on the
+        # dated override, and are never raised above that. A new underlying
+        # needs an explicit initial-entry flag or a verified full closure.
+        # Count under 3 is not a reason to open one. Technical, results, and
+        # manual buys use the same check.
         _und_max=_lim("STOCK_OPT_MAX_UND",STOCK_OPT_MAX_UND,now)
         _lot_max=_lim("STOCK_OPT_MAX_LOTS",STOCK_OPT_LOTS,now)
         if opt and not idx_opt and ((k or "").startswith(("NSE_FO","BSE_FO")) or not k):
-            longs={}
-            # 4 Nov: per-broker count (user: Kite has no stock options, so its slots are free)
-            for p in pos:
-                sp=sym_of(p); q=int(p.get("quantity") or 0)
-                if q>0 and is_opt(sp) and not is_index(sp):
-                    longs.setdefault(underlying(sp),[]).append(p)
-            others=[u for u in longs if u!=und]
-            if und not in longs and len(others)>=_und_max:
-                block.append(f"R11: already long options in {len(others)} stocks ({', '.join(sorted(others))}) - max {_und_max}")
-            lot=lot_size(k,sym) if k else None
-            if not lot: block.append(f"R11: lot size not found for {k or sym} - cannot verify the {_lot_max}-lot cap")
-            else:
-                have=sum(int(p.get("quantity") or 0) for p in longs.get(und,[]))
-                room=max(lot*_lot_max-have,0)
-                if room<=0: block.append(f"R11: {und} already holds {have} qty (= {have/lot:g} lot, lot {lot}) - cap {_lot_max} lot{'s' if _lot_max!=1 else ''} per stock"); adj=0
-                elif adj>room: adj=room; flags.append(f"R11: qty capped to {room} ({_lot_max} lot{'s' if _lot_max!=1 else ''} of {lot} minus held {have})")
+            _sp=None
+            try:
+                sys.path.insert(0, os.path.join(D, "equity"))
+                import stockopt_policy as _sp
+            except Exception as _se:
+                block.append(f"R11: stock-option policy missing ({type(_se).__name__}) - buy refused")
+            if _sp is not None:
+                _und_max=min(int(_und_max), _sp.MAX_UNDERLYINGS)
+                _lot_max=min(int(_lot_max), _sp.LOT_CEILING)
+                _this_orders=orders if broker=="upstox" else kord
+                _view=_sp.book_view(pos, _this_orders)
+                _other=_sp.book_view(kpos, kord) if broker=="upstox" else _sp.book_view(upos, orders)
+                if broker=="upstox" and _kite_err:
+                    _other=None
+                if _view is None:
+                    block.append("R11: this broker's stock-option book is unreadable - buy refused")
+                else:
+                    _held_syms=sorted({sym_of(p) for p in pos if int(p.get("quantity") or 0)>0
+                                       and _sp.is_stock_option(sym_of(p)) and _sp.underlying(sym_of(p))==und})
+                    _new=und not in _view["held"] and und not in _view["pending"] and und not in _view["uncertain"]
+                    _names=sorted(_view["names"])
+                    if _new and _view["count"]>=_und_max:
+                        block.append(f"R11: already reserved options in {_view['count']} stocks ({', '.join(_names)}) - max {_und_max} including pending")
+                    elif _new and _other is None:
+                        block.append("R11: other broker book unreadable - new stock-option name refused")
+                    elif _new and _other is not None and und not in _other["names"] and _other["count"]>=_und_max:
+                        block.append(f"R11: other broker has no vacancy ({_other['count']} of {_und_max}, pending included) - mirrored entry needs both")
+                    elif _new:
+                        _pend=len(_view["pending"])
+                        if _other is not None:
+                            _pend=max(_pend, len(_other["pending"]))
+                        _admit=_sp.admit_new(_view["count"], None if _other is None else _other["count"],
+                                             order.get("_replacement") if isinstance(order.get("_replacement"), dict) else None,
+                                             order.get("_initial_entry") is True, _pend)
+                        if not _admit["ok"]:
+                            block.append("R11: "+_admit["reason"])
+                    elif len(_held_syms)!=1 or _held_syms[0]!=sym:
+                        block.append("R11: add only the single open contract; a different strike or expiry is not a substitute")
+                    elif int(_view["pending_qty"].get(und) or 0)>0 or und in _view["uncertain"]:
+                        block.append(f"R11: an add in {und} is already pending")
+                    else:
+                        _guard=_sp.guard_add(order.get("_add_inputs"), sym, broker,
+                                             _this_orders, [] if _other is None else (kord if broker=="upstox" else orders))
+                        if not _guard["ok"]:
+                            block.append("R11: "+_guard["reasons"][0])
+                    lot=lot_size(k,sym) if k else None
+                    if not lot: block.append(f"R11: lot size not found for {k or sym} - cannot verify the {_lot_max}-lot cap")
+                    else:
+                        have=int(_view["held_qty"].get(und) or 0)+int(_view["pending_qty"].get(und) or 0)
+                        if und in _view["uncertain"]:
+                            block.append(f"R11: {und} has a stock-option buy of unknown size - not adding")
+                            adj=0
+                        else:
+                            room=max(lot*_lot_max-have,0)
+                            if room<=0: block.append(f"R11: {und} already holds {have} qty (= {have/lot:g} lot, lot {lot}) - cap {_lot_max} lot{'s' if _lot_max!=1 else ''} per stock"); adj=0
+                            elif adj>room: adj=room; flags.append(f"R11: qty capped to {room} ({_lot_max} lot{'s' if _lot_max!=1 else ''} of {lot} minus held {have})")
         # rule 10
         px=float(order.get("price") or 0) or ltp or 0
         if prod=="MTF":
-            # 4 Nov 2026 (t292u): R10 caps are measured on the MTF MARGIN the broker blocks, not on price x qty.
-            # 5 Nov 2026 (t304u): only names THIS bot opened count toward the caps, and each holding is
-            # converted to margin at its OWN rate. The single ratio taken from the new order used to be
-            # applied to every holding, which over- or under-stated the book whenever the names differed
-            # (a 4x-leverage stock and a 5x-leverage one do not share a margin rate).
-            rows=mtf
-            qty_by={}
-            for m in rows:
-                q0=int(m.get("quantity") or 0)
-                if q0>0:
-                    nm=sym_of(m).replace("-EQ","")
-                    qty_by[nm]=qty_by.get(nm,0)+q0
+            # Monday 9 Nov 2026: 5 actual names, daily qualification, one shared 25% MTF pool.
+            # The 10% per-stock cap stays. A missing policy module refuses the buy.
+            _mon=False
             try:
-                sys.path.insert(0,"/workspace/equity")
-                import mtf_sizing as _ms
-                mine=_ms.mine_upstox() if broker=="upstox" else _ms.mine_kite()
-                q=_ms.margin_quote(broker,und,qty,px)
-                if q.get("ok") and px and qty: ratio=float(q["margin"])/(px*qty)
+                sys.path.insert(0, os.path.join(os.path.dirname(D), "equity"))
+                import mtf_policy as _mp
+                _mon=_mp.policy_active(now) or not _mp.date_readable(now)
+            except Exception as _pe:
+                _mp=None
+                if now.date()>=datetime.date(2026,11,9):
+                    block.append(f"R10: Monday policy module missing ({type(_pe).__name__}) - no MTF buy")
+            if _mon and _mp is not None:
+                _rows=[]
+                for m in mtf:
+                    q0=int(m.get("quantity") or 0)
+                    if q0==0 and not m.get("day_sell_quantity"): continue
+                    _rows.append(_mp.row_from_upstox(m) if "trading_symbol" in m or "tradingsymbol" in m else m)
+                if broker=="kite":
+                    _rec=_mp.reconcile_book(_rows) if _rows else {}
                 else:
-                    ratio=1.0
-                    block.append(f"R10: MTF margin quote failed ({q.get('why','no quote')}) - cannot size on margin")
-                new_m=float(q["margin"]) if q.get("ok") else px*qty*ratio
-                # margin already blocked by the same name (mine or the user's own: buying it makes it mine)
-                held_here=[(nm,qq) for nm,qq in qty_by.items() if nm==und]
-                avg_here=next((float(m.get("average_price") or 0) for m in rows
-                               if sym_of(m).replace("-EQ","")==und and int(m.get("quantity") or 0)>0),0.0)
-                this_m=0.0
-                for nm,qq in held_here:
-                    hq=_ms.margin_quote(broker,nm,qq,avg_here)
-                    this_m+=float(hq["margin"]) if hq.get("ok") else qq*avg_here*ratio
-                # everything else this bot owns, at each name's own margin
-                total_m=0.0; unpriced=[]
-                for nm,qq in qty_by.items():
-                    if nm==und or nm not in mine: continue
-                    av=next((float(m.get("average_price") or 0) for m in rows
-                             if sym_of(m).replace("-EQ","")==nm and int(m.get("quantity") or 0)>0),0.0)
-                    hq=_ms.margin_quote(broker,nm,qq,av)
-                    if hq.get("ok"): total_m+=float(hq["margin"])
-                    else: total_m+=qq*av*ratio; unpriced.append(nm)
-                if unpriced: flags.append(f"R10: margin quote unavailable for {','.join(unpriced)} - counted at this order's rate")
-            except Exception as e:
-                ratio=1.0; new_m=px*qty; this_m=0.0; total_m=0.0
-                block.append(f"R10: MTF margin sizing unavailable ({type(e).__name__}: {e})")
-            # t339u: 10% -> 12% per stock on 5-6 Nov; the 50% total is NOT raised (the override
-            # table states it at 0.50, and this line reads it, so the cap cannot drift by accident).
-            _per=_lim("MTF_PER_STOCK",MTF_STOCK_CAP,now); _tot=_lim("MTF_TOTAL",MTF_TOTAL_CAP,now)
-            if this_m+new_m>capital*_per: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > {_per*100:g}% cap Rs {capital*_per:,.0f}")
-            if total_m+new_m>capital*_tot: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > {_tot*100:g}% cap Rs {capital*_tot:,.0f}")
-        elif opt or sym.endswith("FUT"):
-            mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
-            fno_lim=min(capital*0.5,capital-mtf_total)
-            fno_used=sum(float(p.get("average_price") or p.get("buy_price") or 0)*int(p.get("quantity") or 0) for p in pos if int(p.get("quantity") or 0)>0 and (is_opt(sym_of(p)) or sym_of(p).endswith("FUT")))
-            if fno_used+px*qty>fno_lim: flags.append(f"R10 WARNING: F&O deployed Rs {fno_used+px*qty:,.0f} > F&O limit Rs {max(fno_lim,0):,.0f} (50% minus MTF overflow)")
+                    _rec=_mp.reconcile_book([_mp.row_from_upstox(m) for m in mtf])
+                _pos={}
+                for _s,_r in _rec.items():
+                    if _r.get("cost") is None:
+                        block.append(f"R10: {_s} has no average price - MTF buy refused")
+                    else:
+                        _pos[_s]={"qty":_r["qty"],"cost":_r["cost"]}
+                _pend=_mp.pending_buys(orders if broker=="upstox" else kord, _pos)
+                _view=_mp.rooms(capital, _pos, _pend, None, 1.0, now, broker=broker,
+                                unpriced=[s for s,r in _rec.items() if r.get("cost") is None])
+                try:
+                    sys.path.insert(0,"/workspace/equity")
+                    import mtf_sizing as _ms
+                    _q=_ms.margin_quote(broker, und, qty, px) if px and qty else {"ok":False,"why":"no price"}
+                except Exception as _qe:
+                    _q={"ok":False,"why":str(_qe)}
+                if not _q.get("ok"):
+                    block.append(f"R10: MTF margin quote failed ({_q.get('why','no quote')}) - cannot size on margin")
+                    _mnew=px*qty if px else 0
+                else:
+                    _mnew=float(_q["margin"])
+                _already=float((_pos.get(und) or {}).get("cost") or 0)
+                if _q.get("ok") and px and qty and _already:
+                    _already=_already*float(_q["margin"])/(px*qty)
+                if _q.get("ok") and px and qty:
+                    _view=_mp.rooms(capital, _pos, _pend, None, float(_q["margin"])/(px*qty), now, broker=broker,
+                                    unpriced=[s for s,r in _rec.items() if r.get("cost") is None])
+                block.extend(_mp.order_blocks(_view, und, "add" if und in _pos else "new", _mnew,
+                                              order.get("_trend_ok") is True, order.get("_in_loss") is True, _already))
+            if not _mon:
+              # 4 Nov 2026 (t292u): R10 caps are measured on the MTF MARGIN the broker blocks, not on price x qty.
+              # 5 Nov 2026 (t304u): only names THIS bot opened count toward the caps, and each holding is
+              # converted to margin at its OWN rate. The single ratio taken from the new order used to be
+              # applied to every holding, which over- or under-stated the book whenever the names differed
+              # (a 4x-leverage stock and a 5x-leverage one do not share a margin rate).
+              rows=mtf
+              qty_by={}
+              for m in rows:
+                  q0=int(m.get("quantity") or 0)
+                  if q0>0:
+                      nm=sym_of(m).replace("-EQ","")
+                      qty_by[nm]=qty_by.get(nm,0)+q0
+              try:
+                  sys.path.insert(0,"/workspace/equity")
+                  import mtf_sizing as _ms
+                  mine=_ms.mine_upstox() if broker=="upstox" else _ms.mine_kite()
+                  q=_ms.margin_quote(broker,und,qty,px)
+                  if q.get("ok") and px and qty: ratio=float(q["margin"])/(px*qty)
+                  else:
+                      ratio=1.0
+                      block.append(f"R10: MTF margin quote failed ({q.get('why','no quote')}) - cannot size on margin")
+                  new_m=float(q["margin"]) if q.get("ok") else px*qty*ratio
+                  # margin already blocked by the same name (mine or the user's own: buying it makes it mine)
+                  held_here=[(nm,qq) for nm,qq in qty_by.items() if nm==und]
+                  avg_here=next((float(m.get("average_price") or 0) for m in rows
+                                 if sym_of(m).replace("-EQ","")==und and int(m.get("quantity") or 0)>0),0.0)
+                  this_m=0.0
+                  for nm,qq in held_here:
+                      hq=_ms.margin_quote(broker,nm,qq,avg_here)
+                      this_m+=float(hq["margin"]) if hq.get("ok") else qq*avg_here*ratio
+                  # everything else this bot owns, at each name's own margin
+                  total_m=0.0; unpriced=[]
+                  for nm,qq in qty_by.items():
+                      if nm==und or nm not in mine: continue
+                      av=next((float(m.get("average_price") or 0) for m in rows
+                               if sym_of(m).replace("-EQ","")==nm and int(m.get("quantity") or 0)>0),0.0)
+                      hq=_ms.margin_quote(broker,nm,qq,av)
+                      if hq.get("ok"): total_m+=float(hq["margin"])
+                      else: total_m+=qq*av*ratio; unpriced.append(nm)
+                  if unpriced: flags.append(f"R10: margin quote unavailable for {','.join(unpriced)} - counted at this order's rate")
+              except Exception as e:
+                  ratio=1.0; new_m=px*qty; this_m=0.0; total_m=0.0
+                  block.append(f"R10: MTF margin sizing unavailable ({type(e).__name__}: {e})")
+              # t339u: 10% -> 12% per stock on 5-6 Nov; the 50% total is NOT raised (the override
+              # table states it at 0.50, and this line reads it, so the cap cannot drift by accident).
+              _per=_lim("MTF_PER_STOCK",MTF_STOCK_CAP,now); _tot=_lim("MTF_TOTAL",MTF_TOTAL_CAP,now)
+              if this_m+new_m>capital*_per: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > {_per*100:g}% cap Rs {capital*_per:,.0f}")
+              if total_m+new_m>capital*_tot: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > {_tot*100:g}% cap Rs {capital*_tot:,.0f}")
+        elif opt or sym.endswith("FUT") or (sym.replace("-EQ","") in (getattr(_cp, "BEE_SYMBOLS", ()) if _cp is not None else ())):
+            if _cap_active and _cp is not None:
+                _kind=_cp.classify(sym, prod, k or "")
+                if _kind=="unassigned" and order.get("_book")==getattr(_cp,"CRUDE_AUTO_BOOK",None) and opt and und=="CRUDEOIL":
+                    # 12 Nov 2026: user-authorized crude option entries. No bucket; Kite only; exactly 1 lot.
+                    _cl=None
+                    try:
+                        import broker_kite as _bk2
+                        _row=_bk2._index("MCX")[1].get(sym)
+                        _cl=int(_row["lot_size"]) if _row else None
+                    except Exception: _cl=None
+                    if broker!="kite": block.append("R10: crude_auto buys go to Kite only (Upstox MCX orders are API-disabled)")
+                    elif not _cl: block.append(f"R10: Kite lot size unreadable for {sym} - crude buy refused")
+                    elif held_q>0: block.append(f"R10: crude_auto already holds {sym}; adds are not part of the crude book")
+                    elif qty!=_cl*getattr(_cp,"CRUDE_AUTO_MAX_LOTS",1): block.append(f"R10: crude_auto is {getattr(_cp,'CRUDE_AUTO_MAX_LOTS',1)} lot ({_cl}); order qty {qty} refused")
+                elif _kind=="unassigned":
+                    block.append("R10: index futures and MCX have no bucket; other books are not used to fund them. Existing exposure is not closed")
+                elif _kind in ("stock_options","index_options") and _cap_skip:
+                    # capital_gate off (t598u): no verified denominator, so no bucket fit; lot caps above still apply.
+                    # The broker's own free funds must still cover the premium (no margin is treated as capital).
+                    try:
+                        _free=float((_kite_margin or {}).get("net") or 0) if broker=="kite" else float(eq.get("available_margin") or 0)
+                    except Exception: _free=0.0
+                    _amt=px*(adj if adj else qty)
+                    if _amt<=0: block.append(f"R10: {_kind} premium is unreadable - buy refused")
+                    elif _free<=0 or _amt>_free: block.append(f"R10 funds: premium Rs {_amt:,.0f} > {broker} free funds Rs {max(_free,0):,.0f} - buy refused")
+                elif _kind in ("stock_options","index_options","index_bees"):
+                    def _same(row):
+                        s2=sym_of(row); return _cp.classify(s2, row.get("product") or "", row.get("instrument_token") or "")==_kind
+                    _book_orders=orders if broker=="upstox" else kord
+                    _used=_cp.premium_exposure([p for p in pos if _same(p)], [o for o in _book_orders if _same(o)])
+                    if _used is None:
+                        block.append(f"R10: {_kind} premium is unreadable - buy refused")
+                    else:
+                        _fit=_cp.fit(_kind, capital if capital else None, _used, px*(adj if adj else qty))
+                        if not _fit["ok"]:
+                            block.append("R10: "+_fit["reason"])
+            else:
+                # Pre-9 Nov warning only. This combined line is not a stock-option budget.
+                mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
+                fno_lim=min(capital*0.5,capital-mtf_total)
+                fno_used=sum(float(p.get("average_price") or p.get("buy_price") or 0)*int(p.get("quantity") or 0) for p in pos if int(p.get("quantity") or 0)>0 and (is_opt(sym_of(p)) or sym_of(p).endswith("FUT")))
+                if fno_used+px*qty>fno_lim: flags.append(f"R10 WARNING: F&O deployed Rs {fno_used+px*qty:,.0f} > legacy combined F&O line Rs {max(fno_lim,0):,.0f} (not a stock-option budget)")
     # rule 5
     if opt and ot in("MARKET","SL-M"): block.append(f"R5: {ot} not allowed on options - use LIMIT/SL")
     if side=="SELL":

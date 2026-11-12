@@ -95,9 +95,10 @@ def _ratios(broker, symbols):
 
 
 def mtf_room(broker):
-    """Room on the caps that actually apply, counting only my own names, each at its own margin rate."""
+    """Room on the caps that actually apply. Before 9 Nov that is bot-tagged names.
+    From 9 Nov it is every positive MTF name, with the 20/20/40 pools."""
     try:
-        st = ms.state_mine(broker)
+        st = ms.cap_state(broker)
     except Exception as e:
         return {'ok': False, 'why': f'{type(e).__name__}: {e}'}
     cap = float(st['capital'])
@@ -107,18 +108,33 @@ def mtf_room(broker):
     used_m = sum(cost * ratios.get(s_, 0.245) for s_, cost in held.items())
     if unknown:                               # fallback ratio, flagged so the number is not trusted blindly
         used_m += sum(cost * 0.245 for s_, cost in held.items() if s_ in unknown)
-    per = 0.10 * cap
-    total = 0.50 * cap
+    per = ms.per_stock_cap() * cap
+    total = ms.total_cap() * cap
     room_total = max(total - used_m, 0.0)
     slots = ms.slots(broker)
-    return {'ok': True, 'capital': round(cap), 'free': round(float(st.get('free') or 0)),
-            'mine': sorted(held), 'mine_count': len(held),
-            'not_mine': sorted((st.get('not_mine') or {}).keys()),
-            'mtf_used_cost': round(used), 'mtf_used_margin': round(used_m),
-            'margin_ratios': ratios, 'ratio_unknown': unknown,
-            'per_stock_cap': round(per), 'total_cap': round(total),
-            'room_total': round(room_total), 'room_half': round(room_total * 0.5),
-            'slots_cap': slots.get('cap'), 'free_slots': slots.get('free_slots')}
+    out = {'ok': True, 'capital': round(cap), 'free': round(float(st.get('free') or 0)),
+           'mine': sorted(held), 'mine_count': len(held),
+           'not_mine': sorted((st.get('not_mine') or {}).keys()),
+           'mtf_used_cost': round(used), 'mtf_used_margin': round(used_m),
+           'margin_ratios': ratios, 'ratio_unknown': unknown,
+           'per_stock_cap': round(per), 'total_cap': round(total),
+           'room_total': round(room_total), 'room_half': round(room_total * 0.5),
+           'slots_cap': slots.get('cap'), 'free_slots': slots.get('free_slots')}
+    if ms._monday():
+        out['policy'] = 'monday-2026-11-09'
+        out['mtf_fraction'] = 0.25
+        out['shared_pool'] = True
+        out['names'] = sorted((st.get('qty') or held).keys()) if isinstance(st.get('qty'), dict) else sorted(held)
+        if st.get('capital_verified') is False:
+            out['initial_pool'] = None
+            out['add_pool'] = None
+            out['note'] = ('MTF initial and adds share one 25% pool. Rupee room is not computed: '
+                           'the funds figure is margin capacity, not verified capital.')
+        else:
+            out['initial_pool'] = round(0.25 * cap)
+            out['add_pool'] = round(0.25 * cap)
+            out['note'] = 'MTF initial and adds share one 25% pool'
+    return out
 
 
 def positions():

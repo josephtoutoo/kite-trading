@@ -39,6 +39,12 @@ def series(key, unit, days):
     cs = ind.candles(key, unit, 1, days)
     import datetime as dt
     if unit=='hours' and cs and dt.datetime.fromisoformat(cs[-1][0])+dt.timedelta(hours=1)>dt.datetime.now().astimezone(): cs=cs[:-1]
+    if unit=='days':
+        import mtf_policy as _pol
+        closed, why = _pol.completed_daily_candles(cs, dt.datetime.now(_pol.IST))
+        if not closed:
+            raise RuntimeError(why or 'no completed daily session')
+        cs = closed
     h=[x[2] for x in cs]; l=[x[3] for x in cs]; c=[x[4] for x in cs]
     st,d = ind.supertrend(h,l,c); e = ind.ema(c,20); pdi,mdi,adx = ind.dmi(h,l,c); m,s,hist = ind.macd(c)
     return dict(h=h,l=l,c=c,st=st,d=d,e=e,pdi=pdi,mdi=mdi,adx=adx,hist=hist,ts=cs[-1][0])
@@ -58,8 +64,17 @@ def analyze(key):
     if H['d'][-1]==1 and -1 in H['d'][-4:-1]: turn.append('1h ST reclaimed')
     last=hc[-1]
     stops=[x for x in (H['st'][-1] if H['d'][-1]==1 else None, D['e'][-1]) if x and x<last]
+    try:
+        import mtf_policy as _pol
+        eligible, why_trend = _pol.trend_ok({
+            'timeframe': 'day', 'incomplete': False,
+            'close': c, 'ema20': D['e'][-1], 'dir': D['d'][-1], 'hist': D['hist'][-1],
+            'pdi': D['pdi'][-1], 'mdi': D['mdi'][-1], 'adx': D['adx'][-1]})
+    except Exception as exc:
+        eligible, why_trend = False, ['trend unreadable: %s' % type(exc).__name__]
     return dict(last=round(last,2), d_up=up, d_adx=round(D['adx'][-1],1), d_ema20=round(D['e'][-1],2), d_st=round(D['st'][-1],2),
         h_st=round(H['st'][-1],2), h_dir=H['d'][-1], h_rsi=round(r[-1],1), h_macd_hist=round(H['hist'][-1],2),
+        eligible=eligible, trend=why_trend,
         pullback=why, turn=turn, stop=round(max(stops),2) if stops else None, bar=H['ts'])
 def upstox_side(km):
     out=[]; f=get('/v2/user/get-funds-and-margin')['data']['equity']; cap=f['available_margin']+f['used_margin']
@@ -112,7 +127,7 @@ def main():
             if r['add_qty']>0:
                 try:
                     import mtf_sizing as ms
-                    g=ms.size(p['broker'],p['sym'],last,mode='add')
+                    g=ms.size(p['broker'],p['sym'],last,mode='add', trend_ok=a.get('eligible') is True, in_loss=pnl < -0.5)
                     if g['qty']<r['add_qty']:
                         r['add_qty']=g['qty']; r['margin_limited']=True
                     r['margin_req']=g.get('margin'); r['leverage']=g.get('leverage')
@@ -123,14 +138,34 @@ def main():
         elif not a['pullback']: v,n='HOLD','trend up, no pullback'
         elif not a['turn']: v,n='WAIT','pullback, no turn up yet'
         else: v,n='ADD','pullback + turn up'
+        try:
+            import mtf_policy as _pol
+            if _pol.policy_active() and v == 'ADD' and not a.get('eligible'):
+                v, n = 'NO', 'Monday trend gate closed — not averaging'
+            if _pol.policy_active() and v == 'ADD' and pnl < -0.5:
+                v, n = 'NO', 'not averaging a loser'
+        except Exception:
+            if v == 'ADD':
+                v, n = 'NO', 'Monday policy module missing — no add'
         if v=='ADD' and r['add_qty']==0: n='at cap - no add'
         if v=='ADD' and r['add_qty'] is None: n+=' (capital unknown, size n/a)'
         r.update(verdict=v,note=n); rows.append(r)
     res=dict(read_only=True,capital=caps,mtf_used={b:round(x) for b,x in used.items()},rows=rows,notes=notes)
     if JS: print(json.dumps(res,default=str)); return
     print(f"READ ONLY. Capital upstox={ucap and round(ucap)} kite={kcap and round(kcap)} | MTF used {res['mtf_used']}")
+    try:
+        import mtf_policy as _pol
+        _mon = _pol.policy_active()
+    except Exception:
+        _mon = False
+    if _mon:
+        print(_pol.POLICY_TEXT)
     for b,c in caps.items():
-        if c: room=max(TOT*c-used[b],0); print(f"{b}: MTF used {used[b]:,.0f} / budget {TOT*c:,.0f} | new-entry cap {room/2:,.0f} | pullback reserve {room/2:,.0f}")
+        if not c: continue
+        if _mon:
+            print(f"{b}: MTF cost {used[b]:,.0f} | shared 25% pool {_pol.TOTAL*c:,.0f} (initial and adds; other buckets are not added). Rupees use the caller's capital figure.")
+        else:
+            room=max(TOT*c-used[b],0); print(f"{b}: MTF used {used[b]:,.0f} / budget {TOT*c:,.0f} | new-entry cap {room/2:,.0f} | pullback reserve {room/2:,.0f}")
     for n in notes: print('NOTE:',n)
     print(f"{'BRK':<6}{'SYM':<11}{'QTY':>5}{'AVG':>9}{'LAST':>9}{'P&L%':>7} {'D':<4}{'ADDQ':>5}{'STOP':>9}{'TGT':>9}  VERDICT")
     for r in rows:

@@ -10,6 +10,11 @@ def a(side='CE', adx=30):
     return dict(close=110 if side == 'CE' else 90, ema20=100, dir=1 if side == 'CE' else -1,
                 adx=adx, prev_adx=adx-1, hist=1 if side == 'CE' else -1, pdi=30 if side == 'CE' else 10,
                 mdi=10 if side == 'CE' else 30)
+assert tech.TECHNICAL_PAUSED is True
+import stockopt_add as add
+import stockopt_policy as pol
+assert add.ADD_PAUSED is True and pol.ADD_EXECUTION_ENABLED is False
+assert exits.ENTRY_GRANTS_REPLACEMENT is False
 assert tech.signal(a())[0] == 'CE'
 assert tech.signal(a('PE'))[0] == 'PE'
 assert tech.signal(a(adx=24))[0] is None

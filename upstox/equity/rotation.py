@@ -48,7 +48,18 @@ def score(key):
     dist = 100*(h['close']-h['ema20'])/h['ema20']
     s = h['adx'] + 1000*h['hist']/h['close'] + 2*dist + (15 if upd else -15)
     if not up1h: s -= 40
+    # `strong` and `score` stay the pre-Monday 1h ranking used by the pre-market picker.
+    # From 9 Nov, MTF entry and adds use only the completed daily qualification.
+    eligible, why, dscore = False, [], None
+    try:
+        import mtf_policy as pol
+        if pol.policy_active():
+            q = pol.qualify_symbol(key)
+            eligible, why, dscore = bool(q.get('eligible')), list(q.get('reasons') or []), q.get('score')
+    except Exception as exc:
+        eligible, why = False, ['daily trend unreadable: %s' % type(exc).__name__]
     return dict(close=h['close'], adx=h['adx'], hist=h['hist'], dist=round(dist,2), up1h=up1h, upd=upd,
+                pdi=h.get('pdi'), mdi=h.get('mdi'), eligible=eligible, why=why, daily_score=dscore,
                 strong=up1h and upd, score=round(s,1))
 def scan(symbols=None, sleep=0.15):
     """Rank NIFTY100 names by the same technical score; returns strong candidates only.
@@ -96,6 +107,33 @@ def main():
     print("Cap check: 5 x 10% = 50% MTF budget (no conflict).")
     print("\nHOLDINGS (ranked)"); [print(f" {h['sym']:<10} qty {h['qty']} val {h['value']:,} score {h['score']} adx {h['adx']} dist {h['dist']}% 1h {'UP' if h['up1h'] else 'DOWN'} D {'UP' if h['upd'] else 'DOWN'}") for h in H]
     print("\nTOP CANDIDATES"); [print(f" {c['sym']:<10} {c['close']} score {c['score']} adx {c['adx']} dist {c['dist']}%") for c in C[:8]]
+    try:
+        import mtf_policy as pol
+        monday = pol.policy_active()
+    except Exception as exc:
+        print('rotation: Monday policy module missing (%s). No rotation and no new name.' % exc)
+        return
+    if monday:
+        print(pol.POLICY_TEXT)
+        print('No rotation and no trim because a rank changed. Over-cap names are reported, not sold.')
+        if len(H) > pol.MAX_NAMES:
+            print('OVER NAMES %s/%s. Reporting only; not liquidating.' % (len(H), pol.MAX_NAMES))
+        print('\nHOLDINGS ranked for adds (completed daily score; ties by symbol)')
+        ranked_h = sorted(H, key=lambda row: (-(row.get('daily_score') if row.get('daily_score') is not None else -1e18), row['sym']))
+        for h in ranked_h:
+            if h.get('eligible'):
+                print('  eligible add %s daily score %s' % (h['sym'], h.get('daily_score')))
+            else:
+                print('  NO ADD %s: %s' % (h['sym'], '; '.join(h.get('why') or ['daily trend gate'])))
+        eligible = sorted([c for c in C if c.get('eligible') and c.get('daily_score') is not None],
+                          key=lambda row: (-row['daily_score'], row['sym']))
+        print('\nNEW NAMES ranked by the completed daily score. Maximum %s, not a quota.' % pol.MAX_NAMES)
+        if not eligible:
+            print('  none — spare slots stay empty')
+        for c in eligible[:pol.MAX_NAMES]:
+            print('  %s daily score %s' % (c['sym'], c.get('daily_score')))
+        print('\nOrders are not placed here. The ranker chooses; it does not ask for a manual list.')
+        return
     acts = []; keep = list(H)
     while len(keep) > MAXN:
         w = keep.pop(); acts.append(f"CLOSE {w['sym']} all {w['qty']} (over 5 holdings, weakest)")

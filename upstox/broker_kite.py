@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Kite (Zerodha) broker adapter for the Upstox automation (4 Nov 2026).
-- Token: /workspace/kite/token.json {"access_token"} ; api key from env KITE_API_KEY. Never printed.
-- All Kite API calls go through UPSTOX_PROXY_URL (static IP). If token/key/proxy invalid -> valid()=False and
+- Token: /workspace/kite/token.json {"access_token"} ; api key from env KITE_API_KEY, else the api_key query param in /workspace/kite/login_url.txt. Never printed.
+- Kite API calls use UPSTOX_PROXY_URL when that env var is set. If token/key invalid -> valid()=False and
   every write/read helper no-ops (returns None / []), so callers never break.
 - Orders: LIMIT (or SL for stops) only, NRML for options, tag auto_entry by default. MARKET/SL-M refused.
 - Symbol map: Upstox instrument_key (e.g. NSE_FO|50978) <-> Kite tradingsymbol via exchange_token, using the
@@ -27,12 +27,27 @@ _reads={}          # ('orders'|'positions'|'holdings') -> (expires_at, value)
 _idx={}
 def log(msg):
     with open(os.path.join(D,"kite_broker.log"),"a") as f: f.write(f"{datetime.datetime.now(IST):%Y-%m-%d %H:%M:%S} {msg}\n")
+def api_key():
+    """KITE_API_KEY, or the api_key param in login_url.txt. Populates the env var for this process only. Never logged."""
+    k=(os.environ.get("KITE_API_KEY") or "").strip()
+    if not k:
+        try:
+            from urllib.parse import urlparse, parse_qs
+            q=parse_qs(urlparse(open(os.environ.get("KITE_LOGIN_URL_FILE","/workspace/kite/login_url.txt")).read().strip()).query)
+            k=((q.get("api_key") or [""])[0] or "").strip()
+        except Exception:
+            k=""
+        if k and not os.environ.get("KITE_API_KEY"):
+            os.environ["KITE_API_KEY"]=k
+    return k
 def client():
     global _k
     if _k is None:
         from kiteconnect import KiteConnect
+        key=api_key()
+        if not key: raise RuntimeError("KITE_API_KEY not set")
         px=os.environ.get("UPSTOX_PROXY_URL")
-        _k=KiteConnect(api_key=os.environ["KITE_API_KEY"],proxies={"https":px,"http":px} if px else None,timeout=20)
+        _k=KiteConnect(api_key=key,proxies={"https":px,"http":px} if px else None,timeout=20)
         _k.set_access_token(json.load(open(TOKF))["access_token"])
     return _k
 def valid():
@@ -40,8 +55,7 @@ def valid():
     global _valid,_why
     if _valid is None:
         try:
-            if not os.environ.get("KITE_API_KEY"): raise RuntimeError("KITE_API_KEY not set")
-            if not os.environ.get("UPSTOX_PROXY_URL"): raise RuntimeError("UPSTOX_PROXY_URL not set (static IP needed)")
+            if not api_key(): raise RuntimeError("KITE_API_KEY not set")
             client().profile(); _valid=True; _why="ok"
         except Exception as e:
             _valid=False; _why=f"{type(e).__name__}: {str(e)[:150]}"; log("kite invalid: "+_why)
@@ -113,11 +127,15 @@ def _positions(strict=False):
         return []
     out=[]
     for p in net:
-        out.append({"broker":"kite","trading_symbol":p["tradingsymbol"],"exchange":p["exchange"],
+        row={"broker":"kite","trading_symbol":p["tradingsymbol"],"tradingsymbol":p["tradingsymbol"],"exchange":p["exchange"],
             "instrument_token":"KITE|%s|%s"%(p["exchange"],p["tradingsymbol"]),"quantity":int(p["quantity"]),
             "average_price":float(p.get("average_price") or 0),"buy_price":float(p.get("buy_price") or 0),"last_price":float(p.get("last_price") or 0),
             "pnl":float(p.get("pnl") or 0),"realised":float(p.get("realised") or 0),"unrealised":float(p.get("unrealised") or 0),
-            "product":p.get("product"),"upstox_key":None})
+            "product":p.get("product"),"upstox_key":None}
+        for src, dst in (("day_buy_quantity","day_buy_quantity"),("day_sell_quantity","day_sell_quantity"),
+                         ("overnight_quantity","overnight_quantity")):
+            if src in p and p.get(src) is not None: row[dst]=int(p.get(src) or 0)
+        out.append(row)
     return out
 def holdings():
     """Kite holdings normalized: MTF shares carry product MTF, delivery shares CNC. Used by trade_lock R8."""

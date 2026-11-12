@@ -76,6 +76,19 @@ def main():
     print("Cap check: 5 x 10% = 50% MTF budget (no conflict).")
     print("\nHOLDINGS (ranked)"); [print(f" {h['sym']:<10} qty {h['qty']} val {h['value']:,} score {h['score']} adx {h['adx']} dist {h['dist']}% 1h {'UP' if h['up1h'] else 'DOWN'} D {'UP' if h['upd'] else 'DOWN'}") for h in H]
     print("\nTOP CANDIDATES"); [print(f" {c['sym']:<10} {c['close']} score {c['score']} adx {c['adx']} dist {c['dist']}%") for c in C[:8]]
+    try:
+        sys.path.insert(0, '/workspace/equity')
+        import mtf_policy as pol
+        if pol.policy_active():
+            print(pol.POLICY_TEXT)
+            print('No forced rotation or trim because a rank changed.')
+            if len(H) > pol.MAX_NAMES:
+                print('OVER NAMES %s/%s. Reporting only; not liquidating.' % (len(H), pol.MAX_NAMES))
+            print('Orders are not placed here. equity/mtf_refill.py plans a name only when both brokers pass.')
+            return
+    except Exception as exc:
+        print('rotation: Monday policy unavailable (%s). Not proposing trims.' % exc)
+        return
     acts = []; keep = list(H)
     while len(keep) > MAXN:
         w = keep.pop(); acts.append(f"CLOSE {w['sym']} all {w['qty']} (over 5 holdings, weakest)")

@@ -11,7 +11,12 @@ cancels or sells.
 
 TATASTEEL's expected date is Sat 2026-11-07, so its due session is Fri 6 Nov.
 Schedule every 5 minutes from 15:10 through 15:20 IST; repeat runs see flat books.
+
+This file only sells. A results_entry BUY is not an exception to the shared
+3-name cap or the replacement gate in trade_lock R11, and it is not an exception
+to the add rule in stockopt_add.py. Nothing here grants that authority.
 """
+ENTRY_GRANTS_REPLACEMENT = False
 import argparse, datetime as dt, json, os, sys, urllib.parse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)

@@ -7,7 +7,13 @@ close<EMA20 & ST red). Intact -> target += entry*0.20, stop floor = target two s
 at LTP*0.995 for live qty. Long futures: 1.5% trail from high, target step +2%.
 Only acts 09:15-15:25 IST Mon-Fri. Cancels leftover SELL SL orders on contracts with no long position.
 MTF: not managed here any more (5 Nov) - equity/upstox_mtf_stops.py owns MTF stops (plain protective only, no trail).
+Trend-stop policy (trend_stop_policy.py) is off. TREND_STOP_POLICY=1 only adds a log note.
+It does not change the trigger, the quantity, or cancel the disaster stop.
 Kite (4 Nov): also manages Kite long options/futures (Upstox LTP+trend, Kite SL/LIMIT orders); no-op if Kite token invalid.
+Full auto (12 Nov 2026, user-authorized): full_auto_policy.flag("trend_exit") (env FULL_AUTO_TREND_EXIT=1 or
+full_auto_flags.json) replaces the 5m index-option trend exit with a COMPLETED 1h Supertrend-flip exit for every
+long option (index, stock, MCX), and lifts option stops on an upward-only ladder (breakeven at +15%, then the
+target two steps back). Every exit SELL re-reads the broker quantity first and is capped to it.
 --dry-run: read-only, prints intended actions, ignores time window, writes no state."""
 import json,os,sys
 sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
@@ -116,7 +122,47 @@ def trend_ok(sym):
     up=a["close"]>a["ema20"] and a["dir"]==1; dn=a["close"]<a["ema20"] and a["dir"]==-1
     ok=dn if sym.endswith("PE") else up
     return ok,f"{u} {iv}m@{a['last_ts'][11:16]} close {a['close']} ema20 {a['ema20']} ST {'green' if a['dir']==1 else 'red'}"
+def _note_trend_policy(info, sym, fut, avg, ltp, stop, q):
+    """Annotation only. The stop already computed above is what gets sent."""
+    if os.environ.get("TREND_STOP_POLICY", "") != "1":
+        return
+    try:
+        import trend_stop_policy as tsp
+        info["trend_policy"] = tsp.review(sym, fut=fut, entry=avg, ltp=ltp, existing_stop=stop, qty=q)
+        info["trend_policy"]["orders_changed"] = False
+        info["trend_policy"]["cancel_disaster_stop"] = False
+    except Exception as e:
+        info["trend_policy"] = {"orders_changed": False, "cancel_disaster_stop": False, "error": type(e).__name__}
 def isfut(sym): return sym.endswith("FUT")
+# ---- full auto (12 Nov 2026) ----
+try:
+    import full_auto_policy as fap
+    FA_TREND=fap.flag("trend_exit")
+    FA_LADDER=fap.flag("stop_ladder")
+except Exception as _fe:
+    fap=None; FA_TREND=False; FA_LADDER=False
+    print(f"risk_manager: full_auto_policy unavailable, legacy exits only: {type(_fe).__name__}: {_fe}",file=sys.stderr)
+_H1={}
+def h1_bar(sym):
+    """Completed 1h bar of the option's underlying (cached per underlying for this run)."""
+    try:
+        import full_auto_feed as faf
+        u=faf.root(sym)
+        if u not in _H1: _H1[u]=faf.underlying_1h(sym)
+        return _H1[u]
+    except Exception as e:
+        return None,f"{type(e).__name__}: {e}"
+def opt_side(sym): return "PE" if sym.endswith("PE") else ("CE" if sym.endswith("CE") else None)
+def upstox_live_qty(k):
+    """Fresh broker read of the open quantity for one instrument. None when the read fails."""
+    r=req("https://api.upstox.com/v2/portfolio/short-term-positions")
+    if r.get("status")!="success": return None
+    return sum(int(x.get("quantity") or 0) for x in (r.get("data") or []) if x.get("instrument_token")==k)
+def kite_live_qty(bk,sym):
+    try:
+        bk.forget(); return sum(int(x["quantity"]) for x in bk.positions(strict=True) if x["trading_symbol"]==sym)
+    except Exception: return None
+FA_NOTE={"trend_exit_1h":FA_TREND,"stop_ladder":FA_LADDER}
 for p in pos:
     sym=p["trading_symbol"]; q=int(p.get("quantity") or 0)
     if not (isopt(sym) or isfut(sym)) or q<=0: continue
@@ -142,15 +188,29 @@ for p in pos:
     # is 15% above entry the exit also follows the underlying 5m trend (CE sold when close<EMA20 with
     # Supertrend red, PE the opposite), so winners run. Stock options and futures keep the plain % stop.
     INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
-    ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
-    if INDEX_OPT and s["high"]>=avg*1.15 and not ok:
+    _fa_exit=None
+    if FA_TREND and not fut:
+        _b,_berr=h1_bar(sym)
+        if _b is None: ok,why=True,"1h bar unavailable ("+str(_berr)+"); fixed stop kept"
+        else:
+            _fx,_fw=fap.trend_exit_1h(opt_side(sym),_b,s)
+            ok,why=(not _fx),f"{_fw} (1h {_b['key']} @{str(_b['ts'])[11:16]} ST {'green' if _b['dir']==1 else 'red'})"
+            if _fx: _fa_exit="TREND_EXIT_1H"
+    else:
+        ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
+        if INDEX_OPT and s["high"]>=avg*1.15 and not ok: _fa_exit="TREND_EXIT"
+    if _fa_exit:
         gok,gdet=_gtt_clear("upstox",sym,key=k)
         if not gok:
             acts.append({"sym":sym,"action":"GTT_FAIL","why":f"overnight GTT not cancelled, trend exit not sent: {gdet}"}); continue
         for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
+        _live=upstox_live_qty(k)   # oversell guard: a stop may have filled while it was being cancelled
+        qx=q if _live is None else (fap.capped_sell(q,_live) if fap else min(q,max(_live,0)))  # unreadable -> old R8-capped q, never naked
+        if qx<=0:
+            acts.append({"sym":sym,"action":_fa_exit+"_SKIPPED","why":f"broker quantity now {_live}; nothing left to sell","trend":why}); continue
         lim=_tk(ltp*0.995)
-        r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":q,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
-        acts.append({"sym":sym,"action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"pnl_est":round((lim-avg)*q),"resp":r.get("status"),"err":r.get("body")})
+        r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":qx,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
+        acts.append({"sym":sym,"action":_fa_exit,"qty":qx,"broker_qty":_live,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"pnl_est":round((lim-avg)*qx),"resp":r.get("status"),"err":r.get("body")})
         continue
     # 5 Nov (audit #8): the target roll used to raise the stop floor above entry, i.e. a trailing stop.
     # That contradicts the rule for options (t288u): a FIXED 30% stop under entry that never trails from
@@ -163,11 +223,26 @@ for p in pos:
                      "stop_floor_moved":bool(fut)})
     if True:
         # 30% fixed floor under entry (never lowered); floor rises only when a target rolls
+        if FA_LADDER and not fut: floor=max(floor,fap.ladder_floor(s.get("entry",avg),s["high"]))  # upward-only ladder
         stop=_tk(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
+        if FA_LADDER and not fut and stop>=ltp and stop>avg*(1-TRAIL)+1e-6:
+            # the ladder stop is already through the market: sell instead of placing a looser stop
+            gok,gdet=_gtt_clear("upstox",sym,key=k)
+            if not gok:
+                acts.append({"sym":sym,"action":"GTT_FAIL","why":f"overnight GTT not cancelled, stop-breach exit not sent: {gdet}"}); continue
+            for o in sls: write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
+            _live=upstox_live_qty(k); qx=q if _live is None else fap.capped_sell(q,_live)
+            if qx<=0:
+                acts.append({"sym":sym,"action":"STOP_BREACH_EXIT_SKIPPED","why":f"broker quantity now {_live}"}); continue
+            lim=_tk(ltp*0.995)
+            r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":qx,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
+            acts.append({"sym":sym,"action":"STOP_BREACH_EXIT","qty":qx,"broker_qty":_live,"ladder_stop":stop,"ltp":ltp,"limit":lim,"resp":r.get("status"),"err":r.get("body")})
+            continue
         if stop>=ltp: stop=_tk(ltp*(0.995 if fut else 0.97))
         else: s["stop"]=stop  # ratchet: never lowered
         lim=_tk(stop*(0.99 if fut else 0.95))
         info={"sym":sym,"qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
+        _note_trend_policy(info, sym, fut, avg, ltp, stop, q)
         if not sls:
             gok,gdet=_gtt_clear("upstox",sym,key=k)
             if not gok:
@@ -258,15 +333,29 @@ try:
             for o in sls[1:]: kacts.append({"sym":sym,"broker":"kite","action":"CANCEL_DUP_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
             sls=sls[:1]; floor=0
             INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
-            ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
-            if INDEX_OPT and s["high"]>=avg*1.15 and not ok:
+            _fa_exit=None
+            if FA_TREND and not fut:
+                _b,_berr=h1_bar(sym)
+                if _b is None: ok,why=True,"1h bar unavailable ("+str(_berr)+"); fixed stop kept"
+                else:
+                    _fx,_fw=fap.trend_exit_1h(opt_side(sym),_b,s)
+                    ok,why=(not _fx),f"{_fw} (1h {_b['key']} @{str(_b['ts'])[11:16]} ST {'green' if _b['dir']==1 else 'red'})"
+                    if _fx: _fa_exit="TREND_EXIT_1H"
+            else:
+                ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
+                if INDEX_OPT and s["high"]>=avg*1.15 and not ok: _fa_exit="TREND_EXIT"
+            if _fa_exit:
                 gok,gdet=_gtt_clear("kite",sym)
                 if not gok:
                     kacts.append({"sym":sym,"broker":"kite","action":"GTT_FAIL","why":f"overnight GTT not cancelled, trend exit not sent: {gdet}"}); continue
                 for o in sls: bk.cancel(o["order_id"],dry=DRY)
+                _live=kite_live_qty(bk,sym)   # oversell guard
+                qx=q if _live is None else (fap.capped_sell(q,_live) if fap else min(q,max(_live,0)))  # unreadable -> old R8-capped q, never naked
+                if qx<=0:
+                    kacts.append({"sym":sym,"broker":"kite","action":_fa_exit+"_SKIPPED","why":f"broker quantity now {_live}; nothing left to sell","trend":why}); continue
                 lim=tick(ltp*0.995)
-                r=bk.place(ex,sym,"SELL",q,lim,tag="target_book",product=p["product"],dry=DRY)
-                kacts.append({"sym":sym,"broker":"kite","action":"TREND_EXIT","qty":q,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"resp":r})
+                r=bk.place(ex,sym,"SELL",qx,lim,tag="target_book",product=p["product"],dry=DRY)
+                kacts.append({"sym":sym,"broker":"kite","action":_fa_exit,"qty":qx,"broker_qty":_live,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"resp":r})
                 continue
             while ltp>=s["target"]:
                 prev=s["target"]; s["target"]=round(prev+avg*STEP,2)
@@ -274,11 +363,24 @@ try:
                 kacts.append({"sym":sym,"broker":"kite","action":"ROLL_TARGET","from":prev,"to":s["target"],
                               "trend":why,"stop_floor_moved":bool(fut)})
             if True:
+                if FA_LADDER and not fut: floor=max(floor,fap.ladder_floor(s.get("entry",avg),s["high"]))  # upward-only ladder
                 stop=tick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
+                if FA_LADDER and not fut and stop>=ltp and stop>avg*(1-TRAIL)+1e-6:
+                    gok,gdet=_gtt_clear("kite",sym)
+                    if not gok:
+                        kacts.append({"sym":sym,"broker":"kite","action":"GTT_FAIL","why":f"overnight GTT not cancelled, stop-breach exit not sent: {gdet}"}); continue
+                    for o in sls: bk.cancel(o["order_id"],dry=DRY)
+                    _live=kite_live_qty(bk,sym); qx=q if _live is None else fap.capped_sell(q,_live)
+                    if qx<=0:
+                        kacts.append({"sym":sym,"broker":"kite","action":"STOP_BREACH_EXIT_SKIPPED","why":f"broker quantity now {_live}"}); continue
+                    lim=tick(ltp*0.995)
+                    kacts.append({"sym":sym,"broker":"kite","action":"STOP_BREACH_EXIT","qty":qx,"broker_qty":_live,"ladder_stop":stop,"ltp":ltp,"limit":lim,"resp":bk.place(ex,sym,"SELL",qx,lim,tag="target_book",product=p["product"],dry=DRY)})
+                    continue
                 if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))
                 else: s["stop"]=stop
                 lim=tick(stop*(0.99 if fut else 0.95))
                 info={"sym":sym,"broker":"kite","qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
+                _note_trend_policy(info, sym, fut, avg, ltp, stop, q)
                 if not sls:
                     gok,gdet=_gtt_clear("kite",sym)
                     if not gok:
@@ -296,4 +398,4 @@ try:
                 kacts.append({"sym":o["trading_symbol"],"broker":"kite","action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
 except Exception as e: kacts.append({"action":"KITE_ERROR","why":f"{type(e).__name__}: {e}"})
 if not DRY: json.dump(st,open(SF,"w"))
-print(json.dumps({"dry_run":DRY,"now":now.strftime("%Y-%m-%d %H:%M IST"),"breaker":breaker,"actions":acts,"kite_actions":kacts},indent=1))
+print(json.dumps({"dry_run":DRY,"now":now.strftime("%Y-%m-%d %H:%M IST"),"full_auto":FA_NOTE,"breaker":breaker,"actions":acts,"kite_actions":kacts},indent=1))

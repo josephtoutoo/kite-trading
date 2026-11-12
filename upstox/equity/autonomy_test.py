@@ -16,6 +16,7 @@ import datetime, json, os, sys, tempfile, types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, '/workspace/upstox')
 import autonomy as A
 import mtf_sizing as ms
@@ -59,7 +60,7 @@ def test_active_dates():
 # ================================================================ b) the values
 def test_override_values():
     want = {'INDEX_OPT_MAX': 6, 'INDEX_OPT_GAP_MIN': 20, 'INDEX_OPT_EXPIRY_CUTOFF': '13:00',
-            'INDEX_OPT_LOSS': 6000, 'WINDOW_MIN': 15, 'STOCK_OPT_MAX_UND': 4,
+            'INDEX_OPT_LOSS': 6000, 'WINDOW_MIN': 15, 'STOCK_OPT_MAX_UND': 3,
             'STOCK_OPT_MAX_LOTS': 2, 'MTF_PER_STOCK': 0.12, 'MTF_TOTAL': 0.50}
     o = A.overrides('2026-11-05T09:05')
     for k, v in want.items():
@@ -279,30 +280,69 @@ def test_r1_cap_six():
     check('5 Nov: the 6th NIFTY decision is allowed', ok2, str(reasons2))
 
 
+def _ms(day):
+    """Epoch milliseconds at 15:30 IST. A fixture stamp, not an exchange expiry."""
+    ist = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    return int(datetime.datetime(day.year, day.month, day.day, 15, 30, tzinfo=ist).timestamp() * 1000)
+
+
+# Synthetic master: one SENSEX option dated 5 Nov and one NIFTY option dated 9 Nov.
+# These dates are not a claim about what the exchange listed. The public master on
+# 6 Nov 2026 no longer contains expired 5 Nov contracts.
+SYNTHETIC_EXPIRY_ROWS = [
+    {'instrument_type': 'CE', 'underlying_symbol': 'SENSEX', 'name': 'SENSEX', 'expiry': _ms(datetime.date(2026, 11, 5))},
+    {'instrument_type': 'CE', 'underlying_symbol': 'NIFTY', 'name': 'NIFTY', 'expiry': _ms(datetime.date(2026, 11, 9))},
+]
+
+
 # ================================================================ f) expiry-day 13:00 cutoff (new)
 def test_expiry_cutoff():
-    # SENSEX expires 2026-11-05 (BSE weekly Thursday); NIFTY's next is 9 Nov.
-    check('_expiry_today(SENSEX, 5 Nov) is True', tl._expiry_today('SENSEX', datetime.datetime(2026, 11, 5, 9, 0)) is True)
-    check('_expiry_today(NIFTY, 5 Nov) is False', tl._expiry_today('NIFTY', datetime.datetime(2026, 11, 5, 9, 0)) is False)
-    check('_expiry_today(SENSEX, 6 Nov) is False', tl._expiry_today('SENSEX', datetime.datetime(2026, 11, 6, 9, 0)) is False)
-    # after 13:00 on the SENSEX expiry day -> refused
-    with Harness():
-        ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 5, 13, 30)))
-    check('5 Nov 13:30 SENSEX (expiry day) refused', not ok, str(reasons))
-    check('5 Nov 13:30 SENSEX refusal names the cutoff', any('13:00' in r for r in reasons), str(reasons))
-    # before 13:00 on the same day -> allowed
-    with Harness():
-        ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 5, 12, 0)))
-    check('5 Nov 12:00 SENSEX (expiry day, before cutoff) allowed', ok, str(reasons))
-    # after 13:00 on a day SENSEX is NOT expiring -> allowed
-    with Harness():
-        ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 6, 13, 30)))
-    check('6 Nov 13:30 SENSEX (not expiry) allowed', ok, str(reasons))
-    # and the cutoff does not exist under the user's rules
-    with Harness():
-        ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 4, 13, 30)))
-    check('4 Nov 13:30 SENSEX allowed (no cutoff in the user rules)',
-          not any('13:00' in r for r in reasons), str(reasons))
+    rows = SYNTHETIC_EXPIRY_ROWS
+    check('synthetic master: SENSEX fixture date matches', tl._expiry_today('SENSEX', datetime.datetime(2026, 11, 5, 9, 0), rows=rows) is True)
+    check('synthetic master: NIFTY fixture date does not match', tl._expiry_today('NIFTY', datetime.datetime(2026, 11, 5, 9, 0), rows=rows) is False)
+    check('synthetic master: SENSEX the next day does not match', tl._expiry_today('SENSEX', datetime.datetime(2026, 11, 6, 9, 0), rows=rows) is False)
+    saved = tl._expiry_rows
+    tl._expiry_rows = rows
+    try:
+        # after 13:00 on the SENSEX expiry day -> refused
+        with Harness():
+            ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 5, 13, 30)))
+        check('5 Nov 13:30 SENSEX (expiry day) refused', not ok, str(reasons))
+        check('5 Nov 13:30 SENSEX refusal names the cutoff', any('13:00' in r for r in reasons), str(reasons))
+        # before 13:00 on the same day -> allowed
+        with Harness():
+            ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 5, 12, 0)))
+        check('5 Nov 12:00 SENSEX (expiry day, before cutoff) allowed', ok, str(reasons))
+        # after 13:00 on a day SENSEX is NOT expiring -> allowed
+        with Harness():
+            ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 6, 13, 30)))
+        check('6 Nov 13:30 SENSEX (not expiry) allowed', ok, str(reasons))
+        # and the cutoff does not exist under the user's rules
+        with Harness():
+            ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 4, 13, 30)))
+        check('4 Nov 13:30 SENSEX allowed (no cutoff in the user rules)',
+              not any('13:00' in r for r in reasons), str(reasons))
+    finally:
+        tl._expiry_rows = saved
+
+
+def test_expiry_master_missing_fails_closed():
+    """No master, or an unreadable one, is not 'not expiry'. The cutoff then refuses."""
+    empty = tempfile.mkdtemp()
+    check('missing master directory returns unknown',
+          tl._expiry_today('SENSEX', datetime.datetime(2026, 11, 6, 9, 0), master_dir=empty) is None)
+    saved = tl._expiry_rows
+    tl._expiry_rows = 'missing'
+    try:
+        check('forced unreadable master returns unknown',
+              tl._expiry_today('SENSEX', datetime.datetime(2026, 11, 6, 13, 30)) is None)
+        with Harness():
+            ok, reasons, _ = tl.check_order(sensex_order(datetime.datetime(2026, 11, 6, 13, 30)))
+        check('unreadable master after 13:00 refuses the buy', not ok, str(reasons))
+        check('the refusal says the calendar is unreadable',
+              any('unreadable' in r for r in reasons), str(reasons))
+    finally:
+        tl._expiry_rows = saved
 
 
 # ================================================================ g) R2a per-index booked loss
@@ -363,31 +403,42 @@ def _fourth_stock_option(day, qty=2000):
 
 
 def test_r11():
-    # 4th underlying
-    for day, want_allowed in (('2026-11-04', False), ('2026-11-05', True), ('2026-11-06', True),
-                              ('2026-11-09', False)):
+    # A fourth underlying is refused on every date, including the old 5-6 Nov grant.
+    for day in ('2026-11-04', '2026-11-05', '2026-11-06', '2026-11-09'):
         holds, order = _fourth_stock_option(day)
+        order['_initial_entry'] = True
         with Harness(positions=holds):
             ok, reasons, adj = tl.check_order(order)
-        check(f'R11 4th stock-option underlying allowed={want_allowed} on {day}', ok == want_allowed,
+        check(f'R11 4th stock-option underlying refused on {day}', ok is False,
               f'allowed={ok} {[r for r in reasons if r.startswith("R11")]}')
-    # 2 lots per underlying: lot 500, ask 2,000
-    for day, want_adj in (('2026-11-04', 500), ('2026-11-05', 1000), ('2026-11-06', 1000),
-                          ('2026-11-09', 500)):
+    # 2 lots per underlying still needs explicit initial-entry authority. Lot 500, ask 2,000.
+    for day, want_adj in (('2026-11-04', 500), ('2026-11-05', 1000), ('2026-11-06', 1000)):
         when = datetime.datetime.fromisoformat(day + 'T10:30')
         order = stock_order('RELIANCE26NOV1300CE', 'NSE_FO|125998', when, qty=2000)
+        order['_initial_entry'] = True
         with Harness():
             ok, reasons, adj = tl.check_order(order)
-        check(f'R11 {day}: 2,000 asked -> {want_adj} allowed', adj == want_adj,
-              f'adj={adj} reasons={[r for r in reasons if r.startswith("R11")]}')
-    # already holding 1 lot: a second lot only fits on the override days
-    for day, want_adj in (('2026-11-04', 0), ('2026-11-05', 500), ('2026-11-09', 0)):
+        check(f'R11 {day}: explicit first name 2,000 asked -> {want_adj}', ok is True and adj == want_adj,
+              f'ok={ok} adj={adj} reasons={[r for r in reasons if r.startswith("R11")]}')
+    when9 = datetime.datetime.fromisoformat('2026-11-09T10:30')
+    with Harness():
+        ok, reasons, adj = tl.check_order(dict(stock_order('RELIANCE26NOV1300CE', 'NSE_FO|125998', when9, qty=500),
+                                               _initial_entry=True))
+    check('9 Nov stock-option buy is refused when capital is only margin capacity',
+          ok is False and any('margin capacity' in r for r in reasons), reasons)
+    when = datetime.datetime.fromisoformat('2026-11-05T10:30')
+    with Harness():
+        ok, reasons, adj = tl.check_order(stock_order('RELIANCE26NOV1300CE', 'NSE_FO|125998', when, qty=500))
+    check('R11 empty book is not a bootstrap', ok is False and any('not a bootstrap' in r for r in reasons),
+          str(reasons))
+    # An add without a tighter-stop proof is refused. The lot cap is not itself an add.
+    for day in ('2026-11-04', '2026-11-05', '2026-11-09'):
         when = datetime.datetime.fromisoformat(day + 'T10:30')
         holds = [_pos('RELIANCE26NOV1300CE', qty=500, key='NSE_FO|125998')]
         with Harness(positions=holds):
             ok, reasons, adj = tl.check_order(stock_order('RELIANCE26NOV1300CE', 'NSE_FO|125998', when, qty=500))
-        check(f'R11 {day}: holding 1 lot -> {want_adj} more', adj == want_adj,
-              f'adj={adj} {[r for r in reasons if r.startswith("R11")]}')
+        check(f'R11 {day}: holding 1 lot is not an add without proof', ok is False,
+              f'ok={ok} adj={adj} {[r for r in reasons if r.startswith("R11")]}')
 
 
 # ================================================================ j) fail-closed reads
@@ -417,13 +468,14 @@ def test_fail_closed():
 # ================================================================ k) MTF caps
 def test_mtf_caps():
     st = {'capital': 1_000_000.0, 'held': {}, 'used': 0.0}
-    for day, want in (('2026-11-04', 100000.0), ('2026-11-05', 120000.0),
-                      ('2026-11-06', 120000.0), ('2026-11-09', 100000.0)):
+    # Per-stock stays 10% except the 5-6 Nov override. The 50% total stays through 8 Nov.
+    # From the morning of 9 Nov the shared pool is 25%; per-stock is not raised.
+    for day, per, total in (('2026-11-04', 100000.0, 500000.0), ('2026-11-05', 120000.0, 500000.0),
+                            ('2026-11-06', 120000.0, 500000.0), ('2026-11-08', 100000.0, 500000.0),
+                            ('2026-11-09', 100000.0, 250000.0)):
         lim = ms.limits(st, 'X', 'new', 1.0, when=day + 'T10:00')
-        check(f'MTF per-stock cap {want:,.0f} on {day}', lim['per_stock'] == want, str(lim['per_stock']))
-        # the 50% total is the same number on every date
-        check(f'MTF total room stays 50% on {day}',
-              lim['room_total'] == 500000.0, str(lim['room_total']))
+        check(f'MTF per-stock cap {per:,.0f} on {day}', lim['per_stock'] == per, str(lim['per_stock']))
+        check(f'MTF total room {total:,.0f} on {day}', lim['room_total'] == total, str(lim['room_total']))
     # per_stock_cap() with no argument reads the wall clock, so assert what it must return for
     # whatever day this runs: 0.12 on an override day, 0.10 on every other day. Pinning it to a
     # fixed number would make this suite fail on 5-6 Nov for the wrong reason.
@@ -432,8 +484,9 @@ def test_mtf_caps():
     check(f'mtf_sizing.per_stock_cap() with no argument is {_want_today} on {_today}',
           ms.per_stock_cap() == _want_today, str(ms.per_stock_cap()))
     check('mtf_sizing.per_stock_cap(5 Nov) is 0.12', ms.per_stock_cap('2026-11-05T10:00') == 0.12)
-    check('mtf_sizing.total_cap never leaves 0.50',
-          ms.total_cap('2026-11-05T10:00') == 0.50 and ms.total_cap('2026-11-09T10:00') == 0.50)
+    check('mtf_sizing.total_cap stays 0.50 through 8 Nov and is 0.25 from 9 Nov',
+          ms.total_cap('2026-11-05T10:00') == 0.50 and ms.total_cap('2026-11-08T10:00') == 0.50
+          and ms.total_cap('2026-11-09T10:00') == 0.25)
     check('MAX_STOCKS (5 per broker)', ms.MAX_STOCKS == 5, str(ms.MAX_STOCKS))
     # the cap really is the binding number: a 110,000 margin order fits 12% and not 10%
     lim5 = ms.limits(st, 'X', 'new', 1.0, when='2026-11-05T10:00')
@@ -461,6 +514,7 @@ def main():
     test_pair_not_counted_twice()
     test_r1_cap_six()
     test_expiry_cutoff()
+    test_expiry_master_missing_fails_closed()
     test_booked_loss()
     test_account_breaker()
     test_r11()
