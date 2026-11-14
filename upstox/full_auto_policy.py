@@ -14,8 +14,8 @@ Rules
   Add      at most one per broker position; open profit (LTP > average) and not past the
            +20% R6 line; the completed 1h underlying bar still aligned (CE: close>EMA20 and
            Supertrend green; PE: the opposite); a broker-acknowledged SELL stop at or above
-           the average price already live; same lots as the entry, never above 3 lots in total
-           (the existing index shape). trade_lock.check_order still re-checks every order.
+           the average price already live; 2 lots per add, clamped so the position stays at
+           or below 6 lots. trade_lock.check_order still re-checks every order.
   Exit     a COMPLETED 1h Supertrend flip against the position, after the position has seen
            the 1h trend on its side at least once. 5m/15m flips are not exits here.
   Stop     upward only. 30% under entry stays the floor. Breakeven once the high is +15%;
@@ -39,7 +39,8 @@ DISASTER = 0.30          # option floor under entry, unchanged
 STEP = 0.20              # target step, unchanged
 BREAKEVEN_AT = 1.15      # high/entry at which the stop moves to entry
 ADD_MAX_RUN = 1.20       # trade_lock R6 refuses an add above avg*1.2
-INDEX_MAX_LOTS = 3       # index_size_policy shape max (1h routes)
+INDEX_MAX_LOTS = 6       # 14 Nov 2026 (t622u): max total lots per broker per index position
+ADD_LOTS = 2             # each add is 2 lots, clamped so held + add <= INDEX_MAX_LOTS
 ADDS_PER_POSITION = 1
 
 
@@ -189,11 +190,13 @@ def add_decision(*, side, avg, ltp, held_qty, lot_size, adds_used, bar_1h, live_
     if float(live_stop_trigger) < avg - 1e-9:
         return no("live stop %.2f is below breakeven %.2f; move the stop first" % (float(live_stop_trigger), avg))
     held_lots = held_qty // lot_size
-    lots = min(held_lots, max_lots - held_lots)
+    lots = min(ADD_LOTS, max(0, max_lots - held_lots))
     if lots < 1:
         return no("already at the %d-lot cap" % max_lots)
-    return {"ok": True, "lots": lots, "qty": lots * lot_size,
-            "reason": "add %d lot%s: in profit, 1h aligned, stop at/above breakeven" % (lots, "" if lots == 1 else "s")}
+    reason = "add %d lot%s: in profit, 1h aligned, stop at/above breakeven" % (lots, "" if lots == 1 else "s")
+    if lots < ADD_LOTS:
+        reason += " (clamped from %d so the %d-lot cap is not exceeded)" % (ADD_LOTS, max_lots)
+    return {"ok": True, "lots": lots, "qty": lots * lot_size, "reason": reason}
 
 
 # ---------------- crude ----------------
