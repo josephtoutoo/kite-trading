@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026; 3 lots/trade from 9 Nov, t327u).
+"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026; first entry 2 lots base / 4 ST-EMA / expiry max(3, trend) from 14 Nov, t620u).
 Run every 5 min by a routine. Acts only 09:20-14:45 IST Mon-Fri (risk_manager handles exits till 15:25).
 Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   CE: close > EMA20 and Supertrend green, previous candle not both; MACD hist > 0; ADX >= 18
   PE: close < EMA20 and Supertrend red,   previous candle not both; MACD hist < 0; ADX >= 18
   (MACD + ADX>=18 filters are there to avoid chop.)
-Option: nearest weekly expiry, ATM strike, qty 3*lot_size on an ordinary trend (trade_lock may halve it).
-STRONG trend (ind.strong: ADX >= 25 AND still rising, price on the Supertrend side of EMA20): qty doubles
-to 4 lots (t295u; switched off from 9 Nov, t327u: every index entry is 3 lots). Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
+Option: nearest weekly expiry, ATM strike, qty 2*lot_size on an ordinary trend (trade_lock may still cap it).
+STRONG / Supertrend-versus-EMA (completed bar with ST strictly beyond EMA20): qty doubles to 4 lots. Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
 14% of signals; the rest -0.016%. trade_lock caps still apply.
 All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product I (fallback D),
 tag auto_entry; cancel if unfilled after 2 min.
-Kite (4 Nov): same signal also buys the same 3 lots NRML LIMIT on Kite when the Kite token is valid (one decision for
+Kite (4 Nov): same signal also buys the same sized lots NRML LIMIT on Kite when the Kite token is valid (one decision for
 the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffected. On fill: trade_lock.record_entry, risk_state.json
 (entry, target +20%, stop -30%), seen_entries.json. One open position per index PER BROKER (t600u, 12 Nov 2026):
 a broker already holding that index is skipped, the other still takes a fresh trigger.
@@ -20,7 +19,7 @@ tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for 
 --dry-run: no orders, no state writes, ignores time window.
 t336u (4 Nov 2026): lot size is no longer fixed. `lots` comes from equity/book_sizing.py, which sizes
 from free capital, the premium actually quoted, the 5m ADX tier, whether the daily trend agrees, the
-expiry-day multiplier and the index-option book's weight. The old 3-lot / 5-on-expiry answer (size_lots)
+expiry-day multiplier and the index-option book's weight. The size_lots fallback (2 lots base, 4 on a strong bar, expiry max(3, trend))
 is kept as the fallback for a missing input or a sizing error, and --fixed-size forces it outright.
 The chosen lots, the reason, and the inputs used are written to r["size"], r["size_lots"] and
 r["size_inputs"]. No cap in trade_lock.py is changed or bypassed - it still re-checks every order."""
@@ -36,7 +35,7 @@ import index_futures as ifut
 import index_contract_policy as icp
 import index_capital_check as icc
 import index_size_policy as isp
-import daily_loss_cap as dlc    # 12 Nov 2026: no NEW entry after 2 losing closed trades or Rs10k realised today (both brokers); exits untouched
+import daily_loss_cap as dlc    # 14 Nov 2026: no NEW entry after 2 losing closed trades or Rs15k realised today (both brokers); exits untouched
 import entry_filters as ef      # 12 Nov 2026: India VIX filter, SHADOW ONLY: logs would-skip, never blocks
 DRY="--dry-run" in sys.argv
 # Delayed confirmation of a fresh 5m cross (MACD/ADX may arrive on a later closed candle,
@@ -60,7 +59,7 @@ EXECUTE=os.environ.get("INDEX_EXECUTE","").strip()=="1" or "--execute" in sys.ar
 TRIGGERS=os.path.join(D,"index_entry_triggers.json")
 DECISIONS=os.path.join(D,"index_entry_decisions.jsonl")
 # t336u (4 Nov 2026): sizes come from capital + market conditions via equity/book_sizing.py.
-# --fixed-size forces the old 3-lot / 5-on-expiry behaviour; any sizing failure falls back to it too.
+# --fixed-size forces the size_lots fallback (2 / 4 / max(3, trend)); any sizing failure falls back to it too.
 FIXED="--fixed-size" in sys.argv
 # User rule (4 Nov 2026, refined): the expiry-week intraday-only rule applies to STOCK options only.
 # This script trades index options only (NIFTY/BANKNIFTY/SENSEX), so they keep normal carry (NRML) -
@@ -69,10 +68,10 @@ def in_expiry_week(exp_date):
     return False
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
-LOTS=3; EXPIRY_LOTS=5; ADX_MIN=18; STRONG_LOTS=LOTS  # t327u/t328u (4 Nov): 3 lots normally, 5 lots on expiry day.
-# The STRONG-trend doubling (t295u) is switched off by setting STRONG_LOTS=LOTS: doubling 3 would be 6 lots,
-# which nobody asked for. Restore it by setting STRONG_LOTS=2*LOTS. trade_lock caps still apply either way.
-# t328u: when the contract being bought expires TODAY (expiry-day trade), size is EXPIRY_LOTS instead.
+# 14 Nov 2026 (t620u): fallback size_lots matches index_size_policy — 2 lots base, 4 on a
+# strong/ST-EMA bar, expiry day is max(3, trend size). The live CONTRACT_POLICY path overwrites
+# this with isp.first_entry_lots. --fixed-size still uses this fallback and skips book_sizing.
+LOTS=isp.BASE_LOTS; EXPIRY_FLOOR=isp.EXPIRY_DAY_LOTS; ADX_MIN=18; STRONG_LOTS=isp.TREND_LOTS
 IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO","kite_exchange":"NFO"},
      "BANKNIFTY":{"key":"NSE_INDEX|Nifty Bank","exch":"NSE","seg":"NSE_FO","kite_exchange":"NFO"},
      "SENSEX":{"key":"BSE_INDEX|SENSEX","exch":"BSE","seg":"BSE_FO","kite_exchange":"BFO"}}
@@ -154,14 +153,16 @@ def _remember_block(name, rev, r):
 def size_lots(expire_today, strong_aligned, sig, raw=None, sside=None):
     """Index-option size in lots, and the note to show. Pure, so it can be tested off-market.
 
-    t327u: 3 lots normally. t328u: 5 lots when the contract bought expires today.
-    The old STRONG-trend doubling is off (STRONG_LOTS == LOTS); expiry day overrides everything.
+    14 Nov 2026: 2 lots normally, 4 on a strong/ST-EMA bar. On expiry day the size is
+    max(3, the trend-based size), never stacked. This is the fallback used when the
+    contract-policy path does not overwrite lots with isp.first_entry_lots.
     """
+    trend = STRONG_LOTS if strong_aligned else LOTS
     if expire_today:
-        return EXPIRY_LOTS, f"expiry-day -> {EXPIRY_LOTS} lots (t328u)"
+        lots = max(EXPIRY_FLOOR, trend)
+        return lots, f"expiry-day -> {lots} lots (max of {EXPIRY_FLOOR} and trend size {trend})"
     if strong_aligned:
-        return STRONG_LOTS, (f"STRONG trend -> {STRONG_LOTS} lots" if STRONG_LOTS != LOTS
-                             else f"STRONG trend -> {STRONG_LOTS} lots (size cap: doubling disabled, t327u)")
+        return STRONG_LOTS, f"STRONG trend -> {STRONG_LOTS} lots"
     if sig and sside is not None and sside != raw:
         return LOTS, f"strong {sside} but signal is {raw} - normal {LOTS} lots"
     if sig:
@@ -482,18 +483,18 @@ for name,cfg in IDX.items():
         else:
             size_note=(r.get("size") or f"{lots} lots")+" | fixed size (no usable quote: ltp "+str(ltp)+", ask "+str(ask)+")"
         if CONTRACT_POLICY:
-            # Capital and the order share one size. Supertrend-versus-EMA (2 lots when
-            # the completed bar qualifies) and the unused one-shot combine with max().
+            # Capital and the order share one size. Supertrend-versus-EMA (4 lots when
+            # the completed bar qualifies, otherwise 2) and the unused one-shot combine with max().
             # This loop is NIFTY/BANKNIFTY/SENSEX only. Adds are not sent.
-            # 12 Nov 2026: 3 lots on this index's own expiry day (from the option master's dates).
+            # 14 Nov 2026: 2-lot base; 3 lots on this index's own expiry day unless the trend size is 4.
             exp_day=isp.is_expiry_day(name, now.date(), opt_exp)
             r["index_expiry_day"]=exp_day
             lots=isp.first_entry_lots(sig, a.get("st"), a.get("ema20"), underlying=name, expiry_day=exp_day)
             r["first_lots_override"]=bool(isp.pending_first_lots())
             signal_lots=isp.st_vs_ema_lots(sig, a.get("st"), a.get("ema20"))
-            shot=isp.pending_first_lots() or 1
+            shot=isp.pending_first_lots() or isp.BASE_LOTS
             size_note=("contract policy: first entry is %s lot%s per broker; Supertrend-versus-EMA is %s, the one-shot is %s and the expiry-day size is %s, combined with max(); an add is not sent" % (
-                lots, "" if lots==1 else "s", signal_lots, shot, isp.EXPIRY_DAY_LOTS if exp_day else 1))
+                lots, "" if lots==1 else "s", signal_lots, shot, isp.EXPIRY_DAY_LOTS if exp_day else isp.BASE_LOTS))
             u_cap=icc.check_index_option_buy({}, [], [], px*lots, now)
             k_cap=icc.check_index_option_buy({"broker":"kite"}, [], [], px*lots, now)
             gate=isp.dual_first_entry((tf_meta or {}).get("_expiry_role") or "next_week", 0, 0, u_cap, k_cap, side=sig, st=a.get("st"), ema=a.get("ema20"), underlying=name, expiry_day=exp_day)
