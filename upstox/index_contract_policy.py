@@ -165,7 +165,12 @@ def _parse(ts):
 
 
 def resample(candles, minutes, now):
-    """Build closed session buckets from 5-minute broker bars. Gaps fail the series."""
+    """Build closed session buckets from 5-minute broker bars.
+
+    Incomplete or missing intra-day buckets are skipped; they do not reject the
+    rest of the series. The last emitted bar is still the last fully closed
+    complete bucket (a forming bucket is ignored, never used as the close).
+    """
     if minutes not in (15, 60):
         return {"ok": False, "reason": "resample only builds 15m or 1h", "candles": []}
     step = minutes // 5
@@ -204,9 +209,10 @@ def resample(candles, minutes, now):
         return all(stamps[i] == start + dt.timedelta(minutes=5 * i) for i in range(step))
 
     # Only fully closed session buckets. The short 15:15-15:30 IST interval, a
-    # weekend, or a holiday with leftover ticks is skipped rather than treated
-    # as a hole that invalidates the whole series. A missing hour on a trading
-    # day still fails below.
+    # weekend, a holiday with leftover ticks, or an incomplete / missing
+    # intra-day bucket is skipped rather than treated as a hole that
+    # invalidates the whole series. The last completed bar is unchanged:
+    # a forming bucket is never emitted.
     closed_starts = sorted(
         s for s in by_start
         if s + dt.timedelta(minutes=minutes) <= now and _can_close(s) and _complete(s)
@@ -214,11 +220,15 @@ def resample(candles, minutes, now):
     if len(closed_starts) < 2:
         return {"ok": False, "reason": "fewer than two closed buckets", "candles": []}
     out = []
+    skipped = []
     for i, expected in enumerate(closed_starts):
         if i:
             prev = closed_starts[i - 1]
             if expected.date() == prev.date() and expected != prev + dt.timedelta(minutes=minutes):
-                return {"ok": False, "reason": f"incomplete or gapped bucket {(prev + dt.timedelta(minutes=minutes)).isoformat()}", "candles": []}
+                hole = prev + dt.timedelta(minutes=minutes)
+                while hole < expected:
+                    skipped.append(hole.isoformat())
+                    hole += dt.timedelta(minutes=minutes)
         got = by_start[expected]
         o = got[0][1][1]
         h = max(r[2] for _, r in got)
@@ -227,7 +237,9 @@ def resample(candles, minutes, now):
         out.append([expected.isoformat(), o, h, l, c, 0, 0])
     # A bucket that has started but not closed must not be the last row.
     forming = [s for s in by_start if s + dt.timedelta(minutes=minutes) > now]
-    return {"ok": True, "reason": None, "candles": out, "forming_ignored": [s.isoformat() for s in sorted(forming)]}
+    return {"ok": True, "reason": None, "candles": out,
+            "forming_ignored": [s.isoformat() for s in sorted(forming)],
+            "skipped_incomplete": skipped}
 
 
 def dedupe(index, open_indexes, decisions_today):

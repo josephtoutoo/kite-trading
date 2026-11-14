@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026; first entry 2 lots base / 4 ST-EMA / expiry max(3, trend) from 14 Nov, t620u).
+"""Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026; first entry 1 lot base / 2 ST-EMA / expiry max(3, trend); 14 Nov revert from the 2-lot base).
 Run every 5 min by a routine. Acts only 09:20-14:45 IST Mon-Fri (risk_manager handles exits till 15:25).
 Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   CE: close > EMA20 and Supertrend green, previous candle not both; MACD hist > 0; ADX >= 18
   PE: close < EMA20 and Supertrend red,   previous candle not both; MACD hist < 0; ADX >= 18
   (MACD + ADX>=18 filters are there to avoid chop.)
-Option: nearest weekly expiry, ATM strike, qty 2*lot_size on an ordinary trend (trade_lock may still cap it).
-STRONG / Supertrend-versus-EMA (completed bar with ST strictly beyond EMA20): qty doubles to 4 lots. Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
+Option: nearest weekly expiry, ATM strike, qty 1*lot_size on an ordinary trend (trade_lock may still cap it).
+STRONG / Supertrend-versus-EMA (completed bar with ST strictly beyond EMA20): qty doubles to 2 lots. Measured on 93 fresh 5m signals: ADX>=25 rising = +0.080% avg forward 60-min move, 62% win,
 14% of signals; the rest -0.016%. trade_lock caps still apply.
 All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product I (fallback D),
 tag auto_entry; cancel if unfilled after 2 min.
@@ -19,7 +19,7 @@ tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for 
 --dry-run: no orders, no state writes, ignores time window.
 t336u (4 Nov 2026): lot size is no longer fixed. `lots` comes from equity/book_sizing.py, which sizes
 from free capital, the premium actually quoted, the 5m ADX tier, whether the daily trend agrees, the
-expiry-day multiplier and the index-option book's weight. The size_lots fallback (2 lots base, 4 on a strong bar, expiry max(3, trend))
+expiry-day multiplier and the index-option book's weight. The size_lots fallback (1 lot base, 2 on a strong bar, expiry max(3, trend))
 is kept as the fallback for a missing input or a sizing error, and --fixed-size forces it outright.
 The chosen lots, the reason, and the inputs used are written to r["size"], r["size_lots"] and
 r["size_inputs"]. No cap in trade_lock.py is changed or bypassed - it still re-checks every order."""
@@ -56,10 +56,15 @@ FUTURES_SIGNAL=ENTRY_SOURCE=="futures"
 CONTRACT_POLICY=icp.contract_policy_on()
 ENTRY_TF=os.environ.get("INDEX_ENTRY_TIMEFRAME","1h")
 EXECUTE=os.environ.get("INDEX_EXECUTE","").strip()=="1" or "--execute" in sys.argv
+# Live 1h/15m indicators need enough history for MACD(12,26,9) to settle.
+# 5 calendar days was too short. A single 30-day request works; 44 days failed (UDAPI1148).
+# Used only on the contract-policy resample path. The 5m paths and the freshness-only
+# gate stay at 5 days.
+INDICATOR_HISTORY_DAYS=30
 TRIGGERS=os.path.join(D,"index_entry_triggers.json")
 DECISIONS=os.path.join(D,"index_entry_decisions.jsonl")
 # t336u (4 Nov 2026): sizes come from capital + market conditions via equity/book_sizing.py.
-# --fixed-size forces the size_lots fallback (2 / 4 / max(3, trend)); any sizing failure falls back to it too.
+# --fixed-size forces the size_lots fallback (1 / 2 / max(3, trend)); any sizing failure falls back to it too.
 FIXED="--fixed-size" in sys.argv
 # User rule (4 Nov 2026, refined): the expiry-week intraday-only rule applies to STOCK options only.
 # This script trades index options only (NIFTY/BANKNIFTY/SENSEX), so they keep normal carry (NRML) -
@@ -68,7 +73,7 @@ def in_expiry_week(exp_date):
     return False
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
 now=datetime.datetime.now(IST)
-# 14 Nov 2026 (t620u): fallback size_lots matches index_size_policy — 2 lots base, 4 on a
+# Fallback size_lots matches index_size_policy — 1 lot base, 2 on a
 # strong/ST-EMA bar, expiry day is max(3, trend size). The live CONTRACT_POLICY path overwrites
 # this with isp.first_entry_lots. --fixed-size still uses this fallback and skips book_sizing.
 LOTS=isp.BASE_LOTS; EXPIRY_FLOOR=isp.EXPIRY_DAY_LOTS; ADX_MIN=18; STRONG_LOTS=isp.TREND_LOTS
@@ -153,7 +158,7 @@ def _remember_block(name, rev, r):
 def size_lots(expire_today, strong_aligned, sig, raw=None, sside=None):
     """Index-option size in lots, and the note to show. Pure, so it can be tested off-market.
 
-    14 Nov 2026: 2 lots normally, 4 on a strong/ST-EMA bar. On expiry day the size is
+    1 lot normally, 2 on a strong/ST-EMA bar. On expiry day the size is
     max(3, the trend-based size), never stacked. This is the fallback used when the
     contract-policy path does not overwrite lots with isp.first_entry_lots.
     """
@@ -301,6 +306,7 @@ for name,cfg in IDX.items():
         signal_key=cfg["key"]
         forced_expiry=None
         tf_meta=None
+        futures_5m=None
         _elig={"upstox":{"ok":True,"reason":None},"kite":{"ok":True,"reason":None}}
         if CONTRACT_POLICY:
             _route=icp.route(name, ENTRY_TF)
@@ -321,7 +327,12 @@ for name,cfg in IDX.items():
                 r["signal"]="NONE"; r["action"]="no entry: "+res["reason"]; continue
             signal_key=res["instrument_key"]
             try:
-                gate=ifut.assess_candles(ind.candles(signal_key,"minutes",5,5), datetime.datetime.now(IST))
+                # Freshness gate itself is unchanged (assess_candles, last closed bar).
+                # When the 1h/15m path also needs this series, fetch the 30-day window
+                # once and reuse it below. The gate-only path stays at 5 days.
+                _5m_days=INDICATOR_HISTORY_DAYS if CONTRACT_POLICY else 5
+                futures_5m=ind.candles(signal_key,"minutes",5,_5m_days)
+                gate=ifut.assess_candles(futures_5m, datetime.datetime.now(IST))
             except Exception as e:
                 r["signal"]="NONE"; r["action"]=f"no entry: futures candles unreadable ({type(e).__name__}); spot was not used"
                 continue
@@ -330,7 +341,9 @@ for name,cfg in IDX.items():
                 r["signal"]="NONE"; r["action"]="no entry: "+gate["reason"]+"; spot was not used"; continue
         if CONTRACT_POLICY:
             try:
-                built=icp.resample(ind.candles(signal_key,"minutes",5,5), _route["minutes"], datetime.datetime.now(IST))
+                if futures_5m is None:
+                    futures_5m=ind.candles(signal_key,"minutes",5,INDICATOR_HISTORY_DAYS)
+                built=icp.resample(futures_5m, _route["minutes"], datetime.datetime.now(IST))
             except Exception as e:
                 r["signal"]="NONE"; r["action"]=f"no entry: futures resample failed ({type(e).__name__}); 5m was not used"; continue
             if not built["ok"]:
@@ -483,10 +496,10 @@ for name,cfg in IDX.items():
         else:
             size_note=(r.get("size") or f"{lots} lots")+" | fixed size (no usable quote: ltp "+str(ltp)+", ask "+str(ask)+")"
         if CONTRACT_POLICY:
-            # Capital and the order share one size. Supertrend-versus-EMA (4 lots when
-            # the completed bar qualifies, otherwise 2) and the unused one-shot combine with max().
+            # Capital and the order share one size. Supertrend-versus-EMA (2 lots when
+            # the completed bar qualifies, otherwise 1) and the unused one-shot combine with max().
             # This loop is NIFTY/BANKNIFTY/SENSEX only. Adds are not sent.
-            # 14 Nov 2026: 2-lot base; 3 lots on this index's own expiry day unless the trend size is 4.
+            # 1-lot base; on this index's own expiry day the size is max(3, the trend size).
             exp_day=isp.is_expiry_day(name, now.date(), opt_exp)
             r["index_expiry_day"]=exp_day
             lots=isp.first_entry_lots(sig, a.get("st"), a.get("ema20"), underlying=name, expiry_day=exp_day)
