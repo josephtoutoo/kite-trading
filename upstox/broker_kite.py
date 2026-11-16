@@ -135,6 +135,12 @@ def _positions(strict=False):
         for src, dst in (("day_buy_quantity","day_buy_quantity"),("day_sell_quantity","day_sell_quantity"),
                          ("overnight_quantity","overnight_quantity")):
             if src in p and p.get(src) is not None: row[dst]=int(p.get(src) or 0)
+        # 16 Nov 2026 (t669u loss-cap tally fix): prices daily_loss_cap needs to value a carried
+        # position at the previous close and to book a partly closed row. Read-only pass-through.
+        for src in ("close_price","day_buy_price","day_sell_price","multiplier"):
+            if src in p and p.get(src) is not None:
+                try: row[src]=float(p.get(src) or 0)
+                except (TypeError,ValueError): pass
         out.append(row)
     return out
 def holdings():
@@ -179,7 +185,12 @@ def _orders(strict=False):
             "status":(o.get("status") or "").lower(),"order_type":o.get("order_type"),"quantity":int(o.get("quantity") or 0),
             "filled_quantity":int(o.get("filled_quantity") or 0),"average_price":float(o.get("average_price") or 0),
             "trigger_price":float(o.get("trigger_price") or 0),"price":float(o.get("price") or 0),"order_timestamp":ts,"tag":o.get("tag"),
-            "status_message":o.get("status_message") or ""})
+            "status_message":o.get("status_message") or "",
+            # 16 Nov 2026 (t669u): product for the per-row FIFO tally, fill times for the re-entry block.
+            # Stored as kite_product (not "product") so MTF/capital code that keys on product is unchanged.
+            "kite_product":o.get("product"),
+            "exchange_timestamp":(o.get("exchange_timestamp").strftime("%Y-%m-%d %H:%M:%S") if hasattr(o.get("exchange_timestamp"),"strftime") else o.get("exchange_timestamp")),
+            "exchange_update_timestamp":(o.get("exchange_update_timestamp").strftime("%Y-%m-%d %H:%M:%S") if hasattr(o.get("exchange_update_timestamp"),"strftime") else o.get("exchange_update_timestamp"))})
     return out
 def order_status(oid):
     if not valid(): return None

@@ -4,6 +4,19 @@ import os, sys, json, time, re, base64, requests, pyotp
 from urllib.parse import urlparse, parse_qs
 from kiteconnect import KiteConnect
 
+def _load_secret_file(path="/workspace/.secrets/kite.env"):
+    """Fill unset env vars from the private secrets file (never prints values)."""
+    import shlex
+    try:
+        for line in open(path):
+            line=line.strip()
+            if not line or line.startswith("#") or "=" not in line: continue
+            k,v=line.split("=",1)
+            if not os.environ.get(k):
+                vals=shlex.split(v); os.environ[k]=vals[0] if vals else ""
+    except FileNotFoundError:
+        pass
+_load_secret_file()
 TOKEN = os.environ.get("KITE_TOKEN_FILE", "/workspace/kite/token.json")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 

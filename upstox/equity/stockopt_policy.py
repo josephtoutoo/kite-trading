@@ -29,9 +29,12 @@ def underlying(symbol):
     return match.group(0) if match else text
 
 
+_SPACED_OPT = re.compile(r'^[A-Z0-9&\-]+ \d+(\.\d+)? (CE|PE) \d{1,2} [A-Z]{3} \d{2}$')  # 16 Nov 2026: Upstox spaced symbols
+
+
 def is_stock_option(symbol):
-    text = (symbol or '').upper()
-    if not re.match(r'^[A-Z&\-]+\d.*(CE|PE)$', text):
+    text = (symbol or '').upper().strip()
+    if not (re.match(r'^[A-Z&\-]+\d.*(CE|PE)$', text) or _SPACED_OPT.match(text)):
         return False
     return underlying(text) not in INDEX
 

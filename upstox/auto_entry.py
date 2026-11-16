@@ -12,7 +12,7 @@ All rules via trade_lock.check_order. LIMIT BUY at ask (else LTP*1.005), product
 tag auto_entry; cancel if unfilled after 2 min.
 Kite (4 Nov): same signal also buys the same sized lots NRML LIMIT on Kite when the Kite token is valid (one decision for
 the 3/day count); invalid Kite token -> Kite leg skipped + logged, Upstox unaffected. On fill: trade_lock.record_entry, risk_state.json
-(entry, target +20%, stop -30%), seen_entries.json. One open position per index PER BROKER (t600u, 12 Nov 2026):
+(entry, target +20%, stop -20% since 16 Nov 2026 t669u; was -30%), seen_entries.json. One open position per index PER BROKER (t600u, 12 Nov 2026):
 a broker already holding that index is skipped, the other still takes a fresh trigger.
 After a fill the SL is placed and immediately re-verified (sl_confirm.py: re-reads the order book, retries once on a
 tick-snapped price, else logs SL_CONFIRM_FAILED to sl_confirm_failures.json for the 10-min option monitor to alert on).
@@ -37,6 +37,7 @@ import index_capital_check as icc
 import index_size_policy as isp
 import daily_loss_cap as dlc    # 14 Nov 2026: no NEW entry after 2 losing closed trades or Rs15k realised today (both brokers); exits untouched
 import entry_filters as ef      # 12 Nov 2026: India VIX filter, SHADOW ONLY: logs would-skip, never blocks
+import perf_rules as prules     # 16 Nov 2026 (t669u): 15m trend filter, expiry >1 trading day, 20% initial stop, lot cap
 DRY="--dry-run" in sys.argv
 # Delayed confirmation of a fresh 5m cross (MACD/ADX may arrive on a later closed candle,
 # and a cooldown must not erase the cross). Off unless the process is started with
@@ -293,8 +294,20 @@ def _open_opt_idx(rows):
 # full_auto_add.py's job). Before this, an Upstox position blocked the Kite leg too.
 U_OPEN=_open_opt_idx(pos if _pos_reply.get("status")=="success" else None)
 K_OPEN=_open_opt_idx(_KPOS)
+# 16 Nov 2026 (t669u): today's order books feed the FIFO loss-cap tally (partly closed rows, carried
+# quantity valued at the previous close). An unreadable book only drops back to the row method.
+def _orders_or_none():
+    try:
+        _r=req("https://api.upstox.com/v2/order/retrieve-all")
+        return (_r.get("data") or []) if _r.get("status")=="success" else None
+    except Exception: return None
+def _kite_orders_or_none():
+    try: return bk.orders(strict=True) if _KPOS is not None else None
+    except Exception: return None
+_UORD=_orders_or_none(); _KORD=_kite_orders_or_none()
 LOSS_CAP=dlc.evaluate(pos if _pos_reply.get("status")=="success" else None,_KPOS,now,
-                      state_path=dlc.default_state_path(),persist=not DRY)
+                      state_path=dlc.default_state_path(),persist=not DRY,
+                      upstox_orders=_UORD,kite_orders=_KORD)
 out["daily_loss_cap"]=LOSS_CAP
 _EF=ef.config()
 if _EF["mode"]!="off": _EF["mode"]="shadow"   # user rule 12 Nov 2026: shadow only, enforce is not honoured here
@@ -460,6 +473,21 @@ for name,cfg in IDX.items():
             continue
         if not LOSS_CAP["ok"]:
             r["signal"]="NONE"; r["action"]="no entry: "+LOSS_CAP["reason"]; continue
+        # 16 Nov 2026 (t669u): never a contract expiring within 1 trading day (the expiry rule itself
+        # stays next week for NIFTY/SENSEX and monthly for BANKNIFTY).
+        if prules.expiry_too_near(exp, now.date(), market_calendar.next_trading_day):
+            r["signal"]="NONE"; r["action"]=f"no entry: {best['trading_symbol']} expires {exp} (within 1 trading day); not taken"
+            prules.log_refusal({"source":"auto_entry","index":name,"signal":sig,"rule":"expiry","symbol":best["trading_symbol"],"expiry":str(exp)})
+            _log_decision({"phase":"pretrade","index":name,"ts":datetime.datetime.now(IST).isoformat(),"action":"blocked","blockers":["expiry within 1 trading day"],"dry_run":DRY})
+            continue
+        # 16 Nov 2026 (t669u): 15m trend filter on the underlying index (last CLOSED 15m bar).
+        _t15=prules.trend15_check(name, sig, trade_lock.INDEX_KEYS, ind.analyze)
+        r["trend_15m"]=_t15
+        if not _t15["ok"]:
+            r["signal"]="NONE"; r["action"]="no entry: 15m trend filter: "+_t15["why"]
+            prules.log_refusal({"source":"auto_entry","index":name,"signal":sig,"rule":"trend15","why":_t15["why"]})
+            _log_decision({"phase":"pretrade","index":name,"ts":datetime.datetime.now(IST).isoformat(),"action":"blocked","blockers":["15m trend: "+_t15["why"]],"dry_run":DRY})
+            continue
         if _EF["mode"]=="shadow":
             _flt=ef.check(now,adx=a.get("adx"),vix_current=_VIX[0],vix_prior=_VIX[1],cfg=_EF)
             r["entry_filters"]=_flt
@@ -545,7 +573,7 @@ for name,cfg in IDX.items():
                 else:
                     kq=lots*m["lot_size"]
                     kprod="MIS" if ekw else "NRML"
-                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
+                    ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,"_rule_lots":lots,"tag":"auto_entry",**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
                     kok,kre,kadj=trade_lock.check_order(ko,broker="kite"); kadj=(kadj//m["lot_size"])*m["lot_size"]
                     r["kite"]={"symbol":m["tradingsymbol"],"exchange":m["exchange"],"qty":kq,"check":{"allowed":kok,"reasons":kre,"adjusted_qty":kadj}}
                     if kok and kadj>0: kleg={**m,"qty":kadj}
@@ -557,7 +585,7 @@ for name,cfg in IDX.items():
         elif not _elig["upstox"]["ok"]: r["action"]="skip: "+_elig["upstox"]["reason"]
         else:
             csym=f"{name}{exp:%y%m%d}{int(best['strike_price'])}{raw}"  # compact form trade_lock parses (master symbol has spaces)
-            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
+            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,"_rule_lots":lots,"tag":"auto_entry",**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
             ok,reasons,adj=trade_lock.check_order(o); adj=(adj//lot)*lot
             r["check"]={"allowed":ok,"reasons":reasons,"adjusted_qty":adj}
             if not ok or adj<=0: r["action"]="blocked by pre-trade rules"
@@ -622,19 +650,21 @@ for name,cfg in IDX.items():
         if oid:
             r["status"]=st; r["filled"]=fill
             if fill>0:
-                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry","intraday":ekw}
-                s.setdefault("_min_stop_by_symbol",{})[best["trading_symbol"]]=tick(avg*0.7)
+                _sf=1-prules.INITIAL_STOP_PCT
+                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry","intraday":ekw,"stop_pct":prules.INITIAL_STOP_PCT}
+                s.setdefault("_min_stop_by_symbol",{})[best["trading_symbol"]]=tick(avg*_sf)
                 seen[oid]={"sym":best["trading_symbol"],"qty":fill,"avg":avg,"time":now.isoformat(),"source":"auto_entry"}
-                r["action"]=f"ENTERED {fill} {best['trading_symbol']} @ {avg}; target {round(avg*1.2,2)} stop {tick(avg*0.7)}"
+                r["action"]=f"ENTERED {fill} {best['trading_symbol']} @ {avg}; target {round(avg*1.2,2)} stop {tick(avg*_sf)}"
             else: r["action"]="not filled in 2 min - cancelled"
         if koid:
             ka=(kst or {}).get("avg") or px; r["kite"]["status"]=(kst or {}).get("status"); r["kite"]["filled"]=kfill
             if kfill>0:
                 kk="KITE|%s|%s"%(kleg["exchange"],kleg["tradingsymbol"])
-                s[kk]={"high":ka,"entry":ka,"target":round(ka*1.2,2),"sym":kleg["tradingsymbol"],"source":"auto_entry","broker":"kite"}
-                s.setdefault("_min_stop_by_symbol",{})[kleg["tradingsymbol"]]=tick(ka*0.7)
+                _sf=1-prules.INITIAL_STOP_PCT
+                s[kk]={"high":ka,"entry":ka,"target":round(ka*1.2,2),"sym":kleg["tradingsymbol"],"source":"auto_entry","broker":"kite","stop_pct":prules.INITIAL_STOP_PCT}
+                s.setdefault("_min_stop_by_symbol",{})[kleg["tradingsymbol"]]=tick(ka*_sf)
                 seen["kite:"+str(koid)]={"sym":kleg["tradingsymbol"],"qty":kfill,"avg":ka,"time":now.isoformat(),"source":"auto_entry","broker":"kite"}
-                r["kite"]["action"]=f"ENTERED {kfill} {kleg['tradingsymbol']} @ {ka} on Kite; target {round(ka*1.2,2)} stop {tick(ka*0.7)}"
+                r["kite"]["action"]=f"ENTERED {kfill} {kleg['tradingsymbol']} @ {ka} on Kite; target {round(ka*1.2,2)} stop {tick(ka*_sf)}"
             else: r["kite"]["action"]="Kite not filled in 2 min - cancelled"
         json.dump(s,open(SF,"w"),indent=1); json.dump(seen,open(SEEN,"w"),indent=1)
         # ---- post-placement confirmation (4 Nov): SL must be LIVE before this counts as an entered trade ----

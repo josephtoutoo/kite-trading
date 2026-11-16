@@ -29,9 +29,13 @@ tsf = ns["tick_size_for"]
 check("bogus key -> default", tsf("NSE_FO|0000000"), 0.05)
 import gtt_overnight as g
 check("mcx exchange", g.kite_exchange({"book": "Option", "sym": "CRUDEOIL26NOV8200PE", "exchange": "MCX"}) == "MCX", True)
+check("mcx from symbol when exchange is blank", g.kite_exchange({"book": "Option", "sym": "CRUDEOIL26NOV8300CE"}) == "MCX", True)
+check("mcx dec crude without exchange", g.kite_exchange({"book": "Option", "sym": "CRUDEOIL26DEC8700CE", "exchange": ""}) == "MCX", True)
+check("natgas without exchange", g.kite_exchange({"book": "Option", "sym": "NATURALGAS26DECFUT"}) == "MCX", True)
 check("sensex fallback", g.kite_exchange({"book": "Option", "sym": "SENSEX26N1982400CE"}) == "BFO", True)
 check("nfo fallback", g.kite_exchange({"book": "Option", "sym": "NIFTY26N1725000CE"}) == "NFO", True)
 check("mtf nse", g.kite_exchange({"book": "MTF", "sym": "SRF", "exchange": "NSE"}) == "NSE", True)
+check("position exchange wins over symbol", g.kite_exchange({"book": "Option", "sym": "CRUDEOIL26NOV8300CE", "exchange": "MCX"}) == "MCX", True)
 check("eq tick fallback", g.contract_tick({"broker": "kite", "kind": "eq", "book": "MTF", "sym": "SRF"}, 2385.1), 0.10)
 check("unknown contract fallback", g.contract_tick({"broker": "kite", "kind": "opt", "book": "Option", "sym": "NOSUCH26NOV1CE", "exchange": "NFO"}, 50), 0.05)
 print(f"tick_grid_test: {ok} passed, {bad} failed")

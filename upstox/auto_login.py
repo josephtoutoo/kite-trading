@@ -3,6 +3,21 @@
 import os, sys, time, json, subprocess, requests, pyotp
 from playwright.sync_api import sync_playwright
 
+def _load_secret_file(path="/workspace/.secrets/upstox.env"):
+    """Fill unset env vars from the private secrets file (never prints values)."""
+    import os as _os, shlex as _sh
+    try:
+        for _l in open(path):
+            _l=_l.strip()
+            if not _l or _l.startswith("#") or "=" not in _l: continue
+            _k,_v=_l.split("=",1)
+            if not _os.environ.get(_k):
+                _p=_sh.split(_v); _os.environ[_k]=_p[0] if _p else ""
+    except FileNotFoundError:
+        pass
+_load_secret_file()
+
+
 BASE = "/workspace/upstox"; TOKEN = f"{BASE}/token.json"; SHOT = f"{BASE}/auto_login_fail.png"
 SERVER = "http://127.0.0.1:8001"
 # The login mobile is personal data, so it is NOT in this file: it comes from the environment, or from
@@ -80,8 +95,12 @@ def attempt():
             pbtn = page.locator("#pinContinueBtn, #continueBtn, button:has-text('Continue')").first
             try:
                 page.wait_for_function("() => { const b=document.querySelector('#pinContinueBtn, #continueBtn'); return !b || !b.disabled; }", timeout=5000)
-                if pbtn.is_visible() and pbtn.is_enabled(): pbtn.click()
             except Exception: pass
+            try:
+                if pbtn.is_visible() and pbtn.is_enabled(): pbtn.click()
+                else: pin.press("Enter")
+            except Exception:
+                pin.press("Enter")
             page.wait_for_url("http://127.0.0.1:8001/**", timeout=45000)
             for _ in range(30):
                 if os.path.exists(TOKEN) and os.path.getmtime(TOKEN) > mtime0: break
@@ -106,7 +125,7 @@ def main():
     except Exception: print("FAIL: UPSTOX_TOTP_SECRET is not a valid base32 setup key"); sys.exit(3)
     try: ensure_server()
     except Exception as e: print(f"FAIL: {e}"); sys.exit(2)
-    for i in range(2):  # 1 try + up to 2 retries
+    for i in range(1):  # single attempt only (avoid PIN/TOTP lockout)
         try:
             uid = attempt(); print(f"OK: Upstox logged in as {uid} in {time.time()-t0:.1f}s"); sys.exit(0)
         except Rejected as e:

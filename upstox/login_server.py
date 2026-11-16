@@ -1,6 +1,21 @@
 import os, json, requests
 from urllib.parse import urlencode
 from flask import Flask, request, redirect
+
+def _load_secret_file(path="/workspace/.secrets/upstox.env"):
+    """Fill unset env vars from the private secrets file (never prints values)."""
+    import os as _os, shlex as _sh
+    try:
+        for _l in open(path):
+            _l=_l.strip()
+            if not _l or _l.startswith("#") or "=" not in _l: continue
+            _k,_v=_l.split("=",1)
+            if not _os.environ.get(_k):
+                _p=_sh.split(_v); _os.environ[_k]=_p[0] if _p else ""
+    except FileNotFoundError:
+        pass
+_load_secret_file()
+
 K=os.environ["UPSTOX_API_KEY"]; S=os.environ["UPSTOX_API_SECRET"]; R="http://127.0.0.1:8001/"
 app=Flask(__name__)
 @app.route("/login")

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Upstox option risk manager (v2, 3 Nov). Manages ALL open long option positions (quantity>0),
-including carry-forward (product D) ones. Keeps a SELL SL at 30% below the highest LTP seen
-(never lowered, floored at seeded min_stop). Target roll-forward (3 Nov): at LTP>=target (start entry*1.20)
-checks underlying trend (index opts 5m, stock opts/futures 15m; CE/FUT need close>EMA20 & ST green, PE need
+including carry-forward (product D) ones. Keeps a SELL SL at a fixed % under entry (never lowered, floored at
+seeded min_stop): 20% for positions opened from 16 Nov 2026 (t669u), 30% kept for positions already open then. Target roll-forward (3 Nov): at LTP>=target (start entry*1.20)
+checks underlying trend (index opts 15m since 16 Nov 2026 14:37 IST, stock opts/futures 15m; CE/FUT need close>EMA20 & ST green, PE need
 close<EMA20 & ST red). Intact -> target += entry*0.20, stop floor = target two steps back (1st roll: entry). Broken -> LIMIT sell
 at LTP*0.995 for live qty. Long futures: 1.5% trail from high, target step +2%.
 Only acts 09:15-15:25 IST Mon-Fri. Cancels leftover SELL SL orders on contracts with no long position.
@@ -11,15 +11,23 @@ Trend-stop policy (trend_stop_policy.py) is off. TREND_STOP_POLICY=1 only adds a
 It does not change the trigger, the quantity, or cancel the disaster stop.
 Kite (4 Nov): also manages Kite long options/futures (Upstox LTP+trend, Kite SL/LIMIT orders); no-op if Kite token invalid.
 Full auto (12 Nov 2026, user-authorized): full_auto_policy.flag("trend_exit") (env FULL_AUTO_TREND_EXIT=1 or
-full_auto_flags.json) replaces the 5m index-option trend exit with a COMPLETED 1h Supertrend-flip exit for every
+full_auto_flags.json) replaces the 15m index-option trend exit with a COMPLETED 1h Supertrend-flip exit for every
 long option (index, stock, MCX), and lifts option stops on an upward-only ladder (breakeven at +15%, then the
 target two steps back). Every exit SELL re-reads the broker quantity first and is capped to it.
+16 Nov 2026 (t669u): OVERSIZE lines for option positions above the lot rule (index 1/2 lots, 3 on that index's
+expiry day, 3 total with the one add; stock options 1 lot per broker), once per position per day, in "oversize".
+Sent TREND_EXIT / STOP_BREACH_EXIT orders are recorded in reentry_blocks.json (same-contract re-entry block).
 --dry-run: read-only, prints intended actions, ignores time window, writes no state."""
 import json,os,sys
 sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
 import json,urllib.request,urllib.error,datetime
 import market_calendar
 import api                     # pooled, proxied, timed client (5 Nov 2026)
+try:
+    import perf_rules as prules   # 16 Nov 2026 (t669u): 20% initial stop, OVERSIZE alerts, re-entry records
+except Exception as _pe:
+    prules=None
+    print(f"risk_manager: perf_rules unavailable, 30% stop and no OVERSIZE check: {type(_pe).__name__}",file=sys.stderr)
 DRY="--dry-run" in sys.argv
 D=os.path.dirname(os.path.abspath(__file__))
 SF=os.path.join(D,"risk_state.json")
@@ -55,6 +63,30 @@ def tick_on(p, ts):
     return round(round(p/ts)*ts, 2)
 def isopt(sym): return len(sym)>2 and sym[-2:] in("CE","PE") and sym[-3].isdigit()  # BAJFINANCE ends in CE: require strike digit
 
+# 16 Nov 2026 14:37 IST (t664u): index-option TREND_EXIT uses last CLOSED 15-minute bar
+# (same EMA20 / Supertrend rule as before). Stock options stay on 15m. The 1h flag stays off.
+INDEX_TREND_EXIT_MIN = 15
+INDEX_TREND_EXIT_DAYS = 10
+import position_life as pl
+def _completed_fills(orders, sym=None, token=None):
+    return pl.completed_fills(orders, sym=sym, token=token)
+def current_open_gen(orders, sym=None, token=None, overnight=0):
+    return pl.current_open_gen(orders, sym=sym, token=token, overnight=overnight)
+def bind_position_peak(s, avg, ltp, qty, *, day_sell=0, overnight=0, orders=None, sym=None, token=None, step=0.20):
+    """Ratchet the +15% peak from this position's own fill, not the contract's earlier high.
+
+    Reset when the book went flat and was re-entered (observed live_qty==0, a new opening-fill id,
+    or today's tape shows a flatten before the current opening). Adds keep the existing high.
+    On reset the stop floor (s['stop'] and seeds[sym]) is cleared so the new entry gets a fresh
+    initial stop, not the prior life's. Returns (reset, why, prev_high).
+    """
+    return pl.bind_position_peak(
+        s, avg, ltp, qty, day_sell=day_sell, overnight=overnight, orders=orders,
+        sym=sym, token=token, step=step, now=now,
+        initial_stop_pct=(prules.INITIAL_STOP_PCT if prules is not None else None),
+        seeds=seeds,
+    )
+
 def _gtt_clear(broker, sym, key=None):
     """Cancel this name's overnight GTT before a day order is placed on it.
 
@@ -89,14 +121,53 @@ try:
     if _mr0.get("status")!="success": _mtfp=[]
 except Exception:
     _mtfp=[]
-day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in pos+_mtfp)
+orders=req("https://api.upstox.com/v2/order/retrieve-all").get("data") or []
+def _old_pnl(p): return float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0))
+# 16 Nov 2026 (t669u): option/future rows valued for TODAY (carry from the previous close, FIFO from today's fills)
+try:
+    import daily_loss_cap as _dlc
+    _uf=_dlc.fills_from_orders(orders,"upstox")
+    day_pnl=sum(_dlc.row_pnl(p,"upstox",_dlc._fills_for(p,"upstox",_uf))["day_pnl"] if (trade_lock.is_opt(trade_lock.sym_of(p)) or trade_lock.is_fut(trade_lock.sym_of(p))) else _old_pnl(p) for p in pos)+sum(_old_pnl(p) for p in _mtfp)
+except Exception as _de:
+    print(f"risk_manager: today-only P&L failed, broker figure used: {type(_de).__name__}",file=sys.stderr)
+    day_pnl=sum(_old_pnl(p) for p in pos+_mtfp)
 breaker={"day_pnl":round(day_pnl,2),"threshold":-trade_lock.THRESHOLD,"locked":False}
 if day_pnl< -trade_lock.THRESHOLD:
-    breaker["locked"]=True; breaker["lock"]=trade_lock.lock(-day_pnl,f"day loss Rs {-day_pnl:,.0f} > Rs 30,000",dry=DRY)
+    breaker["locked"]=True; breaker["lock"]=trade_lock.lock(-day_pnl,f"day loss Rs {-day_pnl:,.0f} > Rs {trade_lock.THRESHOLD:,}",dry=DRY)
 breaker["can_enter"]=trade_lock.can_enter(1)
-orders=req("https://api.upstox.com/v2/order/retrieve-all").get("data") or []
 def pending_sl(k): return [o for o in orders if o["instrument_token"]==k and o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M")]
-acts=[]; longs=set()
+acts=[]; longs=set(); held_keys=set(); kite_book_ok=False
+# 16 Nov 2026 (t669u): one-time marker - positions already open keep their 30% floor; new ones get 20%.
+if prules is not None:
+    try:
+        _legacy=prules.migrate_stop_pct(st,[o["instrument_token"] for o in orders if o.get("transaction_type")=="SELL" and o.get("status") in("trigger pending","open") and o.get("order_type") in("SL","SL-M")],now)
+        if _legacy: acts.append({"action":"STOP_PCT_LEGACY","why":"open before the 20% rule; floor stays 30%","keys":_legacy})
+    except Exception as _me:
+        print(f"risk_manager: stop_pct migration skipped: {type(_me).__name__}",file=sys.stderr)
+OVERSIZE_ITEMS=[]
+def _buys_today(book,sym=None,token=None,overnight=0):
+    n=1 if int(overnight or 0)>0 else 0
+    for o in book or []:
+        osym=o.get("trading_symbol") or o.get("tradingsymbol") or ""
+        if not ((sym and osym==sym) or (token and str(o.get("instrument_token") or "")==str(token))): continue
+        if str(o.get("transaction_type") or "").upper()!="BUY": continue
+        try:
+            if int(float(o.get("filled_quantity") or 0))>0: n+=1
+        except (TypeError,ValueError): pass
+    return n
+def _oversize(broker,sym,q,lot,overnight,book,token=None):
+    """Queue an OVERSIZE item when this option position is above the lot rule (never sends anything)."""
+    if prules is None or not lot or q<=0: return
+    try:
+        u=trade_lock.underlying(sym)
+        if u=="CRUDEOIL" or str(token or "").startswith(("MCX","KITE|MCX")): return
+        kind="index" if u in INDEX_KEYS else "stock"
+        xd=bool(kind=="index" and trade_lock._expiry_today(u,now) is True)
+        lots=q/float(lot)
+        hit=prules.oversize(kind,lots,expiry_day=xd,buys_today=_buys_today(book,sym,token,overnight))
+        if hit: OVERSIZE_ITEMS.append({"broker":broker,"sym":sym,"qty":int(q),"lots":round(lots,2),"allowed":hit[0],"rule":hit[1]})
+    except Exception as e:
+        print(f"risk_manager: oversize check failed for {sym}: {type(e).__name__}",file=sys.stderr)
 import ind,gzip
 INDEX_KEYS=trade_lock.INDEX_KEYS
 EQF=os.path.join(D,"eq_keys.json")
@@ -112,10 +183,10 @@ def eq_keys():
     _EQK=api.file_json(EQF)
     return _EQK
 def trend_ok(sym):
-    """Underlying trend on last CLOSED candle. Index opts: 5m; stock opts/futures: 15m.
+    """Underlying trend on last CLOSED candle. Index opts: 15m; stock opts/futures: 15m.
     CE / long FUT: close>EMA20 & ST green. PE: close<EMA20 & ST red."""
     u=trade_lock.underlying(sym)
-    if u in INDEX_KEYS: key,iv,days=INDEX_KEYS[u],5,5
+    if u in INDEX_KEYS: key,iv,days=INDEX_KEYS[u],INDEX_TREND_EXIT_MIN,INDEX_TREND_EXIT_DAYS
     else: key,iv,days=eq_keys().get(u),15,10
     if not key: return False,f"no underlying key for {u}"
     a=ind.analyze(key,"minutes",iv,days)
@@ -173,8 +244,13 @@ for p in pos:
     avg=avg or p.get("average_price") or p.get("buy_price") or p.get("day_buy_price")
     if not avg or not ltp: acts.append({"sym":sym,"action":"SKIP_NO_PRICE"}); continue
     TRAIL=0.015 if fut else 0.30; STEP=0.02 if fut else 0.20
-    s=st.setdefault(k,{"high":avg}); s["sym"]=sym; s["high"]=max(s.get("high",avg),ltp)
-    s.setdefault("entry",avg); s.setdefault("target",round(avg*(1+STEP),2))
+    s=st.setdefault(k,{"high":avg}); s["sym"]=sym
+    _pr,_pw,_ph=bind_position_peak(s,avg,ltp,q,day_sell=int(p.get("day_sell_quantity") or 0),overnight=int(p.get("overnight_quantity") or 0),orders=orders,sym=sym,token=k,step=STEP)
+    s.setdefault("target",round(avg*(1+STEP),2)); held_keys.add(k)
+    if prules is not None and not fut:
+        s.setdefault("stop_pct",prules.INITIAL_STOP_PCT); TRAIL=prules.stop_pct(s)   # 20% new, 30% legacy
+        _oversize("upstox",sym,q,trade_lock.lot_size(k,sym),p.get("overnight_quantity"),orders,token=k)
+    if _pr: acts.append({"sym":sym,"action":"PEAK_RESET","why":_pw,"entry":round(float(avg),2),"peak":s["high"],"prev_high":_ph,"open_gen":s.get("open_gen")})
     _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":k,"transaction_type":"SELL","order_type":"SL","product":p["product"],"quantity":q})
     if _aq<=0: acts.append({"sym":sym,"action":"SKIP_R8","why":_why}); continue
     q=min(q,_aq)  # rule 8
@@ -184,9 +260,10 @@ for p in pos:
     sls=sls[:1]
     floor=0
     # ---- exit rule (4 Nov, t287u/t288u): INDEX OPTIONS ONLY get the trend exit ----
-    # Losses are always bounded by a fixed 30% floor under entry. For index options, once the contract's high
-    # is 15% above entry the exit also follows the underlying 5m trend (CE sold when close<EMA20 with
-    # Supertrend red, PE the opposite), so winners run. Stock options and futures keep the plain % stop.
+    # Losses are always bounded by a fixed 30% floor under entry. For index options, once this position's high
+    # (from its own fill, reset on flatten/re-entry) is 15% above entry the exit also follows the underlying
+    # 15m trend (CE sold when close<EMA20 with Supertrend red, PE the opposite), so winners run.
+    # Stock options and futures keep the plain % stop.
     INDEX_OPT = trade_lock.underlying(sym) in INDEX_KEYS
     _fa_exit=None
     if FA_TREND and not fut:
@@ -211,6 +288,7 @@ for p in pos:
         lim=_tk(ltp*0.995)
         r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":qx,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
         acts.append({"sym":sym,"action":_fa_exit,"qty":qx,"broker_qty":_live,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"pnl_est":round((lim-avg)*qx),"resp":r.get("status"),"err":r.get("body")})
+        if prules is not None and r.get("status")=="success": prules.record_exit(k,sym,trade_lock.underlying(sym),"upstox",_fa_exit,now)
         continue
     # 5 Nov (audit #8): the target roll used to raise the stop floor above entry, i.e. a trailing stop.
     # That contradicts the rule for options (t288u): a FIXED 30% stop under entry that never trails from
@@ -237,6 +315,7 @@ for p in pos:
             lim=_tk(ltp*0.995)
             r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":qx,"product":p["product"],"validity":"DAY","price":lim,"tag":"target_book","instrument_token":k,"order_type":"LIMIT","transaction_type":"SELL","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
             acts.append({"sym":sym,"action":"STOP_BREACH_EXIT","qty":qx,"broker_qty":_live,"ladder_stop":stop,"ltp":ltp,"limit":lim,"resp":r.get("status"),"err":r.get("body")})
+            if prules is not None and r.get("status")=="success": prules.record_exit(k,sym,trade_lock.underlying(sym),"upstox","STOP_BREACH_EXIT",now)
             continue
         if stop>=ltp: stop=_tk(ltp*(0.995 if fut else 0.97))
         else: s["stop"]=stop  # ratchet: never lowered
@@ -253,8 +332,8 @@ for p in pos:
         else:
             o=sls[0]
             if not DRY: sc.clear("upstox",sym)
-            if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:
-                t2=max(stop,o["trigger_price"])
+            t2=pl.sl_modify_trigger(stop,o["trigger_price"],qty_changed=o["quantity"]!=q,reset=_pr)
+            if t2 is not None:
                 r=write("https://api-hft.upstox.com/v2/order/modify",{"order_id":o["order_id"],"quantity":q,"validity":"DAY","price":_tk(t2*(0.99 if fut else 0.95)),"order_type":"SL","trigger_price":t2,"disclosed_quantity":0},method="PUT")
                 acts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":r.get("status"),"err":r.get("body")})
             else: acts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
@@ -324,8 +403,15 @@ try:
             ltp=ltp or p["last_price"]; avg=p["average_price"] or p["buy_price"]
             if not avg or not ltp: kacts.append({"sym":sym,"broker":"kite","action":"SKIP_NO_PRICE"}); continue
             TRAIL=0.015 if fut else 0.30; STEP=0.02 if fut else 0.20
-            s=st.setdefault(kk,{"high":avg}); s["sym"]=sym; s["broker"]="kite"; s["high"]=max(s.get("high",avg),ltp)
-            s.setdefault("entry",avg); s.setdefault("target",round(avg*(1+STEP),2))
+            s=st.setdefault(kk,{"high":avg}); s["sym"]=sym; s["broker"]="kite"
+            _pr,_pw,_ph=bind_position_peak(s,avg,ltp,q,day_sell=int(p.get("day_sell_quantity") or 0),overnight=int(p.get("overnight_quantity") or 0),orders=kord,sym=sym,token=kk,step=STEP)
+            s.setdefault("target",round(avg*(1+STEP),2)); held_keys.add(kk)
+            if prules is not None and not fut:
+                s.setdefault("stop_pct",prules.INITIAL_STOP_PCT); TRAIL=prules.stop_pct(s)   # 20% new, 30% legacy
+                try: _klot=int(float((bk._index(ex)[1].get(sym) or {}).get("lot_size") or 0)) or None
+                except Exception: _klot=None
+                _oversize("kite",sym,q,_klot,p.get("overnight_quantity"),kord,token=None)
+            if _pr: kacts.append({"sym":sym,"broker":"kite","action":"PEAK_RESET","why":_pw,"entry":round(float(avg),2),"peak":s["high"],"prev_high":_ph,"open_gen":s.get("open_gen")})
             _ok,_why,_aq=trade_lock.check_order({"trading_symbol":sym,"instrument_token":kk,"transaction_type":"SELL","order_type":"SL","product":p["product"],"quantity":q},broker="kite")
             if _aq<=0: kacts.append({"sym":sym,"broker":"kite","action":"SKIP_R8","why":_why}); continue
             q=min(q,_aq)
@@ -356,6 +442,7 @@ try:
                 lim=tick(ltp*0.995)
                 r=bk.place(ex,sym,"SELL",qx,lim,tag="target_book",product=p["product"],dry=DRY)
                 kacts.append({"sym":sym,"broker":"kite","action":_fa_exit,"qty":qx,"broker_qty":_live,"avg":round(avg,2),"ltp":ltp,"limit":lim,"peak":s["high"],"trend":why,"resp":r})
+                if prules is not None and r and not DRY: prules.record_exit(kk,sym,trade_lock.underlying(sym),"kite",_fa_exit,now,to_upstox=bk.to_upstox)
                 continue
             while ltp>=s["target"]:
                 prev=s["target"]; s["target"]=round(prev+avg*STEP,2)
@@ -374,7 +461,9 @@ try:
                     if qx<=0:
                         kacts.append({"sym":sym,"broker":"kite","action":"STOP_BREACH_EXIT_SKIPPED","why":f"broker quantity now {_live}"}); continue
                     lim=tick(ltp*0.995)
-                    kacts.append({"sym":sym,"broker":"kite","action":"STOP_BREACH_EXIT","qty":qx,"broker_qty":_live,"ladder_stop":stop,"ltp":ltp,"limit":lim,"resp":bk.place(ex,sym,"SELL",qx,lim,tag="target_book",product=p["product"],dry=DRY)})
+                    _kr=bk.place(ex,sym,"SELL",qx,lim,tag="target_book",product=p["product"],dry=DRY)
+                    kacts.append({"sym":sym,"broker":"kite","action":"STOP_BREACH_EXIT","qty":qx,"broker_qty":_live,"ladder_stop":stop,"ltp":ltp,"limit":lim,"resp":_kr})
+                    if prules is not None and _kr and not DRY: prules.record_exit(kk,sym,trade_lock.underlying(sym),"kite","STOP_BREACH_EXIT",now,to_upstox=bk.to_upstox)
                     continue
                 if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))
                 else: s["stop"]=stop
@@ -389,13 +478,27 @@ try:
                     if not DRY: sc.clear("kite",sym)
                 else:
                     o=sls[0]
-                    if stop>o["trigger_price"]*1.001 or o["quantity"]!=q:
-                        t2=max(stop,o["trigger_price"])
+                    t2=pl.sl_modify_trigger(stop,o["trigger_price"],qty_changed=o["quantity"]!=q,reset=_pr)
+                    if t2 is not None:
                         kacts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":bk.modify(o["order_id"],q,tick(t2*(0.99 if fut else 0.95)),t2,dry=DRY)})
                     else: kacts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
         for o in kord:
             if o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and isopt(o["trading_symbol"]) and o["trading_symbol"] not in klongs:
                 kacts.append({"sym":o["trading_symbol"],"broker":"kite","action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})
+        kite_book_ok=True
 except Exception as e: kacts.append({"action":"KITE_ERROR","why":f"{type(e).__name__}: {e}"})
+# Flat names drop the peak so a later re-entry starts from its own fill. Only books we fully walked.
+for _k,_s in st.items():
+    if _k.startswith("_") or not isinstance(_s,dict):
+        continue
+    if (str(_k).startswith("KITE|") or str(_k).startswith("KITE:")) and not kite_book_ok:
+        continue
+    if _k not in held_keys:
+        _s["live_qty"]=0
+        _s["open_gen"]=None
+OVERSIZE=[]
+if prules is not None and OVERSIZE_ITEMS:
+    try: OVERSIZE=prules.oversize_alerts(OVERSIZE_ITEMS,now,persist=not DRY)
+    except Exception as _oe: print(f"risk_manager: oversize alerts failed: {type(_oe).__name__}",file=sys.stderr)
 if not DRY: json.dump(st,open(SF,"w"))
-print(json.dumps({"dry_run":DRY,"now":now.strftime("%Y-%m-%d %H:%M IST"),"full_auto":FA_NOTE,"breaker":breaker,"actions":acts,"kite_actions":kacts},indent=1))
+print(json.dumps({"dry_run":DRY,"now":now.strftime("%Y-%m-%d %H:%M IST"),"oversize":OVERSIZE,"full_auto":FA_NOTE,"breaker":breaker,"actions":acts,"kite_actions":kacts},indent=1))

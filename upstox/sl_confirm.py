@@ -176,6 +176,13 @@ def confirm(broker,symbol,qty,trigger=None,target=None,exchange=None,entry_order
         if res["ok"]: break
     return res
 # ---------------- placement (entry path only) ----------------
+# 16 Nov 2026 (user t669u): NEW positions get their first stop 20% under entry (was 30%).
+# This module is the entry path only; open positions are managed by risk_manager.py.
+try:
+    import perf_rules as _prl
+    _INIT_FRAC=1-_prl.INITIAL_STOP_PCT
+except Exception:
+    _INIT_FRAC=0.8
 def live_sl(broker,symbol,qty=None,trigger=None,tick=None):
     tol=max(float(tick or TICK),0.01)+1e-6
     for x in get_orders(broker):
@@ -184,8 +191,8 @@ def live_sl(broker,symbol,qty=None,trigger=None,tick=None):
            and (trigger is None or x["trigger_price"]>=float(trigger)-tol): return x
     return None
 def place_sl_upstox(instrument_key,symbol,qty,avg,product="I",stop=None,tick=None,dry=False):
-    """SELL SL (SL-LIMIT) 30% below entry unless a stop is given. Prices tick-snapped. -> (order_id, stop, why)"""
-    if stop is None: stop=snap("upstox",None,symbol,float(avg)*0.7,tick)
+    """SELL SL (SL-LIMIT) 20% below entry (30% before 16 Nov 2026 t669u) unless a stop is given. Prices tick-snapped. -> (order_id, stop, why)"""
+    if stop is None: stop=snap("upstox",None,symbol,float(avg)*_INIT_FRAC,tick)
     stop=snap("upstox",None,symbol,stop,tick); lim=snap("upstox",None,symbol,stop*0.95,tick)
     try:
         import trade_lock
@@ -201,7 +208,7 @@ def place_sl_upstox(instrument_key,symbol,qty,avg,product="I",stop=None,tick=Non
     log(f"placed SL {oid} {symbol} trig {stop} lim {lim} qty {min(qty,adj)}")
     return oid,stop,(None if oid else f"{r.get('code')}: {str(r.get('body'))[:160]}")
 def place_sl_kite(exchange,symbol,qty,avg,product="NRML",stop=None,tick=None,dry=False):
-    if stop is None: stop=snap("kite",exchange,symbol,float(avg)*0.7,tick)
+    if stop is None: stop=snap("kite",exchange,symbol,float(avg)*_INIT_FRAC,tick)
     stop=snap("kite",exchange,symbol,stop,tick); lim=snap("kite",exchange,symbol,stop*0.95,tick)
     try:
         import broker_kite as bk
@@ -210,13 +217,13 @@ def place_sl_kite(exchange,symbol,qty,avg,product="NRML",stop=None,tick=None,dry
     return oid,stop,(None if oid else "broker_kite.place returned no order id (see kite_broker.log)")
 def guard_upstox(symbol,instrument_key,qty,avg,product="I",target=None,tick=None,entry_order=None,dry=False):
     """Place SL if missing, confirm entry+SL+target, retry once with snapped prices, else record failure."""
-    stop=snap("upstox",None,symbol,float(avg)*0.7,tick)
+    stop=snap("upstox",None,symbol,float(avg)*_INIT_FRAC,tick)
     oid=None; why=""
     if not live_sl("upstox",symbol,qty,stop,tick):
         oid,stop,why=place_sl_upstox(instrument_key,symbol,qty,avg,product,stop,tick,dry)
     r=confirm("upstox",symbol,qty,trigger=stop,target=target,entry_order=entry_order,tick=tick,attempts=2)
     if not r["sl"] and not dry:
-        stop=snap("upstox",None,symbol,float(avg)*0.7,tick)
+        stop=snap("upstox",None,symbol,float(avg)*_INIT_FRAC,tick)
         oid,stop,why=place_sl_upstox(instrument_key,symbol,qty,avg,product,stop,tick,dry)
         r=confirm("upstox",symbol,qty,trigger=stop,target=target,entry_order=entry_order,tick=tick,attempts=2)
     if r["ok"]: clear("upstox",symbol)
@@ -224,13 +231,13 @@ def guard_upstox(symbol,instrument_key,qty,avg,product="I",target=None,tick=None
         record_failure("upstox",symbol,oid or entry_order,"; ".join(r["reasons"]),why,qty=qty,trigger=stop,target=target)
     return r
 def guard_kite(exchange,symbol,qty,avg,product="NRML",target=None,tick=None,entry_order=None,dry=False):
-    stop=snap("kite",exchange,symbol,float(avg)*0.7,tick)
+    stop=snap("kite",exchange,symbol,float(avg)*_INIT_FRAC,tick)
     oid=None; why=""
     if not live_sl("kite",symbol,qty,stop,tick):
         oid,stop,why=place_sl_kite(exchange,symbol,qty,avg,product,stop,tick,dry)
     r=confirm("kite",symbol,qty,trigger=stop,target=target,exchange=exchange,entry_order=entry_order,tick=tick,attempts=2)
     if not r["sl"] and not dry:
-        stop=snap("kite",exchange,symbol,float(avg)*0.7,tick)
+        stop=snap("kite",exchange,symbol,float(avg)*_INIT_FRAC,tick)
         oid,stop,why=place_sl_kite(exchange,symbol,qty,avg,product,stop,tick,dry)
         r=confirm("kite",symbol,qty,trigger=stop,target=target,exchange=exchange,entry_order=entry_order,tick=tick,attempts=2)
     if r["ok"]: clear("kite",symbol)

@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """Close expiry-week option positions the same day (user rule, 4 Nov 2026).
 
-Options whose expiry is within 7 calendar days are intraday only - never carried as
-delivery. This runs shortly before the close, finds any still-open option position
-expiring in that window on either broker. Stock and MCX commodity options only - index options
-are skipped, and --only equity / --only mcx split the NSE-BSE and MCX sessions., and squares it off with a marketable LIMIT
-order (so we control the exit instead of leaving it to the broker's auto square-off).
+Stock and MCX commodity options are intraday-only in the calendar week the contract
+actually expires (Monday-start ISO week that contains the expiry date). A rolling
+"within 7 calendar days" window is NOT used: Mon 16 Nov is not expiry week for a
+Mon 23 Nov contract. Index options are skipped. --only equity / --only mcx split
+the NSE-BSE and MCX sessions. A marketable LIMIT is used so we control the exit
+instead of leaving it to the broker's auto square-off.
 
-CLI: python3 expiry_squareoff.py [--dry]
+The Friday 15:10 IST flatten of stock options is a separate rule and is not
+implemented here; this script only fires in the contract's own expiry week.
+
+Open user LIMIT SELLs at or above market are left alone unless a genuine
+expiry-week flatten still needs the quantity and the resting limit is not
+marketable (too far above LTP to exit now).
+
+CLI: python3 expiry_squareoff.py [--dry | --dry-run] [--only equity|mcx]
 """
 import sys, json, datetime
 sys.path.insert(0, '/workspace/upstox')
 sys.path.insert(0, '/workspace/equity')
 
-DRY = '--dry' in sys.argv
+DRY = ('--dry' in sys.argv) or ('--dry-run' in sys.argv)
 # MCX runs a separate, much later session (crude till ~23:30 IST), so commodity options are
 # squared off by their own late run, not by the 15:10 one that handles NSE/BSE.
 # --only equity  -> NSE/BSE legs only (the 15:10 run)
@@ -54,6 +62,141 @@ def is_index_opt(tsym):
 def is_commodity_opt(tsym):
     return _starts_with_any(tsym, COMMODITY_UND)
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+# A resting LIMIT SELL is close enough to market to leave in place when the
+# price is at or only slightly above LTP (within a 1% band).
+_MARKETABLE_BAND = 0.01
+_WORKING = {
+    'open', 'trigger pending', 'pending', 'open pending', 'validation pending',
+    'put order req received', 'modified', 'after market order received',
+}
+
+
+def in_expiry_week(exp, today=None):
+    """True only when today is in the Monday-start calendar week that contains exp.
+
+    Expired contracts (exp < today) are not expiry-week. Same ISO year+week is
+    required, so the Friday before a Monday expiry does not fire.
+    """
+    if today is None:
+        today = datetime.datetime.now(IST).date()
+    if not exp:
+        return False
+    if isinstance(exp, str):
+        try:
+            exp = datetime.date.fromisoformat(exp[:10])
+        except Exception:
+            return False
+    if exp < today:
+        return False
+    return exp.isocalendar()[:2] == today.isocalendar()[:2]
+
+
+def user_limit_sell_cancel_needed(limit_price, ltp, flattening=False, marketable_band=_MARKETABLE_BAND):
+    """Do not cancel a user LIMIT SELL at or above market unless needed.
+
+    Needed only for a genuine expiry-week flatten when the resting limit is
+    too far above LTP to exit the position now. A sell at or below LTP, or
+    within the marketable band above LTP, is left in place.
+    """
+    try:
+        limit_price = float(limit_price)
+        ltp = float(ltp)
+    except (TypeError, ValueError):
+        return False
+    if ltp <= 0 or limit_price <= 0:
+        return False
+    if not flattening:
+        return False
+    ceiling = ltp * (1 + marketable_band)
+    # at or below market, or only slightly above: leave it
+    if limit_price <= max(ceiling, ltp):
+        return False
+    return True
+
+
+def _norm_sym(sym):
+    return (sym or '').replace(' ', '').replace('-', '').upper()
+
+
+def _order_sym(order):
+    return order.get('trading_symbol') or order.get('tradingsymbol') or order.get('symbol') or ''
+
+
+def _opt_type(sym):
+    """CE/PE from compact (...880CE) or spaced (INDHOTEL880CE23NOV26) forms."""
+    import re
+    m = re.search(r'(CE|PE)', _norm_sym(sym))
+    return m.group(1) if m else None
+
+
+def _same_contract(a, b):
+    """True when two symbols name the same contract, including compact vs spaced forms."""
+    if _norm_sym(a) == _norm_sym(b) and _norm_sym(a):
+        return True
+    ra, rb = underlying_of(a), underlying_of(b)
+    ta, tb = _opt_type(a), _opt_type(b)
+    sa, sb = strike_of(a), strike_of(b)
+    return bool(ra and ra == rb and ta and ta == tb and sa is not None and sa == sb)
+
+
+def _order_working(order):
+    st = (order.get('status') or '').lower().replace('_', ' ').strip()
+    return st in _WORKING
+
+
+def _order_qty(order):
+    try:
+        pending = order.get('pending_quantity')
+        if pending is not None and str(pending) != '':
+            q = int(float(pending))
+            if q > 0:
+                return q
+        filled = int(float(order.get('filled_quantity') or 0))
+        qty = int(float(order.get('quantity') or 0))
+        return max(qty - filled, 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def plan_open_sells(orders, sym, qty, ltp, flattening=False):
+    """Decide which working SELL limits to leave, which to cancel, and residual qty.
+
+    User LIMIT SELLs at or above market are not cancelled unless flattening
+    is required and the limit is not marketable. Protective SL/SL-M sells
+    that reserve quantity are cancelled only when a genuine flatten still
+    needs that quantity.
+    """
+    leave, cancel = [], []
+    remaining = int(qty or 0)
+    for o in orders or []:
+        if not _same_contract(_order_sym(o), sym):
+            continue
+        side = (o.get('transaction_type') or o.get('transactionType') or '').upper()
+        if side != 'SELL' or not _order_working(o):
+            continue
+        oqty = _order_qty(o)
+        if oqty <= 0:
+            continue
+        typ = (o.get('order_type') or o.get('orderType') or 'LIMIT').upper()
+        typ_compact = typ.replace('_', '').replace(' ', '').replace('-', '')
+        price = o.get('price') or o.get('limit_price') or 0
+        rec = {'order_id': o.get('order_id') or o.get('orderId'), 'qty': oqty,
+               'price': price, 'order_type': typ}
+        if typ_compact in ('SL', 'SLM'):
+            if flattening:
+                cancel.append(dict(rec, why='stop reserves qty needed for expiry-week flatten'))
+            else:
+                leave.append(dict(rec, why='protective stop left in place'))
+            continue
+        if user_limit_sell_cancel_needed(price, ltp, flattening=flattening):
+            cancel.append(dict(rec, why='limit too far above market to exit now'))
+        else:
+            leave.append(dict(rec, why='user limit sell at or above market left in place'))
+            remaining -= oqty
+    return {'leave': leave, 'cancel': cancel, 'sell_qty': max(remaining, 0)}
+
+
 
 
 def expiry_of(tsym):
@@ -221,13 +364,26 @@ def main():
     def call(u, body=None, method=None):
         """Same contract as before (parsed JSON, or an error dict), on the shared client:
         keep-alive connection, User-Agent, 20 s timeout, no retry for an order POST.
-        Routing is deliberately unchanged: this script went DIRECT for reads and for its
-        square-off POST, so proxy=False keeps it direct (a routing change on an order
-        endpoint is not something a performance refactor gets to make)."""
+        Default routing: reads go direct; POSTs/DELETEs to the order host use the
+        sanctioned static-IP proxy. proxy=False was why the first live place today
+        hit the static-IP block; do not bypass the proxy on order endpoints."""
         try:
-            return api.request(u, body=body, method=method, proxy=False, timeout=20)
+            return api.request(u, body=body, method=method, timeout=20)
         except Exception as e:
             return {'status': 'error', 'err': str(e)[:120]}
+
+    def load_upstox_orders():
+        d = call('https://api.upstox.com/v2/order/retrieve-all')
+        return d.get('data') or []
+
+    def cancel_upstox(oid):
+        return call('https://api-hft.upstox.com/v2/order/cancel?order_id=' + str(oid), None, 'DELETE')
+
+    upstox_orders = []
+    try:
+        upstox_orders = load_upstox_orders()
+    except Exception as e:
+        out['upstox_orders_err'] = f'{type(e).__name__}: {e}'
 
     def quote(key):
         d = call('https://api.upstox.com/v2/market-quote/quotes?instrument_key=' + urllib.parse.quote(key, safe='')).get('data') or {}
@@ -252,7 +408,7 @@ def main():
         if ONLY == 'mcx' and not is_commodity_opt(sym):
             continue
         exp = expiry_for(sym)
-        if not exp or not (0 <= (exp - now.date()).days <= 7):
+        if not exp or not in_expiry_week(exp, now.date()):
             continue
         ltp, lcl = quote(p['instrument_token'])
         if not ltp:
@@ -262,11 +418,28 @@ def main():
         px = tick(ltp * 0.99, tsz)
         if lcl and px < lcl:
             px = tick(lcl, tsz)
-        a = {'broker': 'upstox', 'sym': sym, 'expiry': str(exp), 'qty': q, 'ltp': ltp, 'limit': px}
+        plan = plan_open_sells(upstox_orders, sym, q, ltp, flattening=True)
+        a = {'broker': 'upstox', 'sym': sym, 'expiry': str(exp), 'qty': q, 'ltp': ltp, 'limit': px,
+             'leave': plan['leave'], 'cancel_plan': plan['cancel'], 'sell_qty': plan['sell_qty']}
         if DRY:
-            a['action'] = 'WOULD_SELL'; out['acts'].append(a); continue
+            if plan['cancel']:
+                a['would_cancel'] = [c['order_id'] for c in plan['cancel']]
+            if plan['sell_qty'] <= 0:
+                a['action'] = 'LEAVE_LIMIT'
+            else:
+                a['action'] = 'WOULD_SELL'
+            out['acts'].append(a); continue
+        a['cancelled'] = []
+        for c in plan['cancel']:
+            if not c.get('order_id'):
+                continue
+            r = cancel_upstox(c['order_id'])
+            a['cancelled'].append({c['order_id']: (r.get('status') if isinstance(r, dict) else r)})
+        if plan['sell_qty'] <= 0:
+            a['action'] = 'LEAVE_LIMIT'
+            out['acts'].append(a); continue
         r = call('https://api-hft.upstox.com/v2/order/place', {
-            'quantity': q, 'product': p.get('product') or 'I', 'validity': 'DAY', 'price': px,
+            'quantity': plan['sell_qty'], 'product': p.get('product') or 'I', 'validity': 'DAY', 'price': px,
             'tag': 'expiry_sqoff', 'instrument_token': p['instrument_token'], 'order_type': 'LIMIT',
             'transaction_type': 'SELL', 'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}, 'POST')
         a['action'] = 'SELL' if (r.get('data') or {}).get('order_id') else 'FAIL'
@@ -278,6 +451,11 @@ def main():
         import broker_kite as bk
         if bk.valid():
             k = bk.client()
+            try:
+                kite_orders = bk.orders()
+            except Exception as e:
+                kite_orders = []
+                out['kite_orders_err'] = f'{type(e).__name__}: {e}'
             for p in k.positions()['net']:
                 q = int(p.get('quantity') or 0)
                 if q <= 0:
@@ -290,7 +468,7 @@ def main():
                 if ONLY == 'mcx' and not is_commodity_opt(sym):
                     continue
                 exp = expiry_for(sym)
-                if not exp or not (0 <= (exp - now.date()).days <= 7):
+                if not exp or not in_expiry_week(exp, now.date()):
                     continue
                 ltp = float(p.get('last_price') or 0)
                 if not ltp:
@@ -298,10 +476,26 @@ def main():
                     continue
                 t = bk.tick_for(p['exchange'], sym) or 0.05
                 px = bk.snap(ltp * 0.99, t)
-                a = {'broker': 'kite', 'sym': sym, 'expiry': str(exp), 'qty': q, 'ltp': ltp, 'limit': px}
+                plan = plan_open_sells(kite_orders, sym, q, ltp, flattening=True)
+                a = {'broker': 'kite', 'sym': sym, 'expiry': str(exp), 'qty': q, 'ltp': ltp, 'limit': px,
+                     'leave': plan['leave'], 'cancel_plan': plan['cancel'], 'sell_qty': plan['sell_qty']}
                 if DRY:
-                    a['action'] = 'WOULD_SELL'; out['acts'].append(a); continue
-                oid = bk.place(p['exchange'], sym, 'SELL', q, px, tag='expiry_sqoff',
+                    if plan['cancel']:
+                        a['would_cancel'] = [c['order_id'] for c in plan['cancel']]
+                    if plan['sell_qty'] <= 0:
+                        a['action'] = 'LEAVE_LIMIT'
+                    else:
+                        a['action'] = 'WOULD_SELL'
+                    out['acts'].append(a); continue
+                a['cancelled'] = []
+                for c in plan['cancel']:
+                    if not c.get('order_id'):
+                        continue
+                    a['cancelled'].append({c['order_id']: bk.cancel(c['order_id'])})
+                if plan['sell_qty'] <= 0:
+                    a['action'] = 'LEAVE_LIMIT'
+                    out['acts'].append(a); continue
+                oid = bk.place(p['exchange'], sym, 'SELL', plan['sell_qty'], px, tag='expiry_sqoff',
                                product=p.get('product') or 'MIS')
                 a['action'] = 'SELL' if oid else 'FAIL'
                 a['order'] = oid

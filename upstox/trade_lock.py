@@ -17,7 +17,7 @@ import api                     # pooled + timed transport (5 Nov 2026)
 D=os.path.dirname(os.path.abspath(__file__))
 LF=os.path.join(D,"trade_lock.json")
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
-THRESHOLD=30000
+THRESHOLD=75000
 INDEX_OPT_MAX=3; INDEX_OPT_LOSS=2000; WINDOW_MIN=30; EQ_STOP_CUTOFF=datetime.time(15,10)
 MTF_STOCK_CAP=0.10; MTF_TOTAL_CAP=0.50
 INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FINNIFTY":"NSE_INDEX|Nifty Fin Service",
@@ -105,9 +105,22 @@ def _data(path, strict=False):
         if strict: raise
         return []
 def sym_of(x): return (x.get("trading_symbol") or x.get("tradingsymbol") or "").upper()
+# 16 Nov 2026 (user-approved 12:10 IST): Upstox trading symbols are spaced, e.g. "PAGEIND 31500 PE 23 NOV 26"
+# and "PAYTM FUT 25 NOV 26". The compact Kite form (INDHOTEL26NOV890CE) keeps matching as before.
+_SPACED_OPT=re.compile(r"^[A-Z0-9&\-]+ \d+(\.\d+)? (CE|PE) \d{1,2} [A-Z]{3} \d{2}$")
+_SPACED_FUT=re.compile(r"^[A-Z0-9&\-]+ FUT \d{1,2} [A-Z]{3} \d{2}$")
 def is_opt(s):
     # 4 Nov: a stock named ...CE (e.g. BAJFINANCE) is not an option - require underlying + expiry digits first
-    return bool(re.match(r"^[A-Z&\-]+\d.*(CE|PE)$",(s or "").upper()))
+    t=(s or "").upper().strip()
+    return bool(re.match(r"^[A-Z&\-]+\d.*(CE|PE)$",t) or _SPACED_OPT.match(t))
+def opt_side(s):
+    """'CE' / 'PE' for an option symbol in either format, '' otherwise."""
+    t=(s or "").upper().strip(); m=_SPACED_OPT.match(t)
+    if m: return m.group(2)
+    return t[-2:] if is_opt(t) else ""
+def is_fut(s):
+    t=(s or "").upper().strip()
+    return t.endswith("FUT") or bool(_SPACED_FUT.match(t))
 def underlying(s):
     s=re.sub(r"-EQ$","",s.upper()); m=re.match(r"^([A-Z&\-]+?)(\d{2}[A-Z0-9]{3}|\d{2}N\d{2}|$)",s)
     m2=re.match(r"^[A-Z&\-]+",s); u=m2.group(0) if m2 else s
@@ -258,7 +271,7 @@ def _kite_mtf():
 def _decisions(filled,now):
     """Index-option BUY decisions today across brokers: an Upstox+Kite pair (same index, same CE/PE, within 5 min,
     different brokers) counts as ONE decision."""
-    ev=sorted([(_ts(o),underlying(sym_of(o)),sym_of(o)[-2:],o.get("broker","upstox")) for o in filled
+    ev=sorted([(_ts(o),underlying(sym_of(o)),opt_side(sym_of(o)),o.get("broker","upstox")) for o in filled
         if o["transaction_type"]=="BUY" and is_opt(sym_of(o)) and is_index(sym_of(o)) and _ts(o) and _ts(o).date()==now.date()])
     dec=[]
     for t,u,sd,b in ev:
@@ -266,6 +279,48 @@ def _decisions(filled,now):
         if m: m["b"].add(b)
         else: dec.append({"t":t,"u":u,"sd":sd,"b":{b}})
     return dec
+# ---------------- 16 Nov 2026 performance rules (t669u): contract metadata ----------------
+def _contract_meta(k,sym,broker="upstox"):
+    """{'lot': int|None, 'expiry': date|None} for an option contract, from the masters already on
+    disk (Upstox instruments_*.json.gz by key, Kite kite_instruments_*.csv by symbol). No download.
+    Tests stub this function."""
+    key=("meta",k,sym)
+    if key in _cache: return _cache[key]
+    out={"lot":None,"expiry":None}
+    try:
+        if (k or "").startswith("KITE|"):
+            _k,ex,ts=k.split("|",2)
+            import broker_kite as _bkm
+            row=_bkm._index(ex)[1].get(ts)
+            if row:
+                out["lot"]=int(float(row.get("lot_size") or 0)) or None
+                try: out["expiry"]=datetime.date.fromisoformat(str(row.get("expiry"))[:10])
+                except Exception: out["expiry"]=None
+        elif k:
+            import glob
+            exch="BSE" if k.startswith("BSE") else ("MCX" if k.startswith("MCX") else "NSE")
+            files=sorted(glob.glob(os.path.join(D,f"instruments_{exch}_*.json.gz")))
+            if files:
+                mk=("expmap",files[-1])
+                if mk not in _cache:
+                    _cache[mk]={x["instrument_key"]:(int(x.get("lot_size") or 0),x.get("expiry")) for x in api.gzip_json(files[-1])
+                                if str(x.get("segment","")).endswith("_FO")}
+                hit=_cache[mk].get(k)
+                if hit:
+                    out["lot"]=hit[0] or None
+                    if hit[1]: out["expiry"]=datetime.datetime.fromtimestamp(hit[1]/1000,IST).date()
+    except Exception as e:
+        print(f"trade_lock: contract master unreadable for {k or sym}: {type(e).__name__}: {str(e)[:120]}",file=sys.stderr)
+    _cache[key]=out
+    return out
+def _perf_rules():
+    try:
+        if D not in sys.path: sys.path.insert(0,D)
+        import perf_rules as _pr
+        return _pr
+    except Exception as e:
+        print(f"trade_lock: perf_rules unavailable: {type(e).__name__}",file=sys.stderr)
+        return None
 def check_order(order,broker="upstox"):
     """-> (allowed: bool, reasons: list[str], adjusted_qty: int)
     broker: 'upstox' | 'kite'. Daily index-option limits (R1 count, R2a loss cutoff, R3, R7) use BOTH
@@ -353,8 +408,21 @@ def check_order(order,broker="upstox"):
         # (5 Nov) Upstox MTF equity lives in /v3/portfolio/mtf-positions, NOT in short-term-positions,
         # so its P&L was missing from this breaker: a six-name MTF book could lose money all day and
         # never trip the Rs 30,000 cutoff. Both brokers, all three books, now feed it.
-        day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in upos+umtf+kpos)
-        if day_pnl< -THRESHOLD: block.append(f"R2: combined (Upstox+Kite) day P&L Rs {day_pnl:,.0f} < -30,000 - no new trades today")
+        # 16 Nov 2026 (t669u): option/future rows are valued for TODAY only - carried quantity from
+        # the previous close, partly closed rows booked FIFO from today's fills (daily_loss_cap.row_pnl).
+        # MTF / equity rows keep the broker's own figure.
+        try:
+            import daily_loss_cap as _dlc
+            _uf=_dlc.fills_from_orders(orders,"upstox"); _kf=_dlc.fills_from_orders(kord,"kite")
+            def _dp(p,b,book):
+                if is_opt(sym_of(p)) or is_fut(sym_of(p)):
+                    return _dlc.row_pnl(p,b,_dlc._fills_for(p,b,book))["day_pnl"]
+                return float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0))
+            day_pnl=sum(_dp(p,"upstox",_uf) for p in upos)+sum(_dp(p,"upstox",None) for p in umtf)+sum(_dp(p,"kite",_kf) for p in kpos)
+        except Exception as _de:
+            print(f"trade_lock: today-only P&L failed, broker figure used: {type(_de).__name__}: {_de}",file=sys.stderr)
+            day_pnl=sum(float(p.get("pnl") if p.get("pnl") is not None else (p.get("unrealised") or 0)+(p.get("realised") or 0)) for p in upos+umtf+kpos)
+        if day_pnl< -THRESHOLD: block.append(f"R2: combined (Upstox+Kite) day P&L Rs {day_pnl:,.0f} < -{THRESHOLD:,} - no new trades today")
         ok,fac,why=can_enter(1)
         if not ok: block.append("R2: "+why)
         elif fac<1:
@@ -380,7 +448,7 @@ def check_order(order,broker="upstox"):
                 # partner. Without this, a Kite leg retried a minute after its Upstox leg filled
                 # would be refused by a rule that only exists to slow the bot down.
                 _other="kite" if broker=="upstox" else "upstox"
-                _prev=[d for d in _dec if not (d["b"]=={_other} and d["sd"]==sym[-2:] and timedelta_min(now,d["t"])<=5)]
+                _prev=[d for d in _dec if not (d["b"]=={_other} and d["sd"]==opt_side(sym) and timedelta_min(now,d["t"])<=5)]
                 if _prev:
                     _last=max(d["t"] for d in _prev)
                     if timedelta_min(now,_last)<_gap:
@@ -396,15 +464,24 @@ def check_order(order,broker="upstox"):
                                      + ("" if exp else " (expiry calendar unreadable, treating it as expiry day)"))
             # rule 2a
             _loss=_lim("INDEX_OPT_LOSS",INDEX_OPT_LOSS,now)
-            bl=sum(float(p.get("realised") or 0) for p in upos+kpos
-                   if is_opt(sym_of(p)) and is_index(sym_of(p)) and underlying(sym_of(p))==und)
+            # 16 Nov 2026 (t669u): booked today, FIFO from today's fills; Kite's realised=0 on a partly
+            # closed row is no longer read as nothing booked.
+            try:
+                import daily_loss_cap as _dlc
+                _uf2=_dlc.fills_from_orders(orders,"upstox"); _kf2=_dlc.fills_from_orders(kord,"kite")
+                bl=sum(_dlc.row_pnl(p,b,_dlc._fills_for(p,b,bk_))["realised"] for b,bk_,rows_ in (("upstox",_uf2,upos),("kite",_kf2,kpos)) for p in rows_
+                       if is_opt(sym_of(p)) and is_index(sym_of(p)) and underlying(sym_of(p))==und)
+            except Exception as _be:
+                print(f"trade_lock: R2a FIFO tally failed, broker realised used: {type(_be).__name__}",file=sys.stderr)
+                bl=sum(float(p.get("realised") or 0) for p in upos+kpos
+                       if is_opt(sym_of(p)) and is_index(sym_of(p)) and underlying(sym_of(p))==und)
             if bl< -_loss: block.append(f"R2: {und} option booked loss Rs {bl:,.0f} < -{_loss:,} - no more {und} option trades today")
             # rule 3
             _win=_lim("WINDOW_MIN",WINDOW_MIN,now)
-            other="PE" if sym.endswith("CE") else "CE"
+            other="PE" if opt_side(sym)=="CE" else "CE"
             for o in filled:
                 t=_ts(o); s2=sym_of(o)
-                if o["transaction_type"]=="BUY" and underlying(s2)==und and s2.endswith(other) and t and timedelta_min(now,t)<=_win:
+                if o["transaction_type"]=="BUY" and underlying(s2)==und and opt_side(s2)==other and t and timedelta_min(now,t)<=_win:
                     block.append(f"R3: {und} {other} bought {t:%H:%M} (<{_win} min ago) - no opposite side"); break
             # rule 4. Spot index, unless this process was started with INDEX_ENTRY_SOURCE=futures.
             # Then the order must carry the futures key the entry already chose. A missing or spot
@@ -419,8 +496,8 @@ def check_order(order,broker="upstox"):
                     a=ind.analyze(_key,"minutes",5,5)
                     above=a["close"]>a["ema20"] and a["dir"]==1; below=a["close"]<a["ema20"] and a["dir"]==-1
                     trend=f"{und} 5m {_src} {_key} close {a['close']} ema20 {a['ema20']} ST {'green' if a['dir']==1 else 'red'} @ {a['last_ts'][11:16]}"
-                    if sym.endswith("PE") and not below: block.append("R4: PUT needs 5m close < 20 EMA and red Supertrend ("+trend+")")
-                    if sym.endswith("CE") and not above: block.append("R4: CALL needs 5m close > 20 EMA and green Supertrend ("+trend+")")
+                    if opt_side(sym)=="PE" and not below: block.append("R4: PUT needs 5m close < 20 EMA and red Supertrend ("+trend+")")
+                    if opt_side(sym)=="CE" and not above: block.append("R4: CALL needs 5m close > 20 EMA and green Supertrend ("+trend+")")
             except Exception as e: block.append(f"R4: trend check failed ({e}) - not allowed without trend confirmation")
         # rule 6
         if held_q>0:
@@ -434,6 +511,59 @@ def check_order(order,broker="upstox"):
             t=_ts(o)
             if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=_win7:
                 block.append(f"R7: {und} exit filled {t:%H:%M} (<{_win7} min ago) - cooldown"); break
+        # ---- 16 Nov 2026 performance rules (user t669u "Improve code changes"), every bot option BUY ----
+        # R4b 15m trend filter, R12 re-entry block, R13 lot cap, R14 index expiry >1 trading day.
+        # MCX (crude, manage-only) keeps its own 1-lot crude_auto rule and is not covered here.
+        _mcx=(k or "").startswith(("MCX","KITE|MCX")) or und=="CRUDEOIL"
+        # Effective from 16 Nov 2026; a dated test fixture ("_now") before that keeps the old rule set.
+        if opt and not _mcx and now.date()>=datetime.date(2026,11,16):
+            _pr=_perf_rules()
+            if _pr is None:
+                block.append("R12: perf_rules module missing - option buy refused")
+            else:
+                _pblock=[]
+                try:
+                    sys.path.insert(0,D); import ind as _ind
+                    _t15=_pr.trend15_check(und,opt_side(sym),INDEX_KEYS,_ind.analyze)
+                except Exception as _te:
+                    _t15={"ok":False,"why":f"15m trend check failed ({type(_te).__name__})"}
+                if not _t15["ok"]: _pblock.append("R4b: "+_t15["why"])
+                try:
+                    import broker_kite as _bkr
+                    _tu=_bkr.to_upstox
+                except Exception:
+                    _tu=None
+                _cid=_pr.contract_id(k,sym,_tu)
+                _rok,_rwhy=_pr.reentry_check(_cid,und,now,list(orders)+list(kord),underlying,sym_of,_tu)
+                if not _rok: _pblock.append(_rwhy)
+                _meta=_contract_meta(k,sym,broker)
+                _lot=_meta.get("lot")
+                if not _lot:
+                    _pblock.append(f"R13: lot size unknown for {k or sym} - cannot verify the lot cap")
+                else:
+                    _tot=(max(held_q,0)+qty)/_lot
+                    if idx_opt:
+                        _xd=_expiry_today(und,now) is True
+                        _allow=_pr.allowed_index_lots(_xd, adds_taken=held_q>0)
+                        if held_q<=0 and order.get("_rule_lots") is not None:
+                            try: _allow=min(_allow,int(order["_rule_lots"]))
+                            except (TypeError,ValueError): pass
+                        _rule="max 3 lots incl. the one add" if held_q>0 else ("expiry-day max 3 lots" if _xd else "1 lot normal / 2 strong trend")
+                    else:
+                        # the user's 1 lot; only the dated 5-6 Nov override (_lim) ever said 2
+                        _allow=int(_lim("STOCK_OPT_MAX_LOTS",_pr.STOCK_OPT_LOTS,now)); _rule=f"stock options {_allow} lot per broker"
+                    if _tot>_allow+1e-9:
+                        _pblock.append(f"R13: {sym} would hold {_tot:g} lots (held {held_q} + {qty}, lot {_lot}) > allowed {_allow} ({_rule})")
+                if idx_opt:
+                    _exp=_meta.get("expiry")
+                    if _exp is None:
+                        _pblock.append(f"R14: expiry unknown for {k or sym} - index buy refused")
+                    elif _pr.expiry_too_near(_exp,now.date(),next_trading_day):
+                        _pblock.append(f"R14: {sym} expires {_exp} (within 1 trading day) - bot index buys use a later expiry")
+                if _pblock:
+                    block.extend(_pblock)
+                    if not order.get("_now"):   # "_now" = an offline test fixture; keep it out of the live log
+                        _pr.log_refusal({"broker":broker,"symbol":sym,"side":opt_side(sym),"qty":qty,"reasons":_pblock,"source":order.get("tag") or order.get("_source")})
         # rule 11: stock options, before the order is sent. t460u: three distinct
         # underlyings per broker, pending and reserved names included. The old
         # 4-underlying figure is not applied. Lots stay 1, or 2 only on the
@@ -601,7 +731,7 @@ def check_order(order,broker="upstox"):
               _per=_lim("MTF_PER_STOCK",MTF_STOCK_CAP,now); _tot=_lim("MTF_TOTAL",MTF_TOTAL_CAP,now)
               if this_m+new_m>capital*_per: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > {_per*100:g}% cap Rs {capital*_per:,.0f}")
               if total_m+new_m>capital*_tot: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > {_tot*100:g}% cap Rs {capital*_tot:,.0f}")
-        elif opt or sym.endswith("FUT") or (sym.replace("-EQ","") in (getattr(_cp, "BEE_SYMBOLS", ()) if _cp is not None else ())):
+        elif opt or is_fut(sym) or (sym.replace("-EQ","") in (getattr(_cp, "BEE_SYMBOLS", ()) if _cp is not None else ())):
             if _cap_active and _cp is not None:
                 _kind=_cp.classify(sym, prod, k or "")
                 if _kind=="unassigned" and order.get("_book")==getattr(_cp,"CRUDE_AUTO_BOOK",None) and opt and und=="CRUDEOIL":
@@ -642,7 +772,7 @@ def check_order(order,broker="upstox"):
                 # Pre-9 Nov warning only. This combined line is not a stock-option budget.
                 mtf_total=sum(float(m.get("average_price") or 0)*int(m.get("quantity") or 0) for m in mtf)
                 fno_lim=min(capital*0.5,capital-mtf_total)
-                fno_used=sum(float(p.get("average_price") or p.get("buy_price") or 0)*int(p.get("quantity") or 0) for p in pos if int(p.get("quantity") or 0)>0 and (is_opt(sym_of(p)) or sym_of(p).endswith("FUT")))
+                fno_used=sum(float(p.get("average_price") or p.get("buy_price") or 0)*int(p.get("quantity") or 0) for p in pos if int(p.get("quantity") or 0)>0 and (is_opt(sym_of(p)) or is_fut(sym_of(p))))
                 if fno_used+px*qty>fno_lim: flags.append(f"R10 WARNING: F&O deployed Rs {fno_used+px*qty:,.0f} > legacy combined F&O line Rs {max(fno_lim,0):,.0f} (not a stock-option budget)")
     # rule 5
     if opt and ot in("MARKET","SL-M"): block.append(f"R5: {ot} not allowed on options - use LIMIT/SL")
@@ -653,7 +783,7 @@ def check_order(order,broker="upstox"):
         if live<=0: block.append(f"R8: no live long {sym} in product {prod} - SELL would open a short"); adj=0
         elif qty>live: adj=live; flags.append(f"R8: qty {qty} > live {live} ({prod}) - adjusted to {live}")
         # rule 9
-        if not opt and not sym.endswith("FUT") and ot in("SL","SL-M") and now.time()>EQ_STOP_CUTOFF:
+        if not opt and not is_fut(sym) and ot in("SL","SL-M") and now.time()>EQ_STOP_CUTOFF:
             block.append(f"R9: equity/MTF stop after 15:10 IST ({now:%H:%M}) - closing session rejects it")
     allowed=not block and adj>0
     return allowed, block+flags, adj

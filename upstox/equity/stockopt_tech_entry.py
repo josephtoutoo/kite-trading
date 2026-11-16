@@ -85,7 +85,9 @@ def pick(rows, side, close, today):
 
 def quote(key):
     import urllib.parse
-    d = api.get('/v2/market-quote/full?instrument_key=' + urllib.parse.quote(key, safe='')).get('data') or {}
+    # /v2/market-quote/full returns HTTP 400 UDAPI100012. /quotes has the
+    # same last_price, depth and tick fields this helper returns.
+    d = api.get('/v2/market-quote/quotes?instrument_key=' + urllib.parse.quote(key, safe='')).get('data') or {}
     v = next(iter(d.values()), {})
     ltp = float(v.get('last_price') or 0)
     try: ask = float(v['depth']['sell'][0]['price'])

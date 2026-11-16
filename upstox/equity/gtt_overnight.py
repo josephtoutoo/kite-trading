@@ -12,14 +12,19 @@ Design (one stop per position, never two):
     GTT and the day SL never coexist. If the cancel fails the day SL is not placed and the GTT
     stays live, so protection never lapses in the wrong direction;
   * levels follow the same rules as the day stops: 5% under LTP or the 1-hour Supertrend when
-    nearer for MTF equity, 30% under entry for stock options, and never lower than a level
-    already recorded (risk only narrows).
+    nearer for MTF equity, 20% under entry for new option positions (30% kept for ones
+    already open on 16 Nov 2026), and never lower than a level already recorded (risk only
+    narrows). A working DAY SL and a GTT must never both cover the same quantity: if a day
+    SL is still live the GTT is deferred (NFO already dies at the cash close; MCX stays open
+    into the evening, so this check matters there). --cover-open-session places the GTT
+    anyway and leaves the day SL in place; crude_auto then cancels the GTT if the position
+    goes flat, so they cannot both sell.
 
 Scopes (user's decision, 4 Nov 2026 t325u): the Upstox MTF names this bot opened, the Upstox
 option positions it manages, and the Kite MTF names it opened plus its Kite option/future longs.
 The 14 Kite MTF names the user bought themselves are left on day stops and are never touched.
 
-CLI: python3 gtt_overnight.py status | place [--dry-run] | cancel SYM [SYM...] | cancel-all
+CLI: python3 gtt_overnight.py status [SYM...] | place [--dry-run] [--cover-open-session] [SYM...] | cancel SYM [SYM...] | cancel-all
 Exit codes: 0 ok, 1 something failed, 2 a book could not be read (nothing was changed).
 Read this file's own notes before changing the trigger maths - the audit depends on it.
 """
@@ -34,8 +39,15 @@ D = os.path.dirname(os.path.abspath(__file__))
 SF = os.path.join(D, 'gtt_state.json')
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 DRY = '--dry-run' in sys.argv
+COVER_OPEN = '--cover-open-session' in sys.argv
 PCT = 5.0                 # MTF equity: stop under LTP
-OPT_STOP = 0.30           # stock options: 30% under entry
+OPT_STOP = 0.30           # fallback only if perf_rules / state are unreadable
+# MCX F&O roots (Kite tradingsymbols). Used when the position left exchange blank.
+MCX_PREFIXES = (
+    'CRUDEOIL', 'NATURALGAS', 'NATGASMINI', 'GOLD', 'SILVER',
+    'COPPER', 'ZINC', 'LEAD', 'NICKEL', 'ALUMINI',
+    'MENTHA', 'COTTON', 'KAPAS', 'MCXBULLDEX', 'MCXMETLDEX', 'MCXENRGDEX',
+)
 
 
 def _k(broker, sym):
@@ -62,15 +74,36 @@ def tick_for(p):
     return 0.10 if float(p) >= 1000 else 0.05
 
 
+def symbol_exchange(sym):
+    """Guess the Kite exchange from a tradingsymbol when the position left it blank."""
+    s = (sym or '').upper()
+    if s.startswith(('SENSEX', 'BANKEX')):
+        return 'BFO'
+    if s.startswith(MCX_PREFIXES):
+        return 'MCX'
+    return None
+
+
 def kite_exchange(row):
-    """Exchange for a Kite GTT. The position's own exchange wins (11 Nov 2026: a CRUDEOIL option
-    was sent as NFO and Kite answered "Instrument not found"); the symbol guess is only a fallback."""
+    """Exchange for a Kite GTT. The position's own exchange wins; if it is missing, derive
+    MCX/BFO from the instrument (16 Nov 2026: CRUDEOIL* sent as NFO -> 'Instrument not found').
+    The NFO default is only the last fallback."""
     if row.get('book') == 'MTF':
         return 'NSE'
     ex = (row.get('exchange') or '').upper()
     if ex in ('NFO', 'BFO', 'MCX', 'CDS', 'BCD', 'NSE', 'BSE'):
         return ex
-    return 'BFO' if row['sym'].startswith(('SENSEX', 'BANKEX')) else 'NFO'
+    guessed = symbol_exchange(row.get('sym') or '')
+    if guessed:
+        return guessed
+    try:
+        import broker_kite as bk
+        sym = row.get('sym') or ''
+        if sym and bk._index('MCX')[1].get(sym):
+            return 'MCX'
+    except Exception:
+        pass
+    return 'NFO'
 
 
 def contract_tick(row, trig):
@@ -245,31 +278,101 @@ def level_eq(row, recorded):
     return max(cand, floor)
 
 
+def option_stop_frac(row):
+    """20% for a new option life, 30% if risk_state already marked the position legacy."""
+    try:
+        import perf_rules as prules
+        rec = _risk_row(row['broker'], row['sym']) or {}
+        if rec.get('stop_pct') is not None:
+            return prules.stop_pct(rec)
+        return prules.INITIAL_STOP_PCT
+    except Exception:
+        return OPT_STOP
+
+
 def level_opt(row, recorded):
     ltp, entry = row['ltp'], row['entry']
-    cand = entry * (1 - OPT_STOP) if entry else ltp * 0.7
+    frac = option_stop_frac(row)
+    cand = entry * (1 - frac) if entry else ltp * (1 - frac)
     floor = float(recorded or 0)
     if floor and floor >= ltp * 0.995:
         floor = 0.0
     return max(min(cand, ltp * 0.97), floor)
 
 
+def _risk_state():
+    try:
+        return json.load(open('/workspace/upstox/risk_state.json'))
+    except Exception:
+        return {}
+
+
+def _risk_row(broker, sym):
+    """The risk_state record for this broker+symbol, if any."""
+    rs = _risk_state()
+    if broker == 'kite':
+        for k, v in rs.items():
+            if isinstance(v, dict) and v.get('sym') == sym and (
+                    k.startswith('KITE|') or k.startswith('KITE:') or v.get('broker') == 'kite'):
+                return v
+    for k, v in rs.items():
+        if isinstance(v, dict) and v.get('sym') == sym:
+            return v
+    return None
+
+
 def recorded_level(broker, sym):
     """The level a previous run or the day scripts recorded, so a restart cannot widen a stop."""
     if broker == 'upstox':
         try:
-            return float((json.load(open(os.path.join(D, 'mtf_stops_upstox.json')))
-                          .get('stops') or {}).get(sym) or 0)
+            eq = float((json.load(open(os.path.join(D, 'mtf_stops_upstox.json')))
+                        .get('stops') or {}).get(sym) or 0)
         except Exception:
-            return 0.0
-    try:
-        rs = json.load(open('/workspace/upstox/risk_state.json'))
-    except Exception:
-        return 0.0
-    for k, v in rs.items():
-        if isinstance(v, dict) and v.get('sym') == sym:
-            return float(v.get('stop') or 0)
-    return 0.0
+            eq = 0.0
+        rec = _risk_row(broker, sym)
+        opt = float((rec or {}).get('stop') or 0)
+        return max(eq, opt)
+    rec = _risk_row(broker, sym)
+    return float((rec or {}).get('stop') or 0)
+
+
+# ---------------- live day SLs (must not coexist with a GTT) ----------------
+def kite_day_sls():
+    """Working Kite DAY SELL SL/SL-M, keyed by tradingsymbol."""
+    import broker_kite as bk
+    out = {}
+    for o in bk.orders(strict=True):
+        if (o.get('transaction_type') or '').upper() != 'SELL':
+            continue
+        if (o.get('status') or '').lower() not in ('trigger pending', 'open'):
+            continue
+        if (o.get('order_type') or '') not in ('SL', 'SL-M'):
+            continue
+        sym = o.get('trading_symbol') or o.get('tradingsymbol') or ''
+        if not sym:
+            continue
+        out[sym] = dict(oid=o.get('order_id'), trigger=float(o.get('trigger_price') or 0),
+                        qty=int(o.get('quantity') or 0), exchange=(o.get('exchange') or ''))
+    return out
+
+
+def upstox_day_sls():
+    """Working Upstox DAY SELL SL/SL-M, keyed by trading_symbol."""
+    r = api.get('/v2/order/retrieve-all')
+    out = {}
+    for o in r.get('data') or []:
+        if (o.get('transaction_type') or '').upper() != 'SELL':
+            continue
+        if (o.get('status') or '').lower() not in ('trigger pending', 'open'):
+            continue
+        if (o.get('order_type') or '') not in ('SL', 'SL-M'):
+            continue
+        sym = (o.get('trading_symbol') or o.get('tradingsymbol') or '').replace('-EQ', '')
+        if not sym:
+            continue
+        out[sym] = dict(oid=o.get('order_id'), trigger=float(o.get('trigger_price') or 0),
+                        qty=int(o.get('quantity') or 0))
+    return out
 
 
 # ---------------- actions ----------------
@@ -378,17 +481,31 @@ def main():
         print(json.dumps(acts, indent=1, default=str))
         return 0 if all(x['action'] != 'CANCEL_FAIL' for x in acts) else 1
     # status / place
+    wants = set(a[1:])
     try:
         rows = upstox_targets() + kite_targets()
     except Exception as e:
         print(json.dumps({'error': f'book unreadable - nothing placed: {type(e).__name__}: {e}'}))
         return 2
+    if wants:
+        rows = [r for r in rows if r['sym'] in wants]
+        missing = sorted(wants - {r['sym'] for r in rows})
+        if missing:
+            print(json.dumps({'error': 'not in the overnight-GTT book: ' + ','.join(missing)}))
+            return 2
     try:
         live_u, live_k = upstox_gtts(), kite_gtts()
     except Exception as e:
         print(json.dumps({'error': f'GTT list unreadable - nothing placed: {type(e).__name__}: {e}'}))
         return 2
     live = {'upstox': live_u, 'kite': live_k}
+    day_sl = {'upstox': {}, 'kite': {}}
+    if cmd == 'place':
+        try:
+            day_sl = {'upstox': upstox_day_sls(), 'kite': kite_day_sls()}
+        except Exception as e:
+            print(json.dumps({'error': f'day-SL book unreadable - nothing placed: {type(e).__name__}: {e}'}))
+            return 2
     qs = quotes([r['key'] for r in rows if r['broker'] == 'upstox']) if any(r['broker'] == 'upstox' for r in rows) else {}
     acts = []
     for row in rows:
@@ -415,6 +532,13 @@ def main():
             acts.append(dict(sym=row['sym'], broker=row['broker'], action='KEEP', gtt=cur['id'],
                              trig=cur['trigger'], ltp=row['ltp']))
             continue
+        sl = (day_sl.get(row['broker']) or {}).get(row['sym'])
+        if sl and not COVER_OPEN:
+            acts.append(dict(sym=row['sym'], broker=row['broker'], action='DEFER',
+                             why='day SL still live - GTT deferred so they cannot both sell',
+                             sl=sl.get('oid'), sl_trig=sl.get('trigger'), trig=round(lvl, 2),
+                             ltp=row['ltp'], qty=row['qty']))
+            continue
         if cur:      # our stop is stale or lower than the rules now allow: replace it, never widen
             ok, detail = cancel_sym(row['broker'], row['sym'], rec, key=row.get('key'))
             if not ok:
@@ -426,7 +550,8 @@ def main():
         save(rec)
     save(rec)
     print(json.dumps({'now': datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST'),
-                      'dry_run': DRY, 'targets': len(rows), 'actions': acts}, indent=1, default=str))
+                      'dry_run': DRY, 'cover_open_session': COVER_OPEN, 'targets': len(rows),
+                      'actions': acts}, indent=1, default=str))
     bad = [x for x in acts if x['action'] in ('FAIL', 'REPLACE_FAIL')]
     if bad:
         print('\nNEEDS ATTENTION:', json.dumps(bad, default=str))
