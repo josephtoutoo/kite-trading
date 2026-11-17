@@ -2,7 +2,7 @@
 """Exit results_entry stock options on the trading day BEFORE expected results.
 
 Calendar: ROOT/stockopt_calendar.json (copy the committed .example to deploy).
-Only long stock options are considered. They must be marked results_entry in
+Stock-option debit spreads are closed as a pair (short first), then leftover longs. They must be marked results_entry in
 risk_state.json (or risk_seeds.json) or have a completed BUY tagged results_entry.
 At/after 15:10 IST on the due date, the overnight GTT and live sell stops are
 cancelled before a LIMIT SELL near LTP is sent on the same broker. If that GTT
@@ -78,9 +78,82 @@ def main(argv=None):
     kpos = bk.positions(strict=True)
     out = {'now': now.isoformat(), 'dry_run': args.dry_run,
            'calendar': {u: {k: d.isoformat() for k, d in v.items()} for u, v in cal.items()}, 'actions': []}
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import stockopt_spread as ssp
+    closed_syms = set()
+    def due_now(underlying):
+        if underlying not in cal:
+            return False
+        due = cal[underlying]['exit_date']
+        return now.date() == due and now.time() >= dt.time(15, 10)
+    # Close debit-spread pairs first (short then long) when the underlying is due.
+    all_rows = []
+    for broker, positions in (('upstox', upos), ('kite', kpos)):
+        for p in positions:
+            sym = tl.sym_of(p)
+            if not tl.is_opt(sym) or tl.is_index(sym):
+                continue
+            all_rows.append({'broker': broker, 'sym': sym, 'qty': int(p.get('quantity') or 0),
+                             'underlying': tl.underlying(sym), 'raw': p,
+                             'product': p.get('product'),
+                             'instrument_token': p.get('instrument_token'),
+                             'exchange': p.get('exchange') or 'NFO',
+                             'last_price': p.get('last_price')})
+    for pair in ssp.infer_pairs(all_rows):
+        lg, sh = pair.get('long') or {}, pair.get('short') or {}
+        u = (pair.get('underlying') or lg.get('underlying') or sh.get('underlying') or '').upper()
+        long_sym = lg.get('sym') or lg.get('trading_symbol')
+        if not due_now(u):
+            continue
+        if (long_sym or '').upper() not in marked:
+            continue
+        for leg, side in ((sh, 'BUY'), (lg, 'SELL')):
+            raw = leg.get('raw') or {}
+            qty = abs(int(leg.get('qty') or 0))
+            if qty <= 0:
+                continue
+            broker = pair.get('broker') or leg.get('broker')
+            sym = leg.get('sym') or tl.sym_of(raw)
+            key = raw.get('instrument_token') if broker == 'upstox' else bk.to_upstox(raw.get('exchange') or 'NFO', sym)
+            price = ltp_upstox(key, raw.get('last_price')) if key else float(raw.get('last_price') or 0)
+            item = {'broker': broker, 'symbol': sym, 'qty': qty, 'side': side,
+                    'results_date': cal[u]['results_date'].isoformat(), 'due_date': cal[u]['exit_date'].isoformat()}
+            if not price:
+                item['error'] = 'no LTP; no exit sent'; out['actions'].append(item); break
+            limit = round(price * (1.005 if side == 'BUY' else 0.995), 2)
+            if args.dry_run:
+                item['action'] = 'DRY-RUN: COVER short' if side == 'BUY' else 'DRY-RUN: SELL long'
+                item['limit'] = limit
+                out['actions'].append(item)
+            else:
+                # clear GTT / stops on this leg, then send
+                try:
+                    import gtt_overnight
+                    gtt_ok, gtt_detail = gtt_overnight.cancel_for_day(broker, sym, key=key)
+                except Exception as e:
+                    gtt_ok, gtt_detail = False, '%s: %s' % (type(e).__name__, e)
+                item['gtt_clear'] = {'ok': gtt_ok, 'detail': gtt_detail}
+                if not gtt_ok:
+                    item['error'] = 'GTT not cleared; pair exit stopped'
+                    out['actions'].append(item)
+                    break
+                if broker == 'upstox':
+                    body = {'quantity': qty, 'product': raw.get('product') or 'D', 'validity': 'DAY', 'price': limit,
+                            'tag': TAG, 'instrument_token': raw['instrument_token'], 'order_type': 'LIMIT',
+                            'transaction_type': side, 'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}
+                    r = api.call('https://api-hft.upstox.com/v2/order/place', body, 'POST', proxy=True)
+                    item['order'] = (r.get('data') or {}).get('order_id') or r
+                else:
+                    item['order'] = bk.place(raw.get('exchange') or 'NFO', sym, side, qty, limit, tag=TAG,
+                                             product=raw.get('product') or 'NRML')
+                item['action'] = 'COVER' if side == 'BUY' else 'SELL'
+                out['actions'].append(item)
+            closed_syms.add((broker, (sym or '').upper()))
     for broker, positions, all_orders in (('upstox', upos, orders), ('kite', kpos, korders)):
         for p in positions:
             sym = tl.sym_of(p); qty = int(p.get('quantity') or 0); u = tl.underlying(sym)
+            if (broker, (sym or '').upper()) in closed_syms:
+                continue
             if qty <= 0 or u not in cal or not tl.is_opt(sym) or tl.is_index(sym): continue
             if sym not in marked:
                 out['actions'].append({'broker': broker, 'symbol': sym, 'skip': 'not marked/tagged results_entry'}); continue

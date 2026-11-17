@@ -680,8 +680,20 @@ def check_order(order,broker="upstox"):
                 if _q.get("ok") and px and qty:
                     _view=_mp.rooms(capital, _pos, _pend, None, float(_q["margin"])/(px*qty), now, broker=broker,
                                     unpriced=[s for s,r in _rec.items() if r.get("cost") is None])
-                block.extend(_mp.order_blocks(_view, und, "add" if und in _pos else "new", _mnew,
-                                              order.get("_trend_ok") is True, order.get("_in_loss") is True, _already))
+                # t697u/t698u: tag longterm_dst is a separate sleeve (max 3 names, Rs 50k
+                # margin per name). It is exempt from the Monday 5-name / 10% / 25% caps
+                # only. rooms() already excludes sleeve holdings from those Monday budgets
+                # so a regular MTF buy is not crowded out by this sleeve.
+                _tag=(order.get("tag") or "")
+                if _tag == getattr(_mp, "LONGTERM_DST_TAG", "longterm_dst"):
+                    if not _q.get("ok"):
+                        pass  # quote failure already appended above
+                    else:
+                        block.extend(_mp.longterm_dst_blocks(_mp.longterm_dst_symbols(broker), und, _mnew,
+                                                            already_held=und in _pos))
+                else:
+                    block.extend(_mp.order_blocks(_view, und, "add" if und in _pos else "new", _mnew,
+                                                  order.get("_trend_ok") is True, order.get("_in_loss") is True, _already))
             if not _mon:
               # 4 Nov 2026 (t292u): R10 caps are measured on the MTF MARGIN the broker blocks, not on price x qty.
               # 5 Nov 2026 (t304u): only names THIS bot opened count toward the caps, and each holding is

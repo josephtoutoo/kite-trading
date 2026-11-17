@@ -166,7 +166,7 @@ CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_sizing_cac
 # user brought in themselves (or traded only in the app) are excluded from the count. A name is
 # "mine" when one of my own entry tags appears on a completed BUY for it, or when it is recorded
 # in mtf_managed.json. Broker free margin (R10d) still uses every live holding - that is real money.
-MY_TAGS = ('rotation', 'scanmtf', 'pullback', 'mtfentry', 'mtf_entry', 'refill', 'add', 'top5')
+MY_TAGS = ('rotation', 'scanmtf', 'pullback', 'mtfentry', 'mtf_entry', 'refill', 'add', 'top5', 'longterm_dst')
 _km_cache = {}               # master path -> ((mtime_ns, size), map)
 MANAGED = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mtf_managed.json')
 

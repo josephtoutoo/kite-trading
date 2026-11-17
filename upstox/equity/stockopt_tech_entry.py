@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Strong-technical stock-option entries, mirrored on Upstox and Kite.
 
-Closed 1h candles only. A candidate needs close/EMA20 + Supertrend alignment,
+Closed 1h candles only (SIGNAL_UNIT/INTERVAL, never a 3m or 15m stock-option signal). A candidate needs close/EMA20 + Supertrend alignment,
 MACD histogram and DMI in its direction, and rising ADX >= 25 (ind.strong).
 Nearest unexpired ATM CE/PE, LIMIT at ask (or 0.5% over LTP), tag stockopt_tech.
 trade_lock.check_order is called for BOTH legs before either would be written.
@@ -23,6 +23,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import api, broker_kite as bk, ind, market_calendar, trade_lock as tl
 import stockopt_audit as audit
+import stockopt_spread as ssp
+
+SIGNAL_UNIT = ssp.SIGNAL_UNIT
+SIGNAL_INTERVAL = ssp.SIGNAL_INTERVAL
+SIGNAL_DAYS = ssp.SIGNAL_DAYS
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 TAG = 'stockopt_tech'
@@ -183,7 +188,7 @@ def main(argv=None, now=None, audit_dir=None):
                                              'kite': audit.broker_decision(None)}})
                 continue
             try:
-                a = ind.analyze(chain[0]['underlying_key'], 'hours', 1, 60)
+                a = ind.analyze(chain[0]['underlying_key'], SIGNAL_UNIT, SIGNAL_INTERVAL, SIGNAL_DAYS)
                 side, detail = signal(a)
                 item = {'underlying': u, 'candle': a['last_ts'], 'close': a['close'], 'side': side, 'signal': detail}
                 if not side:
@@ -194,8 +199,41 @@ def main(argv=None, now=None, audit_dir=None):
                                      'brokers': {'upstox': audit.broker_decision(None),
                                                  'kite': audit.broker_decision(None)}})
                     continue
-                opt = pick(chain, side, a['close'], now.date())
-                if not opt: raise RuntimeError('no ATM contract')
+                plan = ssp.plan_entry(chain, side, a['close'], now.date())
+                item['entry_mode'] = plan.get('mode')
+                item['expiry_week'] = plan.get('expiry_week')
+                item['current_monthly'] = plan.get('current_monthly')
+                item['next_monthly'] = plan.get('next_monthly')
+                item['strike_step'] = plan.get('strike_step')
+                item['hedge_steps'] = plan.get('hedge_steps')
+                item['long_strike'] = plan.get('long_strike')
+                item['short_strike'] = plan.get('short_strike')
+                item['spread_reason'] = plan.get('reason')
+                if plan.get('mode') == 'refuse' or not plan.get('long'):
+                    item['skip'] = plan.get('reason') or 'no ATM contract'
+                    result['actions'].append(item)
+                    evidence.append({'underlying': u, 'status': 'rejected', 'evaluated': True,
+                                     'reason': item['skip'], 'candle': a.get('last_ts'), 'close': a.get('close'),
+                                     'brokers': {'upstox': audit.broker_decision(None),
+                                                 'kite': audit.broker_decision(None)}})
+                    continue
+                opt = plan['long']
+                if plan.get('mode') == 'spread':
+                    # This paused scanner has no pair-send path. Spreads are sent only
+                    # from stockopt_st_ema_entry (BUY, wait for fill, SELL, one retry).
+                    item.update(symbol=opt.get('trading_symbol'), expiry=(opt.get('expiry_date').isoformat()
+                                if hasattr(opt.get('expiry_date'), 'isoformat') else opt.get('expiry_date')),
+                                strike=opt.get('strike_price'), send_allowed=plan.get('send_allowed'),
+                                send_block=plan.get('send_block') or ssp.SPREAD_SEND_BLOCK)
+                    item['action'] = 'DRY-RUN: next-month debit spread planned; tech scanner does not send it' if dry else 'REFUSED: debit spread is sent only by the ST/EMA entry routine'
+                    item['skip'] = 'tech scanner does not send debit spreads'
+                    result['actions'].append(item)
+                    evidence.append({'underlying': u, 'status': 'planned' if dry else 'rejected', 'evaluated': True,
+                                     'reason': item['action'], 'candle': a.get('last_ts'), 'close': a.get('close'),
+                                     'symbol': item.get('symbol'),
+                                     'brokers': {'upstox': audit.broker_decision(None),
+                                                 'kite': audit.broker_decision(None)}})
+                    continue
                 lot = int(opt.get('lot_size') or 0)
                 if not lot: raise RuntimeError('missing lot size')
                 ltp, ask, ts = quote(opt['instrument_key'])

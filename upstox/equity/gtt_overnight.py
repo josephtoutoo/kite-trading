@@ -24,7 +24,13 @@ Scopes (user's decision, 4 Nov 2026 t325u): the Upstox MTF names this bot opened
 option positions it manages, and the Kite MTF names it opened plus its Kite option/future longs.
 The 14 Kite MTF names the user bought themselves are left on day stops and are never touched.
 
-CLI: python3 gtt_overnight.py status [SYM...] | place [--dry-run] [--cover-open-session] [SYM...] | cancel SYM [SYM...] | cancel-all
+t691u: debit spreads get a paired overnight GTT: SELL BELOW on the long at the
+net-debit stop, and a companion BUY BELOW on the short at the corresponding
+price (same fractional move). A SELL GTT is never placed on the short. A
+naked leftover short is bought back immediately (COVER_NAKED_SHORT) on
+`reconcile` and at the start of `place` / `status` (status only reports).
+
+CLI: python3 gtt_overnight.py status [SYM...] | place [--dry-run] [--cover-open-session] [SYM...] | reconcile [--dry-run] | cancel SYM [SYM...] | cancel-all
 Exit codes: 0 ok, 1 something failed, 2 a book could not be read (nothing was changed).
 Read this file's own notes before changing the trigger maths - the audit depends on it.
 """
@@ -32,11 +38,14 @@ import sys, os, json, datetime
 
 sys.path.insert(0, '/workspace/upstox')
 sys.path.insert(0, '/workspace/equity')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import api
 import mtf_sizing as ms
+import stockopt_spread as ssp
 
 D = os.path.dirname(os.path.abspath(__file__))
 SF = os.path.join(D, 'gtt_state.json')
+_SPREAD_LEGS = []  # filled while reading targets; used to infer debit-spread pairs
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 DRY = '--dry-run' in sys.argv
 COVER_OPEN = '--cover-open-session' in sys.argv
@@ -182,6 +191,8 @@ def upstox_targets():
                              ltp=float(p.get('last_price') or 0), product='MTF', kind='eq'))
     for p in pos.get('data') or []:
         q = int(p.get('quantity') or 0)
+        if q != 0:
+            _SPREAD_LEGS.extend(ssp.legs_from_positions([p], 'upstox'))
         if q > 0:
             rows.append(dict(broker='upstox', book='Option', sym=p['trading_symbol'],
                              key=p.get('instrument_token'), qty=q,
@@ -206,6 +217,8 @@ def kite_targets():
         raise RuntimeError('Kite positions returned no data')
     for p in net:
         q = int(p.get('quantity') or 0)
+        if q != 0:
+            _SPREAD_LEGS.extend(ssp.legs_from_positions([p], 'kite', sym_field='tradingsymbol'))
         if q <= 0:
             continue
         sym = p['tradingsymbol']
@@ -457,6 +470,163 @@ def cancel_for_day(broker, sym, key=None):
     return ok, detail
 
 
+
+def _leg_row(leg):
+    """Normalise a spread leg into the GTT target shape."""
+    if not isinstance(leg, dict):
+        return None
+    qty = abs(int(leg.get('qty') if leg.get('qty') is not None else leg.get('quantity') or 0))
+    if qty <= 0:
+        return None
+    return dict(broker=leg.get('broker'), book='Option', kind='opt',
+                sym=leg.get('sym') or leg.get('trading_symbol') or leg.get('tradingsymbol'),
+                key=leg.get('key') or leg.get('instrument_token'),
+                qty=qty,
+                entry=float(leg.get('entry') or leg.get('average_price') or leg.get('avg') or 0),
+                ltp=float(leg.get('ltp') or leg.get('last_price') or 0),
+                product=leg.get('product') or ('D' if leg.get('broker') == 'upstox' else 'NRML'),
+                exchange=leg.get('exchange') or '')
+
+
+def place_gtt(row, trig, rec, *, side='SELL', trigger_type='BELOW', limit=None, role=None):
+    """Place one single-instrument GTT (SELL or BUY). Never used to SELL a short spread leg."""
+    if side == 'SELL' and role == 'cover_short':
+        return dict(sym=row['sym'], broker=row['broker'], action='SKIP',
+                    why='refusing a SELL GTT on a spread short')
+    t = contract_tick(row, trig)
+    trig = snap(trig, t)
+    if trig is None or trig <= 0:
+        return dict(sym=row['sym'], broker=row['broker'], action='SKIP', why='trigger unverified', role=role)
+    if trigger_type == 'BELOW' and row.get('ltp') and trig >= row['ltp']:
+        return dict(sym=row['sym'], broker=row['broker'], action='SKIP',
+                    why='trigger at/above ltp', trig=trig, ltp=row['ltp'], role=role)
+    if limit is None:
+        limit = snap((trig - max(t, trig * 0.005)) if side == 'SELL' else (trig + max(t, trig * 0.005)), t)
+    if row['broker'] == 'upstox':
+        body = dict(type='SINGLE', quantity=int(row['qty']), product=row['product'],
+                    rules=[dict(strategy='ENTRY', trigger_type=trigger_type, trigger_price=trig)],
+                    instrument_token=row['key'], transaction_type=side)
+        if DRY:
+            return dict(sym=row['sym'], broker='upstox', action='PLACE(dry)', trig=trig,
+                        qty=row['qty'], side=side, trigger_type=trigger_type, role=role, limit=limit)
+        r = api.call('https://api.upstox.com/v3/order/gtt/place', body=body, proxy=True)
+        gid = ((r.get('data') or {}).get('gtt_order_ids') or [None])[0]
+        if not gid:
+            return dict(sym=row['sym'], broker='upstox', action='FAIL', why=str(r.get('body') or r)[:200],
+                        side=side, role=role)
+        rec[_k('upstox', row['sym'])] = dict(broker='upstox', gtt_id=gid, trigger=trig, qty=row['qty'],
+                               side=side, role=role, placed=datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M'))
+        return dict(sym=row['sym'], broker='upstox', action='PLACE', gtt=gid, trig=trig,
+                    qty=row['qty'], side=side, trigger_type=trigger_type, role=role)
+    import broker_kite as bk
+    if DRY:
+        return dict(sym=row['sym'], broker='kite', action='PLACE(dry)', trig=trig, qty=row['qty'],
+                    side=side, trigger_type=trigger_type, role=role, limit=limit)
+    try:
+        g = bk.client().place_gtt(
+            trigger_type=bk.client().GTT_TYPE_SINGLE, tradingsymbol=row['sym'],
+            exchange=kite_exchange(row),
+            trigger_values=[trig], last_price=row['ltp'],
+            orders=[dict(transaction_type=side, quantity=int(row['qty']), product=row['product'],
+                         order_type='LIMIT', price=limit)])
+    except Exception as e:
+        return dict(sym=row['sym'], broker='kite', action='FAIL', why=f'{type(e).__name__}: {str(e)[:180]}',
+                    side=side, role=role)
+    rec[_k('kite', row['sym'])] = dict(broker='kite', gtt_id=g.get('trigger_id'), trigger=trig, qty=row['qty'],
+                           side=side, role=role, placed=datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M'))
+    return dict(sym=row['sym'], broker='kite', action='PLACE', gtt=g.get('trigger_id'), trig=trig,
+                qty=row['qty'], limit=limit, side=side, trigger_type=trigger_type, role=role)
+
+
+def cover_short_now(order, dry=None):
+    """Immediate LIMIT BUY to close a leftover spread short. Used by morning reconcile."""
+    if dry is None:
+        dry = DRY
+    broker = order.get('broker')
+    sym = order.get('sym') or order.get('trading_symbol') or order.get('tradingsymbol')
+    qty = int(order.get('quantity') or order.get('qty') or 0)
+    ltp = float(order.get('ltp') or order.get('last_price') or 0)
+    if qty <= 0:
+        return dict(sym=sym, broker=broker, action='SKIP', why='no short quantity')
+    if not ltp:
+        return dict(sym=sym, broker=broker, action='SKIP', why='no price to cover the short')
+    t = tick_for(ltp)
+    px = snap(ltp * 1.005, t)
+    if dry:
+        return dict(sym=sym, broker=broker, action='COVER_NAKED_SHORT(dry)', qty=qty, limit=px,
+                    why=order.get('why') or 'spread long is gone; buy back the leftover short')
+    if broker == 'upstox':
+        token = order.get('key') or order.get('instrument_token')
+        body = dict(quantity=qty, product=order.get('product') or 'D', validity='DAY', price=px,
+                    tag='spread_cover', instrument_token=token, order_type='LIMIT',
+                    transaction_type='BUY', disclosed_quantity=0, trigger_price=0, is_amo=False)
+        r = api.call('https://api-hft.upstox.com/v2/order/place', body, 'POST', proxy=True)
+        oid = (r.get('data') or {}).get('order_id')
+        return dict(sym=sym, broker='upstox', action='COVER_NAKED_SHORT' if oid else 'FAIL',
+                    qty=qty, limit=px, order=oid or r)
+    import broker_kite as bk
+    oid = bk.place(order.get('exchange') or 'NFO', sym, 'BUY', qty, px, tag='spread_cover',
+                   product=order.get('product') or 'NRML')
+    return dict(sym=sym, broker='kite', action='COVER_NAKED_SHORT' if oid else 'FAIL',
+                qty=qty, limit=px, order=oid)
+
+
+def process_spread_pairs(cmd, pairs, live, rec, day_sl):
+    """Place or report the paired long-SELL + short-BUY GTTs. Never sells the short."""
+    acts = []
+    handled = set()
+    for pair in pairs or []:
+        lg, sh = pair.get('long') or {}, pair.get('short') or {}
+        plan = ssp.gtt_spread_plan(lg, sh)
+        long_row, short_row = _leg_row(lg), _leg_row(sh)
+        if not plan.get('ok') or not long_row or not short_row:
+            acts.append(dict(broker=pair.get('broker'), action='SKIP_SPREAD_GTT',
+                             why=plan.get('why') or 'spread legs unverified',
+                             long=(lg.get('sym') or lg.get('trading_symbol')),
+                             short=(sh.get('sym') or sh.get('trading_symbol'))))
+            continue
+        long_row['broker'] = long_row.get('broker') or pair.get('broker')
+        short_row['broker'] = short_row.get('broker') or pair.get('broker')
+        handled.add((long_row['broker'], long_row['sym']))
+        handled.add((short_row['broker'], short_row['sym']))
+        for row, leg in ((long_row, plan['long']), (short_row, plan['short'])):
+            key = row['key'] if row['broker'] == 'upstox' else row['sym']
+            cur = (live.get(row['broker']) or {}).get(key)
+            trig = leg['trigger']
+            covered = bool(cur) and cur['trigger'] >= trig - tick_for(trig) - 1e-9
+            if cmd == 'status':
+                acts.append(dict(sym=row['sym'], broker=row['broker'],
+                                 action='KEEP' if covered else 'WOULD_PLACE',
+                                 role=leg['role'], side=leg['transaction_type'],
+                                 trigger_type=leg['trigger_type'],
+                                 gtt=(cur or {}).get('id'), trig=trig, ltp=row['ltp'], qty=row['qty']))
+                continue
+            sl = (day_sl.get(row['broker']) or {}).get(row['sym'])
+            if sl and not COVER_OPEN and leg['transaction_type'] == 'SELL':
+                acts.append(dict(sym=row['sym'], broker=row['broker'], action='DEFER',
+                                 why='day SL still live - GTT deferred so they cannot both sell',
+                                 role=leg['role'], trig=trig, ltp=row['ltp']))
+                continue
+            if covered:
+                acts.append(dict(sym=row['sym'], broker=row['broker'], action='KEEP',
+                                 gtt=cur['id'], trig=cur['trigger'], role=leg['role'],
+                                 side=leg['transaction_type']))
+                continue
+            if cur:
+                ok, detail = cancel_sym(row['broker'], row['sym'], rec, key=row.get('key'))
+                if not ok:
+                    acts.append(dict(sym=row['sym'], broker=row['broker'], action='REPLACE_FAIL',
+                                     why='old GTT %s could not be cancelled: %s' % (cur['id'], detail),
+                                     role=leg['role']))
+                    save(rec)
+                    continue
+            acts.append(place_gtt(row, trig, rec, side=leg['transaction_type'],
+                                  trigger_type=leg['trigger_type'], limit=leg.get('limit'),
+                                  role=leg['role']))
+            save(rec)
+    return acts, handled
+
+
 def main():
     a = [x for x in sys.argv[1:] if not x.startswith('--')]
     cmd = a[0] if a else 'status'
@@ -483,7 +653,10 @@ def main():
     # status / place
     wants = set(a[1:])
     try:
+        _SPREAD_LEGS.clear()
         rows = upstox_targets() + kite_targets()
+        spread_pairs = ssp.infer_pairs(_SPREAD_LEGS)
+        spread_ledger = ssp.load_ledger()
     except Exception as e:
         print(json.dumps({'error': f'book unreadable - nothing placed: {type(e).__name__}: {e}'}))
         return 2
@@ -508,13 +681,57 @@ def main():
             return 2
     qs = quotes([r['key'] for r in rows if r['broker'] == 'upstox']) if any(r['broker'] == 'upstox' for r in rows) else {}
     acts = []
+    # t691u: buy back a leftover spread short first (9:15 reconcile and every place/status).
+    naked = ssp.reconcile_naked_shorts(_SPREAD_LEGS, ledger=spread_ledger, pairs=spread_pairs)
+    for plan in naked:
+        order = dict(plan.get('order') or {}, broker=plan.get('broker'))
+        if cmd == 'status' or DRY:
+            acts.append(dict(sym=plan.get('short_sym'), broker=plan.get('broker'),
+                             action='WOULD_COVER_NAKED_SHORT' if (cmd == 'status' or DRY) else 'COVER_NAKED_SHORT(dry)',
+                             qty=plan.get('qty'), why=(order.get('why'))))
+            continue
+        acts.append(cover_short_now(order, dry=DRY))
+    spread_acts, spread_handled = process_spread_pairs(
+        'status' if cmd == 'status' else ('status' if cmd == 'reconcile' else cmd),
+        spread_pairs, live, rec, day_sl if cmd == 'place' else {'upstox': {}, 'kite': {}})
+    # `reconcile` only covers leftover shorts; it does not place new GTTs.
+    if cmd != 'reconcile':
+        acts.extend(spread_acts)
+    if cmd == 'reconcile':
+        save(rec)
+        print(json.dumps({'now': datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M IST'),
+                          'dry_run': DRY, 'command': 'reconcile', 'actions': acts}, indent=1, default=str))
+        bad = [x for x in acts if x['action'] in ('FAIL', 'REPLACE_FAIL')]
+        if bad:
+            print('\nNEEDS ATTENTION:', json.dumps(bad, default=str))
+        return 1 if bad else 0
     for row in rows:
+        if (row.get('broker'), row.get('sym')) in spread_handled:
+            continue
         if row['broker'] == 'upstox' and row['book'] == 'MTF':
             q = qs.get(row['key']) or {}
             row['ltp'] = float(q.get('last_price') or 0) or row['ltp']
         if not row['ltp']:
             acts.append(dict(sym=row['sym'], broker=row['broker'], action='SKIP', why='no price'))
             continue
+        if row.get('kind') == 'opt':
+            why_s = ssp.gtt_skip_reason(row, ledger=spread_ledger, pairs=spread_pairs)
+            if why_s:
+                cur_s = live[row['broker']].get(row['key'] if row['broker'] == 'upstox' else row['sym'])
+                if cmd == 'status':
+                    acts.append(dict(sym=row['sym'], broker=row['broker'],
+                                     action='WOULD_CANCEL' if cur_s else 'SKIP_SPREAD',
+                                     why=why_s, gtt=(cur_s or {}).get('id')))
+                    continue
+                if cur_s:
+                    ok, detail = cancel_sym(row['broker'], row['sym'], rec, key=row.get('key'))
+                    acts.append(dict(sym=row['sym'], broker=row['broker'],
+                                     action='CANCEL_SPREAD' if ok else 'CANCEL_FAIL',
+                                     why=why_s, detail=detail, gtt=cur_s.get('id')))
+                    save(rec)
+                    continue
+                acts.append(dict(sym=row['sym'], broker=row['broker'], action='SKIP_SPREAD', why=why_s))
+                continue
         rec_level = recorded_level(row['broker'], row['sym'])
         lvl = level_eq(row, rec_level) if row['kind'] == 'eq' else level_opt(row, rec_level)
         cur = live[row['broker']].get(row['key'] if row['broker'] == 'upstox' else row['sym'])

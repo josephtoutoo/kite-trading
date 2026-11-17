@@ -1,0 +1,31 @@
+{
+  "as_of_session": "2026-11-16",
+  "source": "t694u / reports/stockopt_strong_technicals_2026-11-16.json",
+  "timezone": "Asia/Calcutta",
+  "timeframe": "1h",
+  "max_names": 2,
+  "expiry": "2026-11-23",
+  "adx_min": 20,
+  "product": {"upstox": "I", "kite": "MIS"},
+  "square_off_ist": "15:15",
+  "friday_square_off_ist": "15:10",
+  "entry_open_ist": "09:30",
+  "entry_close_ist": "14:30",
+  "lots": 1,
+  "note": "Pinned strong-technicals shortlist for automated INTRADAY stock-option entries. Live 1h + daily must still pass before a name is chosen. Max 2 names. Weaker puts (TMPV, KAYNES, SUZLON) stay on the list but lose on cleanliness when daily MACD has turned up.",
+  "candidates": [
+    {"symbol": "LICHSGFIN", "side": "CE", "preferred_strike": 605, "preferred_contract": "LICHSGFIN 605 CE 23 NOV 26", "lot_size": 1000, "cleanliness": "clean"},
+    {"symbol": "MFSL", "side": "CE", "preferred_strike": 1420, "preferred_contract": "MFSL 1420 CE 23 NOV 26", "lot_size": 400, "cleanliness": "clean"},
+    {"symbol": "APOLLOHOSP", "side": "CE", "preferred_strike": 8800, "preferred_contract": "APOLLOHOSP 8800 CE 23 NOV 26", "lot_size": 125, "cleanliness": "clean"},
+    {"symbol": "ITC", "side": "CE", "preferred_strike": 295, "preferred_contract": "ITC 295 CE 23 NOV 26", "lot_size": 1725, "cleanliness": "clean"},
+    {"symbol": "MAXHEALTH", "side": "CE", "preferred_strike": 1010, "preferred_contract": "MAXHEALTH 1010 CE 23 NOV 26", "lot_size": 525, "cleanliness": "clean"},
+    {"symbol": "SBILIFE", "side": "CE", "preferred_strike": 1820, "preferred_contract": "SBILIFE 1820 CE 23 NOV 26", "lot_size": 375, "cleanliness": "clean"},
+    {"symbol": "MARICO", "side": "CE", "preferred_strike": 910, "preferred_contract": "MARICO 910 CE 23 NOV 26", "lot_size": 1200, "cleanliness": "clean"},
+    {"symbol": "UNITDSPR", "side": "CE", "preferred_strike": 1440, "preferred_contract": "UNITDSPR 1440 CE 23 NOV 26", "lot_size": 400, "cleanliness": "clean"},
+    {"symbol": "PIIND", "side": "PE", "preferred_strike": 1680, "preferred_contract": "PIIND 1680 PE 23 NOV 26", "lot_size": 175, "cleanliness": "clean"},
+    {"symbol": "PREMIERENE", "side": "PE", "preferred_strike": 820, "preferred_contract": "PREMIERENE 820 PE 23 NOV 26", "lot_size": 650, "cleanliness": "clean"},
+    {"symbol": "TMPV", "side": "PE", "preferred_strike": 260, "preferred_contract": "TMPV 260 PE 23 NOV 26", "lot_size": 1600, "cleanliness": "weaker", "note": "daily MACD has turned up"},
+    {"symbol": "KAYNES", "side": "PE", "preferred_strike": 3000, "preferred_contract": "KAYNES 3000 PE 23 NOV 26", "lot_size": 150, "cleanliness": "weaker", "note": "daily MACD has turned up"},
+    {"symbol": "SUZLON", "side": "PE", "preferred_strike": 37, "preferred_contract": "SUZLON 37 PE 23 NOV 26", "lot_size": 12700, "cleanliness": "weaker", "note": "daily MACD has turned up"}
+  ]
+}

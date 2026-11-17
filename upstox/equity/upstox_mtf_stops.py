@@ -162,12 +162,23 @@ def main():
             _plan = _pol.position_stop(key, ltp, existing_trigger=_live or None, existing_qty=_qty,
                                       position_qty=qty, allow_trail=sym in mine)
             if not _plan.get('place_stop'):
-                acts.append(dict(sym=sym, action=_plan.get('action') or 'KEEP', ltp=ltp, qty=qty,
-                                 trigger=_plan.get('trigger'), source=_plan.get('source'),
-                                 why=_plan.get('reason'), exit=_plan.get('exit'),
-                                 execute_exit=_plan.get('execute_exit')))
-                continue
-            cand = float(_plan['trigger'])
+                _dst_pending = False
+                try:
+                    if '/workspace/upstox/equity' not in sys.path:
+                        sys.path.insert(0, '/workspace/upstox/equity')
+                    import longterm_daily_st as _lt0
+                    _dst_pending = _lt0.symbol_in_sleeve(sym)
+                except Exception:
+                    _dst_pending = False
+                if not _dst_pending:
+                    acts.append(dict(sym=sym, action=_plan.get('action') or 'KEEP', ltp=ltp, qty=qty,
+                                     trigger=_plan.get('trigger'), source=_plan.get('source'),
+                                     why=_plan.get('reason'), exit=_plan.get('exit'),
+                                     execute_exit=_plan.get('execute_exit')))
+                    continue
+                cand = float(_plan.get('trigger') or ltp * (1 - pct / 100.0))
+            else:
+                cand = float(_plan['trigger'])
             stx, d = None, None
             pct_stop = ltp * (1 - pct / 100.0)
         else:
@@ -176,7 +187,37 @@ def main():
             cand = pct_stop
             if stx and d == 1 and stx < ltp and stx > pct_stop:
                 cand = stx                                  # Supertrend nearer, still below price
-        own = sym in mine
+        # t697u/t698u: longterm_dst sleeve trails to the daily Supertrend only and never loosens.
+        dst_sleeve = False
+        try:
+            if '/workspace/upstox/equity' not in sys.path:
+                sys.path.insert(0, '/workspace/upstox/equity')
+            import longterm_daily_st as _lt
+            if _lt.symbol_in_sleeve(sym):
+                dst_sleeve = True
+                rec = ((_lt.load_sleeve_state().get('positions') or {}).get('upstox') or {}).get(sym) or {}
+                daily_st = rec.get('stop')
+                try:
+                    import mtf_policy as _pol2
+                    snap = (_pol2.qualify_symbol(key).get('snapshot') or {})
+                    if snap.get('st') is not None:
+                        daily_st = snap.get('st')
+                except Exception:
+                    pass
+                live_trig = max([float(o.get('trigger_price') or 0) for o in cur] or [0]) or None
+                _dst = _lt.longterm_dst_trail_plan(ltp, daily_st,
+                                                   existing_trigger=live_trig,
+                                                   floor_stop=rec.get('stop'))
+                if not _dst.get('place_stop'):
+                    acts.append(dict(sym=sym, action=_dst.get('action') or 'KEEP', ltp=ltp, qty=qty,
+                                     trigger=_dst.get('trigger'), source=_dst.get('source'),
+                                     why=_dst.get('reason'), sleeve='longterm_dst'))
+                    continue
+                cand = float(_dst['trigger'])
+        except Exception as e:
+            print(f'upstox_mtf_stops: longterm_dst branch failed for {sym}: {type(e).__name__}: {e}',
+                  file=sys.stderr)
+        own = sym in mine or dst_sleeve
         if not own and cur:
             # The user's own holding already has a live stop: leave it exactly as it is.
             acts.append(dict(sym=sym, action='KEEP', order=cur[0]['order_id'],

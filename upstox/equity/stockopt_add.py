@@ -17,6 +17,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import stockopt_audit as audit
 import stockopt_policy as pol
+import stockopt_spread as ssp
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 ADD_PAUSED = True
@@ -34,6 +35,23 @@ def plan(payload):
     decision['send'] = False
     decision['paused'] = True
     decision['orders_placed'] = False
+    ledger = payload.get('spread_ledger')
+    if ledger is None:
+        ledger = ssp.load_ledger()
+    legs = ssp.legs_from_positions(payload.get('upstox') or [], 'upstox') + ssp.legs_from_positions(payload.get('kite') or [], 'kite')
+    pairs = ssp.infer_pairs(legs)
+    spread_hit = None
+    for leg in legs:
+        if int(leg.get('qty') or 0) <= 0:
+            continue
+        why = ssp.gtt_skip_reason(leg, ledger=ledger, pairs=pairs)
+        if why and 'spread' in (why or ''):
+            spread_hit = why
+            break
+    if spread_hit:
+        decision['eligible'] = False
+        decision['reason'] = 'no add on a debit spread; both legs must stay matched'
+        decision['spread_block'] = spread_hit
     return decision
 
 

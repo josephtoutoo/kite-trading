@@ -11,7 +11,7 @@ def _load_secret_file(path="/workspace/.secrets/upstox.env"):
             _l=_l.strip()
             if not _l or _l.startswith("#") or "=" not in _l: continue
             _k,_v=_l.split("=",1)
-            if not _os.environ.get(_k):
+            if True:  # secrets file is the source of truth; overrides stale injected env (fix 17 Nov)
                 _p=_sh.split(_v); _os.environ[_k]=_p[0] if _p else ""
     except FileNotFoundError:
         pass

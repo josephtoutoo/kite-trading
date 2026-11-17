@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Automatic NIFTY/BANKNIFTY/SENSEX option entries (user standing permission from 4 Nov 2026; first entry 1 lot base / 2 ST-EMA / expiry max(3, trend); 14 Nov revert from the 2-lot base).
-Run every 5 min by a routine. Acts only 09:20-14:45 IST Mon-Fri (risk_manager handles exits till 15:25).
+Run by a routine (every 3 min recommended for the 3m route). Acts only 09:30-15:25 IST Mon-Fri (t673u, 16 Nov 2026;
+was 09:20-14:45); the 3m route stops new entries at 15:10 and every route at 15:05 on a Friday (index_routes.py).
+t673u routes (INDEX_CONTRACT_POLICY=1): 3m intraday current-week, 15m delivery next-week, 1h delivery monthly
+(current-week monthly rolls to next month). Each route holds its own position per index per broker and also takes a
+previous-day trend continuation when it has no open position. Per-route tracking: index_route_positions.json.
 Signal on last CLOSED 5-min candle (ind.py): FRESH cross only.
   CE: close > EMA20 and Supertrend green, previous candle not both; MACD hist > 0; ADX >= 18
   PE: close < EMA20 and Supertrend red,   previous candle not both; MACD hist < 0; ADX >= 18
@@ -38,6 +42,7 @@ import index_size_policy as isp
 import daily_loss_cap as dlc    # 14 Nov 2026: no NEW entry after 2 losing closed trades or Rs15k realised today (both brokers); exits untouched
 import entry_filters as ef      # 12 Nov 2026: India VIX filter, SHADOW ONLY: logs would-skip, never blocks
 import perf_rules as prules     # 16 Nov 2026 (t669u): 15m trend filter, expiry >1 trading day, 20% initial stop, lot cap
+import index_routes as iroutes  # 16 Nov 2026 (t673u): 3m / 15m / 1h routes, per-route position tracking
 DRY="--dry-run" in sys.argv
 # Delayed confirmation of a fresh 5m cross (MACD/ADX may arrive on a later closed candle,
 # and a cooldown must not erase the cross). Off unless the process is started with
@@ -56,6 +61,9 @@ FUTURES_SIGNAL=ENTRY_SOURCE=="futures"
 # 5m is not a fallback. Delayed confirmation is a separate flag and stays off.
 CONTRACT_POLICY=icp.contract_policy_on()
 ENTRY_TF=os.environ.get("INDEX_ENTRY_TIMEFRAME","1h")
+# t673u (16 Nov 2026): the contract-policy path evaluates every enabled route (INDEX_ROUTES, default 3m,15m,1h)
+# for every index. INDEX_ENTRY_TIMEFRAME is superseded on that path.
+ROUTES_ON=iroutes.enabled_routes() if CONTRACT_POLICY else []
 EXECUTE=os.environ.get("INDEX_EXECUTE","").strip()=="1" or "--execute" in sys.argv
 # Live 1h/15m indicators need enough history for MACD(12,26,9) to settle.
 # 5 calendar days was too short. A single 30-day request works; 44 days failed (UDAPI1148).
@@ -84,7 +92,7 @@ IDX={"NIFTY":{"key":"NSE_INDEX|Nifty 50","exch":"NSE","seg":"NSE_FO","kite_excha
 SF=os.path.join(D,"risk_state.json"); SEEN=os.path.join(D,"seen_entries.json")
 out={"now":now.strftime("%Y-%m-%d %H:%M IST"),"dry_run":DRY,"reversal_confirm":REVERSAL_CONFIRM,
      "entry_source":ENTRY_SOURCE,"contract_policy":CONTRACT_POLICY,"execute":EXECUTE,"sender":bool(EXECUTE),
-     "entry_timeframe":ENTRY_TF if CONTRACT_POLICY else "5m","rules":f"fresh 5m cross EMA20+Supertrend, MACD hist in direction, ADX>={ADX_MIN} (anti-chop)","indices":{}}
+     "entry_timeframe":",".join(ROUTES_ON) if CONTRACT_POLICY else "5m","routes":ROUTES_ON,"rules":f"fresh 5m cross EMA20+Supertrend, MACD hist in direction, ADX>={ADX_MIN} (anti-chop)","indices":{}}
 # t339u: say which rule set this run is under. On 5-6 Nov 2026 the limit checks in trade_lock
 # move to the two-day values (equity/autonomy.py) and this block names them; from 7 Nov it is the
 # user's own rules again and the block says so. Nothing else in this script changes.
@@ -107,8 +115,8 @@ if ENTRY_SOURCE=="invalid":
     out["skipped"]="INDEX_ENTRY_SOURCE must be spot or futures; spot was not assumed"; done()
 if not DRY and not market_calendar.is_trading_day(now.date()):
     out["skipped"]="exchange holiday / market closed ("+now.date().isoformat()+")"; done()
-if not DRY and (now.weekday()>=5 or not (datetime.time(9,20)<=now.time()<=datetime.time(14,45))):
-    out["skipped"]="outside 09:20-14:45 IST weekday entry window"; done()
+if not DRY and (now.weekday()>=5 or not (iroutes.ENTRY_START<=now.time()<=iroutes.ENTRY_END)):
+    out["skipped"]="outside 09:30-15:25 IST weekday entry window"; done()
 def req(u,body=None,method=None,proxy=False):
     """Parsed JSON, or {'status':'error','code':..,'body':..} exactly as before. One shared
     keep-alive client; proxy=True forces the static-IP proxy, False forces a direct read.
@@ -294,6 +302,61 @@ def _open_opt_idx(rows):
 # full_auto_add.py's job). Before this, an Upstox position blocked the Kite leg too.
 U_OPEN=_open_opt_idx(pos if _pos_reply.get("status")=="success" else None)
 K_OPEN=_open_opt_idx(_KPOS)
+# ---- t673u (16 Nov 2026): per-route occupancy. A tracked position (index_route_positions.json) keeps its
+# route; an untracked one (opened before this change, or manually) is classified read-only by inference
+# (intraday product -> 3m, monthly expiry -> 1h, else 15m) and is never rewritten or touched.
+_RSTATE=iroutes.load()
+_MON_CACHE={}; _KEYROW={}; _OCC_CACHE={}; _FUT_CACHE={}
+def _monthlies(name,exch):
+    if name not in _MON_CACHE:
+        _s=set()
+        for row in master(exch):
+            if row.get("instrument_type")=="FUT" and (row.get("underlying_symbol") or row.get("name"))==name:
+                _s.add(datetime.datetime.fromtimestamp(row["expiry"]/1000,IST).date())
+        _MON_CACHE[name]=_s
+    return _MON_CACHE[name]
+def _master_row(key):
+    if not _KEYROW:
+        for _ex in ("NSE","BSE"):
+            for row in master(_ex):
+                if row.get("segment") in ("NSE_FO","BSE_FO") and row.get("instrument_key"): _KEYROW[row["instrument_key"]]=row
+    return _KEYROW.get(key)
+def _route_occupancy(name,cfg,broker):
+    """{"routes":{route:[symbols]},"positions":[...]} for one index on one broker; None = book unreadable."""
+    ck=(name,broker)
+    if ck in _OCC_CACHE: return _OCC_CACHE[ck]
+    rows=(pos if _pos_reply.get("status")=="success" else None) if broker=="upstox" else _KPOS
+    if rows is None: _OCC_CACHE[ck]=None; return None
+    occ={rt:[] for rt in iroutes.ROUTES}; det=[]
+    for p in rows:
+        sym=trade_lock.sym_of(p)
+        if int(p.get("quantity") or 0)<=0 or not trade_lock.is_opt(sym) or trade_lock.underlying(sym)!=name: continue
+        if broker=="upstox":
+            ik=p.get("instrument_token") or p.get("instrument_key"); key=iroutes.ukey(ik)
+        else:
+            key=iroutes.kkey(p.get("exchange"),sym)
+            try: ik=bk.to_upstox(p.get("exchange"),sym)
+            except Exception: ik=None
+        mr=_master_row(ik) if ik else None
+        expd=datetime.datetime.fromtimestamp(mr["expiry"]/1000,IST).date() if mr and mr.get("expiry") else None
+        rt,how=iroutes.route_of(_RSTATE,key,p.get("product"),expd,_monthlies(name,cfg["exch"]))
+        occ[rt].append(sym)
+        det.append({"symbol":sym,"qty":int(p.get("quantity") or 0),"product":p.get("product"),"route":rt,"how":how,"key":key,"upstox_key":ik,"expiry":str(expd) if expd else None})
+    _OCC_CACHE[ck]={"routes":occ,"positions":det}
+    return _OCC_CACHE[ck]
+def _prune_route_state():
+    """Live runs only, both books readable: drop records of positions that are flat and were opened before today."""
+    if DRY or not CONTRACT_POLICY or _pos_reply.get("status")!="success" or _KPOS is None: return
+    try:
+        live={iroutes.ukey(p.get("instrument_token")) for p in pos if int(p.get("quantity") or 0)>0}
+        live|={iroutes.kkey(p.get("exchange"),trade_lock.sym_of(p)) for p in _KPOS if int(p.get("quantity") or 0)>0}
+        P=_RSTATE.get("positions") or {}
+        stale=[k for k,v in P.items() if k not in live and str((v or {}).get("opened",""))[:10]<now.date().isoformat()]
+        for k in stale: P.pop(k,None)
+        if stale: iroutes.save(_RSTATE)
+    except Exception as e:
+        print(f"auto_entry: route state prune skipped: {type(e).__name__}: {e}",file=sys.stderr)
+_prune_route_state()
 # 16 Nov 2026 (t669u): today's order books feed the FIFO loss-cap tally (partly closed rows, carried
 # quantity valued at the previous close). An unreadable book only drops back to the row method.
 def _orders_or_none():
@@ -312,8 +375,11 @@ out["daily_loss_cap"]=LOSS_CAP
 _EF=ef.config()
 if _EF["mode"]!="off": _EF["mode"]="shadow"   # user rule 12 Nov 2026: shadow only, enforce is not honoured here
 _VIX=ef.vix_inputs(ind.candles,now) if (_EF["mode"]!="off" and _EF["vix_pct"] is not None) else (None,[])
-for name,cfg in IDX.items():
-    r=out["indices"][name]={}
+# t673u: one pass per (index, route). Without the contract policy the legacy single 5m pass is unchanged.
+_LOOP=[(name,cfg,rt) for name,cfg in IDX.items() for rt in (ROUTES_ON or [None])]
+for name,cfg,ROUTE in _LOOP:
+    if ROUTE is None: r=out["indices"][name]={}
+    else: r=out["indices"].setdefault(name,{})[ROUTE]={}
     try:
         claimed_id=None
         signal_key=cfg["key"]
@@ -321,17 +387,28 @@ for name,cfg in IDX.items():
         tf_meta=None
         futures_5m=None
         _elig={"upstox":{"ok":True,"reason":None},"kite":{"ok":True,"reason":None}}
+        _occ={}
+        if ROUTE is not None:
+            r["route"]=ROUTE
+            r["product"]={"upstox":iroutes.SPEC[ROUTE]["upstox_product"],"kite":iroutes.SPEC[ROUTE]["kite_product"]}
+            _wok,_wwhy=iroutes.in_window(ROUTE, now)
+            if not _wok and not DRY:
+                r["signal"]="NONE"; r["action"]="no entry: "+_wwhy; continue
+            if not _wok: r["window_note"]=_wwhy+" (ignored on --dry-run)"
         if CONTRACT_POLICY:
-            _route=icp.route(name, ENTRY_TF)
+            _route=iroutes.route(name, ROUTE)
             if not _route["ok"]:
                 r["signal"]="NONE"; r["action"]="no entry: "+_route["reason"]; continue
             if not FUTURES_SIGNAL:
                 r["signal"]="NONE"; r["action"]="no entry: 1h/15m requires futures candles; spot 5m was not used"; continue
         if FUTURES_SIGNAL:
             try:
-                krows,kerr=ifut.fetch_kite_master(cfg["kite_exchange"])
-                res=ifut.resolve(name, master(cfg["exch"]), krows, now.date())
-                if krows is None: res["audit"]["kite_master_error"]=kerr
+                if name not in _FUT_CACHE:
+                    krows,kerr=ifut.fetch_kite_master(cfg["kite_exchange"])
+                    _res=ifut.resolve(name, master(cfg["exch"]), krows, now.date())
+                    if krows is None: _res["audit"]["kite_master_error"]=kerr
+                    _FUT_CACHE[name]=_res
+                res=_FUT_CACHE[name]
             except Exception as e:
                 r["signal"]="NONE"; r["action"]=f"no entry: futures master unreadable ({type(e).__name__}); spot was not used"
                 continue
@@ -350,13 +427,22 @@ for name,cfg in IDX.items():
                 r["signal"]="NONE"; r["action"]=f"no entry: futures candles unreadable ({type(e).__name__}); spot was not used"
                 continue
             r["futures_candles"]=gate
-            if not gate["ok"]:
+            if not gate["ok"] and DRY and "stale" in str(gate.get("reason")):
+                # --dry-run only (never orders): evaluate the last completed session so routes/contracts can be checked after hours.
+                r["dry_run_note"]="futures candles stale ("+gate["reason"]+"); evaluated anyway because --dry-run cannot order"
+            elif not gate["ok"]:
                 r["signal"]="NONE"; r["action"]="no entry: "+gate["reason"]+"; spot was not used"; continue
         if CONTRACT_POLICY:
             try:
-                if futures_5m is None:
-                    futures_5m=ind.candles(signal_key,"minutes",5,INDICATOR_HISTORY_DAYS)
-                built=icp.resample(futures_5m, _route["minutes"], datetime.datetime.now(IST))
+                if _route["minutes"]==3:
+                    # t673u 3m route: the broker's own 3-minute futures candles (5m cannot build 3m).
+                    _c3=[c for c in ind.candles(signal_key,"minutes",3,iroutes.SPEC["3m"]["history_days"])
+                         if icp.OPEN<=iel.parse_ts(c[0]).time()<icp.CLOSE]   # session bars only (09:15-15:30 IST)
+                    built={"ok":bool(_c3),"reason":"no 3m futures candles","candles":_c3}
+                else:
+                    if futures_5m is None:
+                        futures_5m=ind.candles(signal_key,"minutes",5,INDICATOR_HISTORY_DAYS)
+                    built=icp.resample(futures_5m, _route["minutes"], datetime.datetime.now(IST))
             except Exception as e:
                 r["signal"]="NONE"; r["action"]=f"no entry: futures resample failed ({type(e).__name__}); 5m was not used"; continue
             if not built["ok"]:
@@ -366,6 +452,14 @@ for name,cfg in IDX.items():
                 r["signal"]="NONE"; r["action"]="no entry: resampled series has no closed pair"; continue
             a=iel.analyze_shape(bars[-1], bars[-2]); a["last_ts"]=bars[-1]["ts"]; a["st"]=bars[-1].get("st"); a["prev_hist"]=bars[-2]["hist"]; a["prev_adx"]=bars[-2]["adx"]
             sig,raw,why=signal(a)
+            r["signal_mode"]="fresh_cross" if sig else None
+            if not sig:
+                # t673u: previous-day trend continuation (no fresh cross) when the route has no open position;
+                # a broker that already holds this route is refused by dedupe_route below.
+                _cs,_cdet=iroutes.continuation(bars, now.date(), ADX_MIN)
+                r["continuation"]=_cdet
+                if _cs:
+                    sig=raw=_cs; why=list(why)+[_cdet["why"]]; r["signal_mode"]="prev_day_continuation"
             monthlies=set()
             try:
                 for row in master(cfg["exch"]):
@@ -380,7 +474,7 @@ for name,cfg in IDX.items():
                 # can serve as NIFTY/SENSEX next-week expiry. A date with mixed or missing tags stays untagged.
                 _rows=[{"expiry":_d,"weekly":next(iter(_f))} if len(_f)==1 and next(iter(_f)) in (True,False) else _d
                        for _d,_f in _wk.items()]
-                chosen=icp.select_expiry(name, _route["name"], now.date(), _rows, monthlies, None)
+                chosen=iroutes.select_expiry(name, ROUTE, now.date(), _rows, monthlies)
                 r["expiry_choice"]={k:(v.isoformat() if hasattr(v,"isoformat") else v) for k,v in chosen.items()}
             except Exception as e:
                 r["signal"]="NONE"; r["action"]=f"no entry: expiry master unreadable ({type(e).__name__})"; continue
@@ -388,11 +482,15 @@ for name,cfg in IDX.items():
                 r["signal"]="NONE"; r["action"]="no entry: "+chosen["reason"]; continue
             forced_expiry=chosen["expiry"]
             tf_meta=icp.metadata(name, _route["name"], chosen["expiry"], chosen["role"], signal_key)
+            tf_meta["_route"]=ROUTE
             r["contract"]=tf_meta
             held=iel.load_trigger(TRIGGERS, "_decisions") or {}
             today_dec=[row for row in (held.get(now.date().isoformat()) or [])]
-            _elig={"upstox":icp.dedupe_broker(name, "upstox", U_OPEN, today_dec),
-                   "kite":icp.dedupe_broker(name, "kite", K_OPEN, today_dec)}
+            # t673u: one position per index PER ROUTE per broker (was per index).
+            _occ={"upstox":_route_occupancy(name,cfg,"upstox"),"kite":_route_occupancy(name,cfg,"kite")}
+            r["route_occupancy"]={b:(v["positions"] if v is not None else "unreadable") for b,v in _occ.items()}
+            _elig={b:iroutes.dedupe_route(name, b, ROUTE, (_occ[b]["routes"] if _occ[b] is not None else None), today_dec)
+                   for b in ("upstox","kite")}
             r["broker_eligibility"]=_elig
             if not _elig["upstox"]["ok"] and not _elig["kite"]["ok"]:
                 r["signal"]="NONE"; r["action"]="no entry: upstox: "+_elig["upstox"]["reason"]+" | kite: "+_elig["kite"]["reason"]; continue
@@ -411,6 +509,10 @@ for name,cfg in IDX.items():
             except Exception as e:
                 print(f"auto_entry: decision row not built for {name}: {type(e).__name__}: {e}", file=sys.stderr)
         openp=[p for p in pos if int(p.get("quantity") or 0)>0 and trade_lock.underlying(trade_lock.sym_of(p))==name and trade_lock.is_opt(trade_lock.sym_of(p))]
+        if ROUTE is not None:
+            # t673u: only this route's own position blocks this route on Upstox.
+            _uo=((_occ.get("upstox") or {}).get("routes") or {}).get(ROUTE) or []
+            openp=[p for p in openp if trade_lock.sym_of(p) in _uo]
         if openp: r["open_position"]=[trade_lock.sym_of(p) for p in openp]
         rev=None
         if not CONTRACT_POLICY:
@@ -461,6 +563,13 @@ for name,cfg in IDX.items():
         if not picked:
             r["signal"]="NONE"; r["action"]="no entry: listed expiry "+str(forced_expiry)+" is not in the option master; nearest expiry was not used"; continue
         best,exp,std=picked
+        if ROUTE is not None:
+            # t673u: one contract is tracked by one route per broker (stops/exits are keyed by contract).
+            for _b in ("upstox","kite"):
+                _same=[d2 for d2 in ((_occ.get(_b) or {}).get("positions") or []) if d2.get("upstox_key")==best["instrument_key"]]
+                if _same and _elig[_b]["ok"]:
+                    _elig[_b]={"ok":False,"reason":f"{best['trading_symbol']} is already held on {_b} by the {_same[0]['route']} route; one contract per route"}
+            r["broker_eligibility"]=_elig
         strong,sside,sdet=ind.strong(a); r["strong"]={"on":strong,"side":sside,**sdet}
         expire_today = (exp == now.date())
         lots, size_note = size_lots(expire_today, bool(strong and sig and sside == raw), sig, raw, sside)
@@ -468,6 +577,10 @@ for name,cfg in IDX.items():
         if size_note: r["size"] = size_note
         qty=lots*int(best["lot_size"])
         r["option"]={"symbol":best["trading_symbol"],"key":best["instrument_key"],"expiry":str(exp),"strike":best["strike_price"],"lot_size":best["lot_size"],"qty":qty,"strike_step":std}
+        if ROUTE is not None:
+            r["option"].update({"route":ROUTE,"expiry_role":(r.get("expiry_choice") or {}).get("role"),
+                                "expiry_rule":(r.get("expiry_choice") or {}).get("rule"),
+                                "product_upstox":iroutes.SPEC[ROUTE]["upstox_product"],"product_kite":iroutes.SPEC[ROUTE]["kite_product"]})
         if not sig:
             r["action"]="duplicate: reversal trigger already submitted" if r.get("reversal_duplicate") else "none: no fresh signal"
             continue
@@ -560,6 +673,10 @@ for name,cfg in IDX.items():
         ekw=in_expiry_week(exp)
         r["expiry_week"]=ekw
         r["carry"]="intraday only (expiry week)" if ekw else "positional"
+        # t673u: product comes from the route (3m intraday I/MIS; 15m and 1h delivery D/NRML).
+        _uprod=iroutes.SPEC[ROUTE]["upstox_product"] if ROUTE else "I"
+        _kprod=iroutes.SPEC[ROUTE]["kite_product"] if ROUTE else ("MIS" if ekw else "NRML")
+        if ROUTE: r["carry"]="intraday (3m route, same-day square-off)" if iroutes.SPEC[ROUTE]["intraday"] else "delivery (NRML/D)"
         # ---- Kite leg plan (checked BEFORE any order so the pair is one decision; never blocks Upstox) ----
         kleg=None
         try:
@@ -567,12 +684,15 @@ for name,cfg in IDX.items():
             else:
                 m=bk.from_upstox(best["instrument_key"])
                 kopen=[p for p in bk.positions() if p["quantity"]>0 and trade_lock.underlying(p["trading_symbol"])==name and trade_lock.is_opt(p["trading_symbol"])]
+                if ROUTE is not None:
+                    _ko=((_occ.get("kite") or {}).get("routes") or {}).get(ROUTE) or []
+                    kopen=[p for p in kopen if p["trading_symbol"] in _ko]
                 if not _elig["kite"]["ok"]: r["kite"]={"action":"skip: "+_elig["kite"]["reason"]}
                 elif not m: r["kite"]={"action":"skipped: no Kite symbol for "+best["instrument_key"]}
                 elif kopen: r["kite"]={"action":"skip: Kite position already open","open":[p["trading_symbol"] for p in kopen]}
                 else:
                     kq=lots*m["lot_size"]
-                    kprod="MIS" if ekw else "NRML"
+                    kprod=_kprod
                     ko={"trading_symbol":m["tradingsymbol"],"instrument_token":"KITE|%s|%s"%(m["exchange"],m["tradingsymbol"]),"transaction_type":"BUY","order_type":"LIMIT","product":kprod,"quantity":kq,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,"_rule_lots":lots,"tag":"auto_entry",**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
                     kok,kre,kadj=trade_lock.check_order(ko,broker="kite"); kadj=(kadj//m["lot_size"])*m["lot_size"]
                     r["kite"]={"symbol":m["tradingsymbol"],"exchange":m["exchange"],"qty":kq,"check":{"allowed":kok,"reasons":kre,"adjusted_qty":kadj}}
@@ -585,14 +705,14 @@ for name,cfg in IDX.items():
         elif not _elig["upstox"]["ok"]: r["action"]="skip: "+_elig["upstox"]["reason"]
         else:
             csym=f"{name}{exp:%y%m%d}{int(best['strike_price'])}{raw}"  # compact form trade_lock parses (master symbol has spaces)
-            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":"I","quantity":qty,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,"_rule_lots":lots,"tag":"auto_entry",**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
+            o={"trading_symbol":csym,"instrument_token":best["instrument_key"],"transaction_type":"BUY","order_type":"LIMIT","product":_uprod,"quantity":qty,"price":px,"_signal_source":ENTRY_SOURCE,"_signal_instrument_key":signal_key,"_rule_lots":lots,"tag":"auto_entry",**({k2:v for k2,v in (tf_meta or {}).items() if k2.startswith("_")})}
             ok,reasons,adj=trade_lock.check_order(o); adj=(adj//lot)*lot
             r["check"]={"allowed":ok,"reasons":reasons,"adjusted_qty":adj}
             if not ok or adj<=0: r["action"]="blocked by pre-trade rules"
             else: uleg=adj
         if DRY:
-            if uleg: r["action"]=f"DRY-RUN: would BUY {uleg} {best['trading_symbol']} LIMIT {px}"
-            if kleg: r["kite"]["action"]=f"DRY-RUN: would BUY {kleg['qty']} {kleg['tradingsymbol']} LIMIT {px} NRML on Kite"; bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,dry=True)
+            if uleg: r["action"]=f"DRY-RUN: would BUY {uleg} {best['trading_symbol']} LIMIT {px} {_uprod} on Upstox"
+            if kleg: r["kite"]["action"]=f"DRY-RUN: would BUY {kleg['qty']} {kleg['tradingsymbol']} LIMIT {px} {_kprod} on Kite"; bk.place(kleg["exchange"],kleg["tradingsymbol"],"BUY",kleg["qty"],px,dry=True)
             continue
         if not uleg and not kleg:
             _remember_block(name, rev, r)
@@ -608,18 +728,26 @@ for name,cfg in IDX.items():
                 book=iel.load_trigger(TRIGGERS, "_decisions") or {}
                 day=now.date().isoformat()
                 rows=list(book.get(day) or [])
-                rows.append({"index":name,"timeframe":(tf_meta or {}).get("_timeframe"),"expiry":(tf_meta or {}).get("_option_expiry"),"side":raw,
+                rows.append({"index":name,"route":ROUTE,"timeframe":(tf_meta or {}).get("_timeframe"),"expiry":(tf_meta or {}).get("_option_expiry"),"side":raw,
                              "brokers":[b for b,leg in (("upstox",uleg),("kite",kleg)) if leg]})
                 book[day]=rows
                 iel.save_trigger(TRIGGERS, "_decisions", book)
+                if ROUTE is not None:
+                    # pre-record the route before any order, so a crash after a fill cannot orphan the position
+                    for _b,_leg in (("upstox",uleg),("kite",kleg)):
+                        if not _leg: continue
+                        _k=iroutes.ukey(best["instrument_key"]) if _b=="upstox" else iroutes.kkey(kleg["exchange"],kleg["tradingsymbol"])
+                        iroutes.record(_RSTATE,_k,route_name=ROUTE,index=name,symbol=best["trading_symbol"] if _b=="upstox" else kleg["tradingsymbol"],
+                                       product=_uprod if _b=="upstox" else _kprod,qty=0,ts=now.isoformat(),broker=_b)
+                    iroutes.save(_RSTATE)
             except Exception as e:
                 r["action"]=f"no entry: timeframe decision was not recorded ({type(e).__name__}); order not sent"
                 continue
         oid=None; koid=None
         if uleg:
-            body={"quantity":uleg,"product":"I","validity":"DAY","price":px,"tag":"auto_entry","instrument_token":best["instrument_key"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False}
+            body={"quantity":uleg,"product":_uprod,"validity":"DAY","price":px,"tag":"auto_entry","instrument_token":best["instrument_key"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False}
             pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
-            if pr.get("status")!="success" and "product" in json.dumps(pr).lower() and not ekw:
+            if pr.get("status")!="success" and "product" in json.dumps(pr).lower() and not ekw and ROUTE is None:
                 body["product"]="D"; pr=req("https://api-hft.upstox.com/v2/order/place",body,"POST",proxy=True)
             oid=(pr.get("data") or {}).get("order_id")
             if not oid: r["action"]="order rejected"; r["resp"]={"code":pr.get("code"),"body":pr.get("body")}
@@ -651,7 +779,7 @@ for name,cfg in IDX.items():
             r["status"]=st; r["filled"]=fill
             if fill>0:
                 _sf=1-prules.INITIAL_STOP_PCT
-                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry","intraday":ekw,"stop_pct":prules.INITIAL_STOP_PCT}
+                s[best["instrument_key"]]={"high":avg,"entry":avg,"target":round(avg*1.2,2),"sym":best["trading_symbol"],"source":"auto_entry","intraday":bool(ekw or (ROUTE and iroutes.SPEC[ROUTE]["intraday"])),"route":ROUTE,"stop_pct":prules.INITIAL_STOP_PCT}
                 s.setdefault("_min_stop_by_symbol",{})[best["trading_symbol"]]=tick(avg*_sf)
                 seen[oid]={"sym":best["trading_symbol"],"qty":fill,"avg":avg,"time":now.isoformat(),"source":"auto_entry"}
                 r["action"]=f"ENTERED {fill} {best['trading_symbol']} @ {avg}; target {round(avg*1.2,2)} stop {tick(avg*_sf)}"
@@ -661,12 +789,26 @@ for name,cfg in IDX.items():
             if kfill>0:
                 kk="KITE|%s|%s"%(kleg["exchange"],kleg["tradingsymbol"])
                 _sf=1-prules.INITIAL_STOP_PCT
-                s[kk]={"high":ka,"entry":ka,"target":round(ka*1.2,2),"sym":kleg["tradingsymbol"],"source":"auto_entry","broker":"kite","stop_pct":prules.INITIAL_STOP_PCT}
+                s[kk]={"high":ka,"entry":ka,"target":round(ka*1.2,2),"sym":kleg["tradingsymbol"],"source":"auto_entry","broker":"kite","route":ROUTE,"intraday":bool(ROUTE and iroutes.SPEC[ROUTE]["intraday"]),"stop_pct":prules.INITIAL_STOP_PCT}
                 s.setdefault("_min_stop_by_symbol",{})[kleg["tradingsymbol"]]=tick(ka*_sf)
                 seen["kite:"+str(koid)]={"sym":kleg["tradingsymbol"],"qty":kfill,"avg":ka,"time":now.isoformat(),"source":"auto_entry","broker":"kite"}
                 r["kite"]["action"]=f"ENTERED {kfill} {kleg['tradingsymbol']} @ {ka} on Kite; target {round(ka*1.2,2)} stop {tick(ka*_sf)}"
             else: r["kite"]["action"]="Kite not filled in 2 min - cancelled"
         json.dump(s,open(SF,"w"),indent=1); json.dump(seen,open(SEEN,"w"),indent=1)
+        if ROUTE is not None:
+            # t673u: confirm (or drop) the pre-recorded route rows with the real fills.
+            try:
+                _P=_RSTATE.setdefault("positions",{})
+                _uk=iroutes.ukey(best["instrument_key"])
+                if uleg:
+                    if fill>0: iroutes.record(_RSTATE,_uk,route_name=ROUTE,index=name,symbol=best["trading_symbol"],product=body.get("product"),qty=fill,ts=now.isoformat(),broker="upstox",order_id=oid)
+                    elif not [p for p in pos if p.get("instrument_token")==best["instrument_key"] and int(p.get("quantity") or 0)>0]: _P.pop(_uk,None)
+                if kleg:
+                    _kk=iroutes.kkey(kleg["exchange"],kleg["tradingsymbol"])
+                    if kfill>0: iroutes.record(_RSTATE,_kk,route_name=ROUTE,index=name,symbol=kleg["tradingsymbol"],product=kprod,qty=kfill,ts=now.isoformat(),broker="kite",order_id=koid)
+                    else: _P.pop(_kk,None)
+                iroutes.save(_RSTATE)
+            except Exception as e: r["route_state_error"]=f"{type(e).__name__}: {e}"
         # ---- post-placement confirmation (4 Nov): SL must be LIVE before this counts as an entered trade ----
         if fill>0:
             try:

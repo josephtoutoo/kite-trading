@@ -16,7 +16,17 @@ long option (index, stock, MCX), and lifts option stops on an upward-only ladder
 target two steps back). Every exit SELL re-reads the broker quantity first and is capped to it.
 16 Nov 2026 (t669u): OVERSIZE lines for option positions above the lot rule (index 1/2 lots, 3 on that index's
 expiry day, 3 total with the one add; stock options 1 lot per broker), once per position per day, in "oversize".
-Sent TREND_EXIT / STOP_BREACH_EXIT orders are recorded in reentry_blocks.json (same-contract re-entry block).
+Sent TREND_EXIT / STOP_BREACH_EXIT / TWO_CANDLE_EXIT / EMA50_EXIT orders are recorded in reentry_blocks.json (same-contract re-entry block).
+16 Nov 2026 (t685u): index-option routes (tracked in index_route_positions.json, or inferred:
+intraday->3m, monthly->1h, else 15m; existing BANKNIFTY calls read as 1h) also exit when two
+consecutive completed route-timeframe FUTURES candles after entry each close against the previous
+close (CE below, PE above). Checked on each 5-minute run; 3m signals use all completed post-entry
+3m futures candles, and the sell is sent at that run.
+16 Nov 2026 (t691u): stock-option debit spreads are closed as a pair (buy
+the short back first, then sell the long) when the net-premium stop / ladder
+fires, or when a long-leg exit applies. A lone leftover short is bought back
+at the start of each run (9:15 reconcile). A lone SELL SL is never left on a
+spread long.
 --dry-run: read-only, prints intended actions, ignores time window, writes no state."""
 import json,os,sys
 sys.path.insert(0,os.path.dirname(os.path.abspath(__file__)))
@@ -234,9 +244,156 @@ def kite_live_qty(bk,sym):
         bk.forget(); return sum(int(x["quantity"]) for x in bk.positions(strict=True) if x["trading_symbol"]==sym)
     except Exception: return None
 FA_NOTE={"trend_exit_1h":FA_TREND,"stop_ladder":FA_LADDER}
+# t685u/t686u: two consecutive route-timeframe futures closes vs previous close, or a close through EMA50 (index option routes only); whichever completes first
+try:
+    import index_two_candle_exit as i2c
+    _I2C=i2c.prepare(now=now)
+except Exception as _i2e:
+    i2c=None; _I2C=None
+    print(f"risk_manager: index_two_candle_exit unavailable, two-candle/EMA50 exit off: {type(_i2e).__name__}",file=sys.stderr)
+def _two_candle_check(sym,product,broker,instrument_key=None,exchange=None):
+    if i2c is None: return False,"route-timeframe exit module unavailable",None
+    try:
+        r=i2c.evaluate(sym,product=product,broker=broker,instrument_key=instrument_key,exchange=exchange,state=_I2C,now=now)
+        if isinstance(r,tuple) and len(r)>=3:
+            return r[0],r[1],r[2]
+        return (r[0],r[1],("TWO_CANDLE_EXIT" if r[0] else None))
+    except Exception as e:
+        return False,"route-timeframe exit check failed: %s"%type(e).__name__,None
+
+def _stockopt_spread_ctx(pos_list, broker):
+    """Ledger + inferred debit-spread pairs. Fail-closed: if the module cannot
+    load, stock-option spread legs still do not get a lone SELL SL."""
+    try:
+        eq=os.path.join(D,"equity")
+        if eq not in sys.path: sys.path.insert(0,eq)
+        import stockopt_spread as _ssp
+        legs=_ssp.legs_from_positions(pos_list, broker)
+        return {"pairs": _ssp.infer_pairs(legs), "ledger": _ssp.load_ledger(), "mod": _ssp, "legs": legs}
+    except Exception:
+        return None
+
+def _stockopt_spread_skip(sym, qty, ctx):
+    if not ctx or not ctx.get("mod"): return None
+    try:
+        return ctx["mod"].gtt_skip_reason({"sym": sym, "qty": qty}, ledger=ctx.get("ledger"), pairs=ctx.get("pairs"))
+    except Exception:
+        return None
+
+def _spread_find_raw(pos_list, sym, broker="upstox"):
+    want=(sym or "").replace(" ","").replace("-","").upper()
+    for r in pos_list or []:
+        s=(r.get("trading_symbol") or r.get("tradingsymbol") or "")
+        if s.replace(" ","").replace("-","").upper()==want:
+            return r
+    return None
+
+def _spread_limit(ltp, side, ts=0.05):
+    if not ltp: return None
+    px=ltp*(1.005 if side=="BUY" else 0.995)
+    return tick_on(px, ts or 0.05)
+
+def _spread_cover_upstox(plan, pos_list):
+    raw=_spread_find_raw(pos_list, plan.get("short_sym"))
+    if not raw:
+        return {"sym":plan.get("short_sym"),"action":"COVER_NAKED_SHORT_SKIP","why":"short not in the book"}
+    qty=abs(int(raw.get("quantity") or plan.get("qty") or 0))
+    ltp=float(raw.get("last_price") or 0)
+    px=_spread_limit(ltp,"BUY",tick_size_for(raw.get("instrument_token")))
+    if not qty or not px:
+        return {"sym":raw.get("trading_symbol"),"action":"COVER_NAKED_SHORT_SKIP","why":"qty or price unverified"}
+    r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":qty,"product":raw.get("product") or "D","validity":"DAY","price":px,"tag":"spread_cover","instrument_token":raw["instrument_token"],"order_type":"LIMIT","transaction_type":"BUY","disclosed_quantity":0,"trigger_price":0,"is_amo":False})
+    oid=(r.get("data") or {}).get("order_id") if not DRY else "DRY"
+    if DRY: r={"status":"dry-run"}
+    return {"sym":raw.get("trading_symbol"),"action":"COVER_NAKED_SHORT" if (oid or DRY) else "COVER_NAKED_SHORT_FAIL","qty":qty,"limit":px,"resp":r.get("status"),"order":oid}
+
+def _spread_close_upstox(long_raw, short_raw, why, action):
+    ssp=__import__("stockopt_spread")
+    alerts=[]
+    def place(order):
+        side=order["transaction_type"]
+        raw=short_raw if side=="BUY" else long_raw
+        ltp=float(raw.get("last_price") or 0)
+        px=_spread_limit(ltp,side,tick_size_for(raw.get("instrument_token")))
+        if not px: return None
+        qty=int(order.get("quantity") or order.get("qty") or 0)
+        r=write("https://api-hft.upstox.com/v2/order/place",{"quantity":qty,"product":raw.get("product") or "D","validity":"DAY","price":px,"tag":"spread_exit","instrument_token":raw["instrument_token"],"order_type":"LIMIT","transaction_type":side,"disclosed_quantity":0,"trigger_price":0,"is_amo":False})
+        if DRY: return "DRY-"+side
+        return (r.get("data") or {}).get("order_id")
+    def wait(oid, order):
+        if DRY or not oid or str(oid).startswith("DRY"):
+            return {"filled": True, "qty": int(order.get("quantity") or 0)}
+        import time
+        want=int(order.get("quantity") or 0)
+        for _ in range(6):
+            try:
+                d=req("https://api.upstox.com/v2/order/details?order_id="+str(oid)).get("data") or {}
+                status=str(d.get("status") or "").lower()
+                filled=int(d.get("filled_quantity") or 0)
+                if status in ("complete","completed","filled","traded") or (want and filled>=want):
+                    return {"filled": True, "qty": filled or want, "avg": d.get("average_price")}
+                if status in ("rejected","cancelled","canceled","failed"):
+                    return {"filled": False, "qty": filled, "status": status}
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return {"filled": False, "qty": 0, "reason": "cover fill unverified"}
+    def live(order):
+        raw=short_raw if order["transaction_type"]=="BUY" else long_raw
+        # re-read the book if possible
+        q=upstox_live_qty(raw.get("instrument_token"))
+        if q is None:
+            return abs(int(raw.get("quantity") or 0))
+        return abs(int(q))
+    # cancel leftover lone SLs on both legs
+    for raw in (long_raw, short_raw):
+        if not raw: continue
+        for o in pending_sl(raw.get("instrument_token")):
+            write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE")
+        _gtt_clear("upstox", raw.get("trading_symbol"), key=raw.get("instrument_token"))
+    result=ssp.execute_pair_exit(place, wait,
+                                 {"transaction_type":"BUY","quantity":abs(int((short_raw or {}).get("quantity") or 0))},
+                                 {"transaction_type":"SELL","quantity":abs(int((long_raw or {}).get("quantity") or 0))},
+                                 live_qty=live, alert=lambda m,d: alerts.append(m))
+    return {"sym": (long_raw or {}).get("trading_symbol"),"short":(short_raw or {}).get("trading_symbol"),
+            "action": action if result.get("ok") or DRY else "SPREAD_EXIT_FAIL",
+            "why": why, "result": result, "alert": alerts or None}
+
+_spread_u=_stockopt_spread_ctx(pos,"upstox")
+if _spread_u and _spread_u.get("mod"):
+    for _plan in _spread_u["mod"].reconcile_naked_shorts(_spread_u.get("legs") or [], ledger=_spread_u.get("ledger"), pairs=_spread_u.get("pairs")):
+        acts.append(_spread_cover_upstox(_plan, pos))
 for p in pos:
     sym=p["trading_symbol"]; q=int(p.get("quantity") or 0)
     if not (isopt(sym) or isfut(sym)) or q<=0: continue
+    if isopt(sym) and trade_lock.underlying(sym) not in INDEX_KEYS and _spread_u and _spread_u.get("mod"):
+        _pair,_role=_spread_u["mod"].find_pair(sym, _spread_u.get("pairs"))
+        if _pair and _role=="long":
+            lg=_pair.get("long") or {}; sh=_pair.get("short") or {}
+            long_raw=_spread_find_raw(pos, lg.get("sym") or sym) or p
+            short_raw=_spread_find_raw(pos, sh.get("sym") or sh.get("trading_symbol"))
+            # cancel a leftover lone SL on the long (it would naked the short)
+            k=p["instrument_token"]; longs.add(k)
+            for o in pending_sl(k):
+                acts.append({"sym":sym,"action":"CANCEL_SPREAD_SL","order":o["order_id"],
+                             "resp":write("https://api-hft.upstox.com/v2/order/cancel?order_id="+o["order_id"],method="DELETE").get("status")})
+            long_leg={"sym":sym,"qty":q,"avg":p.get("average_price") or p.get("buy_price"),"ltp":p.get("last_price")}
+            short_leg={"sym":(short_raw or {}).get("trading_symbol") or sh.get("sym"),
+                       "qty":int((short_raw or sh).get("quantity") or sh.get("qty") or 0),
+                       "avg":(short_raw or sh).get("average_price"),
+                       "ltp":(short_raw or sh).get("last_price") or sh.get("ltp")}
+            skey="SPREAD|upstox|"+sym
+            sstate=st.setdefault(skey,{})
+            dec=_spread_u["mod"].spread_day_decision(long_leg, short_leg, sstate)
+            if dec.get("fire") and short_raw is not None:
+                acts.append(_spread_close_upstox(long_raw, short_raw, dec.get("why"), dec.get("action") or "SPREAD_EXIT"))
+            elif dec.get("fire") and short_raw is None:
+                acts.append({"sym":sym,"action":"SPREAD_EXIT_SKIPPED","why":"short leg missing from the book; long not sold alone"})
+            else:
+                acts.append({"sym":sym,"action":"SPREAD_WATCH","why":dec.get("why") or "net/long stop not hit","net_now":dec.get("net_now"),"net_entry":dec.get("net_entry"),"stop":dec.get("stop"),"method":dec.get("method")})
+            continue
+        if _pair and _role=="short":
+            continue  # managed with the long, or by the naked-short reconcile
     fut=isfut(sym)
     k=p["instrument_token"]; longs.add(k); ltp=p["last_price"]
     _ts=tick_size_for(k); _tk=lambda x,_t=_ts: tick_on(x,_t)  # 11 Nov: contract tick grid
@@ -276,6 +433,9 @@ for p in pos:
     else:
         ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
         if INDEX_OPT and s["high"]>=avg*1.15 and not ok: _fa_exit="TREND_EXIT"
+    if not _fa_exit and INDEX_OPT and not fut:
+        _c2,_c2w,_c2a=_two_candle_check(sym,p.get("product"),"upstox",instrument_key=k)
+        if _c2: _fa_exit=_c2a or "TWO_CANDLE_EXIT"; why=_c2w
     if _fa_exit:
         gok,gdet=_gtt_clear("upstox",sym,key=k)
         if not gok:
@@ -390,10 +550,98 @@ try:
         # the end of this block then cancelled every live Kite option stop on the account. Refuse
         # the whole Kite section instead.
         kpos=bk.positions(strict=True); kord=bk.orders(strict=True); klongs=set()
+        _spread_k=_stockopt_spread_ctx(kpos,"kite")
         def kpending(ts): return [o for o in kord if o["trading_symbol"]==ts and o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M")]
+        def _spread_cover_kite(plan):
+            raw=_spread_find_raw(kpos, plan.get("short_sym"), "kite")
+            if not raw:
+                return {"sym":plan.get("short_sym"),"broker":"kite","action":"COVER_NAKED_SHORT_SKIP","why":"short not in the book"}
+            qty=abs(int(raw.get("quantity") or plan.get("qty") or 0))
+            ltp=float(raw.get("last_price") or 0)
+            px=tick(ltp*1.005) if ltp else None
+            if not qty or not px:
+                return {"sym":raw.get("trading_symbol"),"broker":"kite","action":"COVER_NAKED_SHORT_SKIP","why":"qty or price unverified"}
+            oid=bk.place(raw.get("exchange") or "NFO", raw["trading_symbol"], "BUY", qty, px, tag="spread_cover", product=raw.get("product") or "NRML", dry=DRY)
+            return {"sym":raw["trading_symbol"],"broker":"kite","action":"COVER_NAKED_SHORT" if (oid or DRY) else "COVER_NAKED_SHORT_FAIL","qty":qty,"limit":px,"order":oid}
+        def _spread_close_kite(long_raw, short_raw, why, action):
+            ssp=__import__("stockopt_spread")
+            alerts=[]
+            def place(order):
+                side=order["transaction_type"]
+                raw=short_raw if side=="BUY" else long_raw
+                ltp=float(raw.get("last_price") or 0)
+                px=tick(ltp*(1.005 if side=="BUY" else 0.995)) if ltp else None
+                if not px: return None
+                return bk.place(raw.get("exchange") or "NFO", raw["trading_symbol"], side, int(order.get("quantity") or 0), px, tag="spread_exit", product=raw.get("product") or "NRML", dry=DRY) or ("DRY-"+side if DRY else None)
+            def wait(oid, order):
+                if DRY or not oid or str(oid).startswith("DRY"):
+                    return {"filled": True, "qty": int(order.get("quantity") or 0)}
+                import time
+                want=int(order.get("quantity") or 0)
+                for _ in range(6):
+                    try:
+                        stt=bk.order_status(oid) or {}
+                        status=str(stt.get("status") or "").lower()
+                        filled=int(stt.get("filled") or 0)
+                        if status in ("complete","completed","filled","traded") or (want and filled>=want):
+                            return {"filled": True, "qty": filled or want, "avg": stt.get("avg")}
+                        if status in ("rejected","cancelled","canceled","failed"):
+                            return {"filled": False, "qty": filled, "status": status}
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                return {"filled": False, "qty": 0, "reason": "cover fill unverified"}
+            def live(order):
+                raw=short_raw if order["transaction_type"]=="BUY" else long_raw
+                q=kite_live_qty(bk, raw["trading_symbol"])
+                if q is None:
+                    return abs(int(raw.get("quantity") or 0))
+                return abs(int(q))
+            for raw in (long_raw, short_raw):
+                if not raw: continue
+                for o in kpending(raw["trading_symbol"]):
+                    bk.cancel(o["order_id"], dry=DRY)
+                _gtt_clear("kite", raw["trading_symbol"])
+            result=ssp.execute_pair_exit(place, wait,
+                                         {"transaction_type":"BUY","quantity":abs(int((short_raw or {}).get("quantity") or 0))},
+                                         {"transaction_type":"SELL","quantity":abs(int((long_raw or {}).get("quantity") or 0))},
+                                         live_qty=live, alert=lambda m,d: alerts.append(m))
+            return {"sym":(long_raw or {}).get("trading_symbol"),"broker":"kite","short":(short_raw or {}).get("trading_symbol"),
+                    "action": action if result.get("ok") or DRY else "SPREAD_EXIT_FAIL",
+                    "why": why, "result": result, "alert": alerts or None}
+        if _spread_k and _spread_k.get("mod"):
+            for _plan in _spread_k["mod"].reconcile_naked_shorts(_spread_k.get("legs") or [], ledger=_spread_k.get("ledger"), pairs=_spread_k.get("pairs")):
+                kacts.append(_spread_cover_kite(_plan))
         for p in kpos:
             sym=p["trading_symbol"]; q=p["quantity"]; ex=p["exchange"]
             if not (isopt(sym) or isfut(sym)) or q<=0: continue
+            if isopt(sym) and trade_lock.underlying(sym) not in INDEX_KEYS and _spread_k and _spread_k.get("mod"):
+                _pair,_role=_spread_k["mod"].find_pair(sym, _spread_k.get("pairs"))
+                if _pair and _role=="long":
+                    lg=_pair.get("long") or {}; sh=_pair.get("short") or {}
+                    long_raw=_spread_find_raw(kpos, lg.get("sym") or sym, "kite") or p
+                    short_raw=_spread_find_raw(kpos, sh.get("sym") or sh.get("trading_symbol"), "kite")
+                    klongs.add(sym)
+                    for o in kpending(sym):
+                        kacts.append({"sym":sym,"broker":"kite","action":"CANCEL_SPREAD_SL","order":o["order_id"],
+                                      "resp":bk.cancel(o["order_id"],dry=DRY)})
+                    long_leg={"sym":sym,"qty":q,"avg":p.get("average_price") or p.get("buy_price"),"ltp":p.get("last_price")}
+                    short_leg={"sym":(short_raw or {}).get("trading_symbol") or sh.get("sym"),
+                               "qty":int((short_raw or sh).get("quantity") or sh.get("qty") or 0),
+                               "avg":(short_raw or sh).get("average_price"),
+                               "ltp":(short_raw or sh).get("last_price") or sh.get("ltp")}
+                    skey="SPREAD|kite|"+sym
+                    sstate=st.setdefault(skey,{})
+                    dec=_spread_k["mod"].spread_day_decision(long_leg, short_leg, sstate)
+                    if dec.get("fire") and short_raw is not None:
+                        kacts.append(_spread_close_kite(long_raw, short_raw, dec.get("why"), dec.get("action") or "SPREAD_EXIT"))
+                    elif dec.get("fire") and short_raw is None:
+                        kacts.append({"sym":sym,"broker":"kite","action":"SPREAD_EXIT_SKIPPED","why":"short leg missing from the book; long not sold alone"})
+                    else:
+                        kacts.append({"sym":sym,"broker":"kite","action":"SPREAD_WATCH","why":dec.get("why") or "net/long stop not hit","net_now":dec.get("net_now"),"net_entry":dec.get("net_entry"),"stop":dec.get("stop"),"method":dec.get("method")})
+                    continue
+                if _pair and _role=="short":
+                    continue
             fut=isfut(sym); klongs.add(sym); kk="KITE|%s|%s"%(ex,sym)
             ukey=bk.to_upstox(ex,sym); ltp=None
             if ukey:
@@ -430,6 +678,9 @@ try:
             else:
                 ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
                 if INDEX_OPT and s["high"]>=avg*1.15 and not ok: _fa_exit="TREND_EXIT"
+            if not _fa_exit and INDEX_OPT and not fut:
+                _c2,_c2w,_c2a=_two_candle_check(sym,p.get("product"),"kite",exchange=ex)
+                if _c2: _fa_exit=_c2a or "TWO_CANDLE_EXIT"; why=_c2w
             if _fa_exit:
                 gok,gdet=_gtt_clear("kite",sym)
                 if not gok:

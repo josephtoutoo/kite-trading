@@ -140,12 +140,24 @@ def main():
                                       existing_qty=int((cur or {}).get('quantity') or 0), position_qty=want,
                                       allow_trail=sym in mine)
             if not _plan.get('place_stop'):
-                acts.append(dict(sym=sym, action=_plan.get('action') or 'KEEP', ltp=ltp,
-                                 trigger=_plan.get('trigger'), qty=want, source=_plan.get('source'),
-                                 why=_plan.get('reason'), exit=_plan.get('exit'),
-                                 execute_exit=_plan.get('execute_exit')))
-                continue
-            cand = float(_plan['trigger'])
+                # Sleeve names still go through the longterm_dst branch below.
+                _dst_pending = False
+                try:
+                    if '/workspace/upstox/equity' not in sys.path:
+                        sys.path.insert(0, '/workspace/upstox/equity')
+                    import longterm_daily_st as _lt0
+                    _dst_pending = _lt0.symbol_in_sleeve(sym)
+                except Exception:
+                    _dst_pending = False
+                if not _dst_pending:
+                    acts.append(dict(sym=sym, action=_plan.get('action') or 'KEEP', ltp=ltp,
+                                     trigger=_plan.get('trigger'), qty=want, source=_plan.get('source'),
+                                     why=_plan.get('reason'), exit=_plan.get('exit'),
+                                     execute_exit=_plan.get('execute_exit')))
+                    continue
+                cand = float(_plan.get('trigger') or ltp * (1 - PCT / 100.0))
+            else:
+                cand = float(_plan['trigger'])
             stx, d = None, None
             pct_stop = ltp * (1 - PCT / 100.0)
         else:
@@ -156,6 +168,34 @@ def main():
                 cand = stx                      # Supertrend nearer, still below price
             if cand > ltp * 0.99:               # guard: never a stop within 1% of price
                 cand = pct_stop
+        # t697u/t698u: longterm_dst sleeve trails to the daily Supertrend only and never loosens.
+        dst_sleeve = False
+        try:
+            if '/workspace/upstox/equity' not in sys.path:
+                sys.path.insert(0, '/workspace/upstox/equity')
+            import longterm_daily_st as _lt
+            if _lt.symbol_in_sleeve(sym):
+                dst_sleeve = True
+                rec = ((_lt.load_sleeve_state().get('positions') or {}).get('kite') or {}).get(sym) or {}
+                daily_st = rec.get('stop')
+                try:
+                    import mtf_policy as _pol2
+                    snap = (_pol2.qualify_symbol(key).get('snapshot') or {})
+                    if snap.get('st') is not None:
+                        daily_st = snap.get('st')
+                except Exception:
+                    pass
+                _dst = _lt.longterm_dst_trail_plan(ltp, daily_st,
+                                                   existing_trigger=(cur or {}).get('trigger_price'),
+                                                   floor_stop=rec.get('stop'))
+                if not _dst.get('place_stop'):
+                    acts.append(dict(sym=sym, action=_dst.get('action') or 'KEEP', ltp=ltp,
+                                     trigger=_dst.get('trigger'), qty=want, source=_dst.get('source'),
+                                     why=_dst.get('reason'), sleeve='longterm_dst'))
+                    continue
+                cand = float(_dst['trigger'])
+        except Exception as e:
+            print(f'kite_mtf_stops: longterm_dst branch failed for {sym}: {type(e).__name__}: {e}', file=sys.stderr)
         tick = bk.tick_for(exch, sym) or 0.05
         trig = bk.snap(cand, tick)
         limit = bk.snap(trig - max(tick, trig * 0.005), tick)
@@ -175,7 +215,7 @@ def main():
         if cur and float(cur.get('trigger_price') or 0) >= trig:
             acts.append(dict(sym=sym, action='KEEP', stop=cur['trigger_price'], ltp=ltp)); continue
         if cur:
-            if sym not in mine:
+            if sym not in mine and not dst_sleeve:
                 acts.append(dict(sym=sym, action='KEEP', stop=cur['trigger_price'], ltp=ltp,
                                  why='existing holding: protective stop only, not trailed'))
                 continue

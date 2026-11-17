@@ -16,3 +16,4 @@ upstox/alert_state.json
 venv/
 upstox/*.json
 upstox/*.html
+upstox/equity/logs/

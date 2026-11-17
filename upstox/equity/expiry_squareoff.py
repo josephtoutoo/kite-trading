@@ -10,6 +10,9 @@ instead of leaving it to the broker's auto square-off.
 
 The Friday 15:10 IST flatten of stock options is a separate rule and is not
 implemented here; this script only fires in the contract's own expiry week.
+Next-month debit-spread legs (t687u) are never squared off here: a December
+contract is not in November's expiry week, and recorded spread legs are
+skipped even if the expiry parse were wrong.
 
 Open user LIMIT SELLs at or above market are left alone unless a genuine
 expiry-week flatten still needs the quantity and the resting limit is not
@@ -17,9 +20,11 @@ marketable (too far above LTP to exit now).
 
 CLI: python3 expiry_squareoff.py [--dry | --dry-run] [--only equity|mcx]
 """
-import sys, json, datetime
+import sys, json, datetime, os
 sys.path.insert(0, '/workspace/upstox')
 sys.path.insert(0, '/workspace/equity')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import stockopt_spread as ssp
 
 DRY = ('--dry' in sys.argv) or ('--dry-run' in sys.argv)
 # MCX runs a separate, much later session (crude till ~23:30 IST), so commodity options are
@@ -355,10 +360,76 @@ def expiry_for(tsym):
     return parsed
 
 
+
+def skip_next_month_spread(exp, today, sym=None, ledger=None):
+    """True when this contract must not be flattened by the current-week square-off.
+
+    Next-month debit-spread legs expire after this ISO week, so in_expiry_week
+    already leaves them alone. The ledger check is a belt-and-suspenders guard
+    if a symbol parse were wrong or a recorded spread leg appeared in-week.
+    """
+    # A next-month (later expiry) contract is left alone in this week's flatten.
+    # A recorded spread that IS in its own expiry week must be closed as a pair
+    # (short first) further down, not skipped here.
+    if ssp.leave_next_month_spread(exp, today):
+        return True, "next-month contract is not squared in this week's flatten"
+    return False, None
+
+
+
+def _opt_pos_row(p, broker):
+    return {
+        'broker': broker,
+        'sym': p.get('trading_symbol') or p.get('tradingsymbol') or '',
+        'trading_symbol': p.get('trading_symbol') or p.get('tradingsymbol') or '',
+        'qty': int(p.get('quantity') or 0),
+        'quantity': int(p.get('quantity') or 0),
+        'product': p.get('product'),
+        'instrument_token': p.get('instrument_token') or p.get('instrument_key'),
+        'exchange': p.get('exchange') or 'NFO',
+        'last_price': p.get('last_price'),
+        'average_price': p.get('average_price'),
+        'raw': p,
+    }
+
+
+def spread_expiry_closes(rows, today, ledger):
+    """Ordered cover-then-sell plans for debit spreads whose contract expires this week."""
+    legs = []
+    for r in rows:
+        if is_index_opt(r['sym']):
+            continue
+        parsed = ssp.parse_option_symbol(r['sym']) or {}
+        r = dict(r, underlying=parsed.get('underlying') or underlying_of(r['sym']),
+                 expiry=expiry_for(r['sym']) or parsed.get('expiry'),
+                 side=parsed.get('side'), strike=parsed.get('strike') or strike_of(r['sym']))
+        if not r.get('expiry') or not in_expiry_week(r['expiry'], today):
+            continue
+        skip, _ = skip_next_month_spread(r['expiry'], today, r['sym'], ledger)
+        if skip:
+            continue
+        legs.append(r)
+    plans = []
+    seen = set()
+    for pair in ssp.infer_pairs(legs) + []:
+        # also pull ledger pairs whose both/any expiry-week legs are present
+        sh, lg = pair.get('short') or {}, pair.get('long') or {}
+        key = (pair.get('broker'), ssp._norm_sym(lg.get('sym') or lg.get('trading_symbol')),
+               ssp._norm_sym(sh.get('sym') or sh.get('trading_symbol')))
+        if key in seen:
+            continue
+        seen.add(key)
+        plans.append(pair)
+    # ledger-only shorts in expiry week whose long is also in the book or gone
+    return plans, {ssp._norm_sym((p.get('long') or {}).get('sym') or (p.get('long') or {}).get('trading_symbol'))
+                   for p in plans} | {ssp._norm_sym((p.get('short') or {}).get('sym') or (p.get('short') or {}).get('trading_symbol'))
+                   for p in plans}
+
 def main():
     import sys, urllib.parse
     import api
     now = datetime.datetime.now(IST)
+    spread_ledger = ssp.load_ledger()
     out = {'now': now.strftime('%Y-%m-%d %H:%M IST'), 'dry': DRY, 'only': ONLY, 'acts': []}
 
     def call(u, body=None, method=None):
@@ -396,11 +467,51 @@ def main():
 
     # ---- Upstox ----
     pos = call('https://api.upstox.com/v2/portfolio/short-term-positions').get('data') or []
+    u_pairs, u_paired = spread_expiry_closes([_opt_pos_row(p, 'upstox') for p in pos], now.date(), spread_ledger)
+    by_sym = {(p.get('trading_symbol') or '').replace(' ', '').upper(): p for p in pos}
+
+    def close_upstox_leg(raw, side, qty):
+        sym = raw.get('trading_symbol') or ''
+        ltp, lcl = quote(raw['instrument_token'])
+        if not ltp:
+            return {'broker': 'upstox', 'sym': sym, 'action': 'SKIP', 'why': 'no quote', 'side': side, 'qty': qty}
+        tsz = upstox_tick(raw['instrument_token'])
+        px = tick(ltp * (1.01 if side == 'BUY' else 0.99), tsz)
+        a = {'broker': 'upstox', 'sym': sym, 'qty': qty, 'ltp': ltp, 'limit': px, 'side': side}
+        if DRY:
+            a['action'] = 'WOULD_COVER' if side == 'BUY' else 'WOULD_SELL'
+            return a
+        r = call('https://api-hft.upstox.com/v2/order/place', {
+            'quantity': qty, 'product': raw.get('product') or 'D', 'validity': 'DAY', 'price': px,
+            'tag': 'expiry_sqoff', 'instrument_token': raw['instrument_token'], 'order_type': 'LIMIT',
+            'transaction_type': side, 'disclosed_quantity': 0, 'trigger_price': 0, 'is_amo': False}, 'POST')
+        a['action'] = ('COVER' if side == 'BUY' else 'SELL') if (r.get('data') or {}).get('order_id') else 'FAIL'
+        a['order'] = (r.get('data') or {}).get('order_id') or r
+        return a
+
+    for pair in u_pairs:
+        sh, lg = pair.get('short') or {}, pair.get('long') or {}
+        sh_raw = by_sym.get(ssp._norm_sym(sh.get('sym') or sh.get('trading_symbol')))
+        lg_raw = by_sym.get(ssp._norm_sym(lg.get('sym') or lg.get('trading_symbol')))
+        cover_ok = True
+        if sh_raw and int(sh_raw.get('quantity') or 0) < 0:
+            act = close_upstox_leg(sh_raw, 'BUY', abs(int(sh_raw['quantity'])))
+            out['acts'].append(act)
+            cover_ok = act.get('action') in ('WOULD_COVER', 'COVER')
+        if lg_raw and int(lg_raw.get('quantity') or 0) > 0:
+            if not cover_ok:
+                out['acts'].append({'broker': 'upstox', 'sym': lg_raw.get('trading_symbol'),
+                                    'action': 'SKIP', 'why': 'short cover failed; long not sold'})
+            else:
+                out['acts'].append(close_upstox_leg(lg_raw, 'SELL', int(lg_raw['quantity'])))
+
     for p in pos:
         q = int(p.get('quantity') or 0)
         if q <= 0:
             continue
         sym = p.get('trading_symbol') or ''
+        if ssp._norm_sym(sym) in u_paired:
+            continue
         if is_index_opt(sym):
             continue
         if ONLY == 'equity' and is_commodity_opt(sym):
@@ -409,6 +520,12 @@ def main():
             continue
         exp = expiry_for(sym)
         if not exp or not in_expiry_week(exp, now.date()):
+            # t687u: next-month debit spreads expire after this week and are left alone
+            continue
+        skip, why = skip_next_month_spread(exp, now.date(), sym, spread_ledger)
+        if skip:
+            out['acts'].append({'broker': 'upstox', 'sym': sym, 'expiry': str(exp),
+                                'action': 'SKIP_NEXT_MONTH_SPREAD', 'why': why})
             continue
         ltp, lcl = quote(p['instrument_token'])
         if not ltp:
@@ -456,11 +573,50 @@ def main():
             except Exception as e:
                 kite_orders = []
                 out['kite_orders_err'] = f'{type(e).__name__}: {e}'
-            for p in k.positions()['net']:
+            knet = k.positions()['net']
+            k_pairs, k_paired = spread_expiry_closes([_opt_pos_row(p, 'kite') for p in knet], now.date(), spread_ledger)
+            k_by = {(p.get('tradingsymbol') or '').replace(' ', '').upper(): p for p in knet}
+
+            def close_kite_leg(raw, side, qty):
+                sym = raw['tradingsymbol']
+                ltp = float(raw.get('last_price') or 0)
+                if not ltp:
+                    return {'broker': 'kite', 'sym': sym, 'action': 'SKIP', 'why': 'no quote', 'side': side, 'qty': qty}
+                t = bk.tick_for(raw['exchange'], sym) or 0.05
+                px = bk.snap(ltp * (1.01 if side == 'BUY' else 0.99), t)
+                a = {'broker': 'kite', 'sym': sym, 'qty': qty, 'ltp': ltp, 'limit': px, 'side': side}
+                if DRY:
+                    a['action'] = 'WOULD_COVER' if side == 'BUY' else 'WOULD_SELL'
+                    return a
+                oid = bk.place(raw['exchange'], sym, side, qty, px, tag='expiry_sqoff',
+                               product=raw.get('product') or 'NRML')
+                a['action'] = ('COVER' if side == 'BUY' else 'SELL') if oid else 'FAIL'
+                a['order'] = oid
+                return a
+
+            for pair in k_pairs:
+                sh, lg = pair.get('short') or {}, pair.get('long') or {}
+                sh_raw = k_by.get(ssp._norm_sym(sh.get('sym') or sh.get('trading_symbol')))
+                lg_raw = k_by.get(ssp._norm_sym(lg.get('sym') or lg.get('trading_symbol')))
+                cover_ok = True
+                if sh_raw and int(sh_raw.get('quantity') or 0) < 0:
+                    act = close_kite_leg(sh_raw, 'BUY', abs(int(sh_raw['quantity'])))
+                    out['acts'].append(act)
+                    cover_ok = act.get('action') in ('WOULD_COVER', 'COVER')
+                if lg_raw and int(lg_raw.get('quantity') or 0) > 0:
+                    if not cover_ok:
+                        out['acts'].append({'broker': 'kite', 'sym': lg_raw.get('tradingsymbol'),
+                                            'action': 'SKIP', 'why': 'short cover failed; long not sold'})
+                    else:
+                        out['acts'].append(close_kite_leg(lg_raw, 'SELL', int(lg_raw['quantity'])))
+
+            for p in knet:
                 q = int(p.get('quantity') or 0)
                 if q <= 0:
                     continue
                 sym = p['tradingsymbol']
+                if ssp._norm_sym(sym) in k_paired:
+                    continue
                 if is_index_opt(sym):
                     continue
                 if ONLY == 'equity' and is_commodity_opt(sym):
@@ -469,6 +625,12 @@ def main():
                     continue
                 exp = expiry_for(sym)
                 if not exp or not in_expiry_week(exp, now.date()):
+                    # t687u: next-month debit spreads expire after this week and are left alone
+                    continue
+                skip, why = skip_next_month_spread(exp, now.date(), sym, spread_ledger)
+                if skip:
+                    out['acts'].append({'broker': 'kite', 'sym': sym, 'expiry': str(exp),
+                                        'action': 'SKIP_NEXT_MONTH_SPREAD', 'why': why})
                     continue
                 ltp = float(p.get('last_price') or 0)
                 if not ltp:
