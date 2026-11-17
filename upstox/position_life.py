@@ -71,6 +71,25 @@ def current_open_gen(orders, sym=None, token=None, overnight=0):
     return gen, flats_before
 
 
+def current_open_fill(orders, sym=None, token=None, overnight=0):
+    """Timestamp and order id of the buy that opened the current long.
+
+    Returns (fill_ts, order_id, flats_before). fill_ts and order_id are None
+    when the book is flat, the position is an overnight carry with no day
+    opening fill, or the tape does not identify the opening buy. An add after
+    the open does not change the returned fill (same rule as current_open_gen).
+    """
+    gen, flats_before = current_open_gen(orders, sym=sym, token=token, overnight=overnight)
+    if not gen or str(gen).startswith("overnight:"):
+        return None, None, flats_before
+    ts, _sep, oid = str(gen).partition("|")
+    ts = ts.strip() or None
+    oid = oid.strip() or None
+    if not ts:
+        return None, None, flats_before
+    return ts, oid, flats_before
+
+
 def bind_position_peak(s, avg, ltp, qty, *, day_sell=0, overnight=0, orders=None,
                        sym=None, token=None, step=0.20, now=None,
                        initial_stop_pct=None, seeds=None):

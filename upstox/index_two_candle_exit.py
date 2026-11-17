@@ -8,9 +8,14 @@ against the previous candle's close:
   CE: close < previous close
   PE: close > previous close
 
-The count starts from candles completed after the entry. A pre-entry candle is
-only used as the comparison close for the first post-entry bar. Equal closes are
-not adverse.
+The count starts from candles completed after the entry. A candle that closes
+at or before the entry is ignored. A pre-entry candle is only used as the
+comparison close for the first post-entry bar. Equal closes are not adverse.
+
+The entry time is the current life's opening fill when today's order tape is
+available (a re-entry or new opening fill resets it). The route record's
+"opened" field is only a fallback, and is rewritten to the fill time so a
+stale time from a previous life of the same contract cannot fire the exit.
 
 Also (t686u): exit when a completed route-timeframe futures candle after entry
 closes against EMA50 (CE: close < EMA50; PE: close > EMA50). EMA50 uses the same
@@ -83,6 +88,20 @@ def completed_at(bar, minutes):
     return bar_ts(bar) + dt.timedelta(minutes=int(minutes))
 
 
+def bar_completed_after(bar, minutes, start):
+    """True when this candle's close is strictly after start (entry / floor).
+
+    A candle that closes at or before entry is ignored by both the two-candle
+    and EMA50 exits.
+    """
+    if start is None:
+        return False
+    try:
+        return completed_at(bar, minutes) > start
+    except Exception:
+        return False
+
+
 def adverse_close(side, close, prev_close):
     """True when this candle's close is against a long CE or PE."""
     if close is None or prev_close is None:
@@ -130,11 +149,10 @@ def consecutive_adverse(bars, side, entry_ts, minutes, count_from=None):
     post = []  # indices of bars that completed after start
     for i, b in enumerate(rows):
         try:
-            done = completed_at(b, minutes)
             _ = bar_close(b)
         except Exception:
             continue
-        if done > start:
+        if bar_completed_after(b, minutes, start):
             post.append(i)
 
     if len(post) < 2:
@@ -233,13 +251,13 @@ def ema50_break(bars, side, entry_ts, minutes, count_from=None):
     post = 0
     for i, b in enumerate(rows):
         try:
-            done = completed_at(b, minutes)
             close = bar_close(b)
             ema = emas[i]
             t = bar_ts(b)
+            done = completed_at(b, minutes)
         except Exception:
             continue
-        if done <= start:
+        if not bar_completed_after(b, minutes, start):
             continue
         post += 1
         if adverse_ema50(side, close, ema):
@@ -348,12 +366,19 @@ def _expiry_of(instrument_key, rows=None):
     return None
 
 
-def prepare(now=None, state=None, master_rows=None):
-    """Load route state and instrument masters once per risk_manager run."""
+def prepare(now=None, state=None, master_rows=None, orders=None, state_path=None):
+    """Load route state and instrument masters once per risk_manager run.
+
+    orders: today's completed (and working) orders for this broker, used to
+    resolve the current life's opening fill. Not fetched here; the caller
+    passes the book it already loaded. Tests stay offline by omitting it.
+    """
     return {
         "now": now or dt.datetime.now(IST),
         "state": iroutes.load() if state is None else (state or {}),
         "rows": master_rows if master_rows is not None else _instrument_rows(),
+        "orders": orders,
+        "state_path": state_path,
     }
 
 
@@ -390,6 +415,43 @@ def fetch_completed_bars(index, minutes, now, fut_key=None):
         return [], key, "futures candles unreadable (%s)" % type(e).__name__
 
 
+def resolve_entry(rec, orders, sym, token=None):
+    """Prefer the current life's opening fill over a stale route 'opened' time.
+
+    Returns (entry_dt, source, fill_ts_str, fill_oid). source is 'opening_fill'
+    or 'route_record', or (None, None, None, None) when neither is available.
+    """
+    fill_ts = fill_oid = None
+    try:
+        import position_life as pl
+        fill_ts, fill_oid, _flats = pl.current_open_fill(orders, sym=sym, token=token)
+    except Exception:
+        fill_ts, fill_oid = None, None
+    fill = parse_ts(fill_ts) if fill_ts else None
+    opened = parse_ts((rec or {}).get("opened"))
+    if fill is not None:
+        return fill, "opening_fill", fill_ts, fill_oid
+    if opened is not None:
+        return opened, "route_record", None, None
+    return None, None, None, None
+
+
+def sync_route_opened(ctx, key, entry, source, fill_oid=None, persist=False):
+    """Write the opening-fill time back onto a tracked route record."""
+    if source != "opening_fill" or not key or entry is None:
+        return False
+    state = (ctx or {}).get("state")
+    if not isinstance(state, dict):
+        return False
+    changed = iroutes.refresh_opened(state, key, entry, order_id=fill_oid)
+    if changed and persist:
+        try:
+            iroutes.save(state, path=(ctx or {}).get("state_path"))
+        except Exception:
+            pass
+    return changed
+
+
 def classify(ctx, broker, instrument_key, exchange, sym, product):
     """(route, how, entry_ts, entry_source, key, index) or (None, why, ...)."""
     und = None
@@ -418,12 +480,14 @@ def classify(ctx, broker, instrument_key, exchange, sym, product):
     expiry = _expiry_of(uk, rows)
     route, how = iroutes.route_of(state, key, product, expiry, _monthlies(und, rows))
     rec = ((state.get("positions") or {}).get(key) or {}) if key else {}
-    opened = parse_ts(rec.get("opened"))
-    if opened is not None:
-        return route, how, opened, "route_record", key, und
-    # Unknown entry (inferred / pre-t673u): do not scan days of history and
-    # immediately flatten. Start from this session's open, then RULE_EFFECTIVE
-    # still floors it in evaluate().
+    orders = (ctx or {}).get("orders")
+    token = instrument_key or uk
+    entry, src, _fill_ts, _fill_oid = resolve_entry(rec, orders, sym, token=token)
+    if entry is not None:
+        return route, how, entry, src, key, und
+    # Unknown entry (inferred / pre-t673u, no fill tape): do not scan days of
+    # history and immediately flatten. Start from this session's open, then
+    # RULE_EFFECTIVE still floors it in evaluate().
     now = (ctx or {}).get("now") or dt.datetime.now(IST)
     session = dt.datetime.combine(now.date(), dt.time(9, 15), IST)
     return route, how, session, "session_open_fallback", key, und
@@ -438,16 +502,35 @@ def _log(row):
 
 
 def evaluate(sym, product=None, broker="upstox", instrument_key=None, exchange=None,
-             state=None, now=None, bars=None, apply_effective=True, log=True):
+             state=None, now=None, bars=None, apply_effective=True, log=True,
+             orders=None, sync_route=False):
     """(fire, why, action). Fetches futures candles unless `bars` is supplied.
 
     action is TWO_CANDLE_EXIT, EMA50_EXIT, or None. apply_effective: live default
     True floors the count at RULE_EFFECTIVE so already-closed candles cannot
     flatten a carry-forward the first morning.
+
+    orders: today's order tape for this broker; when present, the current
+    life's opening fill is the entry time (a re-entry resets a stale route
+    'opened'). sync_route=True (live risk_manager) writes that fill time back
+    onto the tracked route record. Tests leave it False so they do not touch
+    the live state file.
     """
     now = now or dt.datetime.now(IST)
     ctx = state if isinstance(state, dict) and "state" in (state or {}) else prepare(now=now, state=state)
+    if orders is not None:
+        ctx = dict(ctx)
+        ctx["orders"] = orders
     route, how, entry, src, key, und = classify(ctx, broker, instrument_key, exchange, sym, product)
+    if sync_route and src == "opening_fill":
+        _oid = None
+        try:
+            import position_life as pl
+            _ts, _oid, _fl = pl.current_open_fill(ctx.get("orders"), sym=sym,
+                                                  token=instrument_key)
+        except Exception:
+            _oid = None
+        sync_route_opened(ctx, key, entry, src, fill_oid=_oid, persist=True)
     if route is None:
         return False, how, None
     minutes = iroutes.SPEC[route]["minutes"]

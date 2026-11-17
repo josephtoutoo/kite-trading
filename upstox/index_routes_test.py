@@ -96,6 +96,19 @@ def test_tracking_and_dedupe():
     assert R.enabled_routes({}) == ["3m", "15m", "1h"] and R.enabled_routes({"INDEX_ROUTES": "1h,bogus"}) == ["1h"]
 
 
+def test_refresh_opened():
+    st = {}
+    key = R.ukey("NSE_FO|1")
+    assert R.refresh_opened(st, key, "2026-11-17T10:50:57+05:30") is False  # untracked
+    R.record(st, key, route_name="3m", index="NIFTY", symbol="X", product="I", qty=65,
+             ts="2026-11-17T09:31:30+05:30", broker="upstox", order_id="old")
+    assert R.refresh_opened(st, key, "2026-11-17T10:50:57+05:30", order_id="new", qty=40) is True
+    rec = st["positions"][key]
+    assert rec["opened"] == "2026-11-17T10:50:57+05:30"
+    assert rec["order_id"] == "new" and rec["qty"] == 40 and rec["route"] == "3m"
+    assert R.refresh_opened(st, key, "2026-11-17T10:50:57+05:30", order_id="new", qty=40) is False
+
+
 def test_wiring():
     src = open(os.path.join(D, "auto_entry.py")).read(); ast.parse(src)
     assert "iroutes.select_expiry(name, ROUTE, now.date(), _rows, monthlies)" in src
@@ -109,5 +122,5 @@ def test_wiring():
 
 
 if __name__ == "__main__":
-    test_expiry(); test_window(); test_continuation(); test_tracking_and_dedupe(); test_wiring()
+    test_expiry(); test_window(); test_continuation(); test_tracking_and_dedupe(); test_refresh_opened(); test_wiring()
     print("index_routes tests passed (synthetic, no broker, no orders)")

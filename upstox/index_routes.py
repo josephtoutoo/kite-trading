@@ -241,6 +241,29 @@ def record(state, key, *, route_name, index, symbol, product, qty, ts, broker, o
     return state
 
 
+def refresh_opened(state, key, ts, order_id=None, qty=None):
+    """Reset a tracked route's entry time to the current life's opening fill.
+
+    No-op when the key is not already tracked (inferred / untracked positions
+    stay unwritten). Returns True when the record was changed.
+    """
+    rec = ((state or {}).get("positions") or {}).get(key)
+    if not rec or rec.get("route") not in ROUTES:
+        return False
+    new_ts = ts.isoformat() if hasattr(ts, "isoformat") else ts
+    changed = False
+    if rec.get("opened") != new_ts:
+        rec["opened"] = new_ts
+        changed = True
+    if order_id and rec.get("order_id") != order_id:
+        rec["order_id"] = order_id
+        changed = True
+    if qty is not None and rec.get("qty") != qty:
+        rec["qty"] = qty
+        changed = True
+    return changed
+
+
 def infer_route(product, expiry, monthly_dates):
     """Read-only classification of an untracked position (never written back)."""
     if str(product or "").upper() in INTRADAY_PRODUCTS:

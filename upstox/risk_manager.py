@@ -251,10 +251,10 @@ try:
 except Exception as _i2e:
     i2c=None; _I2C=None
     print(f"risk_manager: index_two_candle_exit unavailable, two-candle/EMA50 exit off: {type(_i2e).__name__}",file=sys.stderr)
-def _two_candle_check(sym,product,broker,instrument_key=None,exchange=None):
+def _two_candle_check(sym,product,broker,instrument_key=None,exchange=None,orders=None):
     if i2c is None: return False,"route-timeframe exit module unavailable",None
     try:
-        r=i2c.evaluate(sym,product=product,broker=broker,instrument_key=instrument_key,exchange=exchange,state=_I2C,now=now)
+        r=i2c.evaluate(sym,product=product,broker=broker,instrument_key=instrument_key,exchange=exchange,state=_I2C,now=now,orders=orders,sync_route=True)
         if isinstance(r,tuple) and len(r)>=3:
             return r[0],r[1],r[2]
         return (r[0],r[1],("TWO_CANDLE_EXIT" if r[0] else None))
@@ -434,7 +434,7 @@ for p in pos:
         ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
         if INDEX_OPT and s["high"]>=avg*1.15 and not ok: _fa_exit="TREND_EXIT"
     if not _fa_exit and INDEX_OPT and not fut:
-        _c2,_c2w,_c2a=_two_candle_check(sym,p.get("product"),"upstox",instrument_key=k)
+        _c2,_c2w,_c2a=_two_candle_check(sym,p.get("product"),"upstox",instrument_key=k,orders=orders)
         if _c2: _fa_exit=_c2a or "TWO_CANDLE_EXIT"; why=_c2w
     if _fa_exit:
         gok,gdet=_gtt_clear("upstox",sym,key=k)
@@ -679,7 +679,7 @@ try:
                 ok,why=trend_ok(sym) if (not fut and INDEX_OPT) else (True,"not an index option")
                 if INDEX_OPT and s["high"]>=avg*1.15 and not ok: _fa_exit="TREND_EXIT"
             if not _fa_exit and INDEX_OPT and not fut:
-                _c2,_c2w,_c2a=_two_candle_check(sym,p.get("product"),"kite",exchange=ex)
+                _c2,_c2w,_c2a=_two_candle_check(sym,p.get("product"),"kite",exchange=ex,orders=kord)
                 if _c2: _fa_exit=_c2a or "TWO_CANDLE_EXIT"; why=_c2w
             if _fa_exit:
                 gok,gdet=_gtt_clear("kite",sym)
