@@ -17,7 +17,7 @@ import api                     # pooled + timed transport (5 Nov 2026)
 D=os.path.dirname(os.path.abspath(__file__))
 LF=os.path.join(D,"trade_lock.json")
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
-THRESHOLD = 30000
+THRESHOLD=30000
 INDEX_OPT_MAX=3; INDEX_OPT_LOSS=2000; WINDOW_MIN=30; EQ_STOP_CUTOFF=datetime.time(15,10)
 MTF_STOCK_CAP=0.10; MTF_TOTAL_CAP=0.50
 INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FINNIFTY":"NSE_INDEX|Nifty Fin Service",
@@ -448,41 +448,60 @@ def check_order(order,broker="upstox"):
         if not ok: block.append("R2: "+why)
         elif fac<1:
             adj=max(int(adj*fac),0); flags.append(f"R2: {why}; qty cut to {adj} (round to lot size)")
+        # 17 Nov 2026 12:27 IST (t716u "Don't block today"): when index_r1_r7_off is on and
+        # today's IST date is on or before index_r1_r7_off_until, skip R1 (daily decision cap,
+        # including the expired 5-6 Nov gap/expiry-cutoff extras) and R7 (post-exit cooldown)
+        # for index option entries only. R12, R2a, R3, R4, R4b, R5, R6, R11, R13, the loss cap
+        # and the 09:30-15:25 window stay. Defaults off; expires by date even if the flag is left on.
+        _skip_r1_r7=False
         if idx_opt:
+            try:
+                if D not in sys.path: sys.path.insert(0, D)
+                import full_auto_policy as _fap17
+                _skip_r1_r7=bool(_fap17.index_r1_r7_off(now))
+                _r17_until=_fap17.index_r1_r7_until()
+            except Exception as _se:
+                _skip_r1_r7=False; _r17_until=None
+                print(f"trade_lock: index_r1_r7_off unreadable, R1/R7 stay on: {type(_se).__name__}",file=sys.stderr)
+            if _skip_r1_r7:
+                _until_s=_r17_until.isoformat() if _r17_until else "today"
+                flags.append(f"R1/R7 skipped: index_r1_r7_off until {_until_s}; index option decision cap and cooldown off today only")
+                print("trade_lock: R1/R7 skipped: index_r1_r7_off",file=sys.stderr)
             # t329u (4 Nov): NIFTY, SENSEX and BANKNIFTY are SEPARATE books. Every index-option rule below
             # counts only this order's own underlying - a NIFTY loss or a third NIFTY decision must never
             # block BANKNIFTY or SENSEX. (MCX crude is a separate script and never enters this path.)
             # rule 1
             # t339u (4 Nov): every limit below is read at decision time through _lim(), so the
             # two-day override moves it only on 5-6 Nov and the user's constant is back on 7 Nov.
-            _max=_lim("INDEX_OPT_MAX",INDEX_OPT_MAX,now)
-            _dec=[d for d in _decisions(filled,now) if d["u"]==und]
-            n=len(_dec)
-            if n>=_max and not order.get("_paired"): block.append(f"R1: {n} {und} option trade decisions already today across Upstox+Kite (max {_max} per index)")
-            # t339u: two extra index checks, live ONLY while the override is on. Both can only
-            # refuse a trade the count would have allowed, never allow one it refused.
-            _gap=_lim("INDEX_OPT_GAP_MIN",None,now)
-            if _gap and _dec:
-                # The mirror leg of one decision must not count against its own partner: _decisions
-                # already calls an Upstox+Kite pair of the same index and side within 5 min ONE
-                # decision, so the gap is measured from the last decision that is not this order's
-                # partner. Without this, a Kite leg retried a minute after its Upstox leg filled
-                # would be refused by a rule that only exists to slow the bot down.
-                _other="kite" if broker=="upstox" else "upstox"
-                _prev=[d for d in _dec if not (d["b"]=={_other} and d["sd"]==opt_side(sym) and timedelta_min(now,d["t"])<=5)]
-                if _prev:
-                    _last=max(d["t"] for d in _prev)
-                    if timedelta_min(now,_last)<_gap:
-                        block.append(f"R1: last {und} decision {_last:%H:%M} is {timedelta_min(now,_last):.0f} min ago (<{_gap} min) - too soon for another")
-            _cut=_lim("INDEX_OPT_EXPIRY_CUTOFF",None,now)
-            if _cut:
-                try: _ch,_cm=str(_cut).split(":")
-                except Exception: _ch,_cm="13","00"
-                if now.time()>datetime.time(int(_ch),int(_cm)):
-                    exp=_expiry_today(und,now)
-                    if exp is not False:   # True, or unknown -> the tighter branch (this only restricts)
-                        block.append(f"R1: {und} options expire today and it is {now:%H:%M} (>={_cut}) - no NEW index-option decision"
-                                     + ("" if exp else " (expiry calendar unreadable, treating it as expiry day)"))
+            if not _skip_r1_r7:
+                _max=_lim("INDEX_OPT_MAX",INDEX_OPT_MAX,now)
+                _dec=[d for d in _decisions(filled,now) if d["u"]==und]
+                n=len(_dec)
+                if n>=_max and not order.get("_paired"): block.append(f"R1: {n} {und} option trade decisions already today across Upstox+Kite (max {_max} per index)")
+                # t339u: two extra index checks, live ONLY while the override is on. Both can only
+                # refuse a trade the count would have allowed, never allow one it refused.
+                _gap=_lim("INDEX_OPT_GAP_MIN",None,now)
+                if _gap and _dec:
+                    # The mirror leg of one decision must not count against its own partner: _decisions
+                    # already calls an Upstox+Kite pair of the same index and side within 5 min ONE
+                    # decision, so the gap is measured from the last decision that is not this order's
+                    # partner. Without this, a Kite leg retried a minute after its Upstox leg filled
+                    # would be refused by a rule that only exists to slow the bot down.
+                    _other="kite" if broker=="upstox" else "upstox"
+                    _prev=[d for d in _dec if not (d["b"]=={_other} and d["sd"]==opt_side(sym) and timedelta_min(now,d["t"])<=5)]
+                    if _prev:
+                        _last=max(d["t"] for d in _prev)
+                        if timedelta_min(now,_last)<_gap:
+                            block.append(f"R1: last {und} decision {_last:%H:%M} is {timedelta_min(now,_last):.0f} min ago (<{_gap} min) - too soon for another")
+                _cut=_lim("INDEX_OPT_EXPIRY_CUTOFF",None,now)
+                if _cut:
+                    try: _ch,_cm=str(_cut).split(":")
+                    except Exception: _ch,_cm="13","00"
+                    if now.time()>datetime.time(int(_ch),int(_cm)):
+                        exp=_expiry_today(und,now)
+                        if exp is not False:   # True, or unknown -> the tighter branch (this only restricts)
+                            block.append(f"R1: {und} options expire today and it is {now:%H:%M} (>={_cut}) - no NEW index-option decision"
+                                         + ("" if exp else " (expiry calendar unreadable, treating it as expiry day)"))
             # rule 2a
             _loss=_lim("INDEX_OPT_LOSS",INDEX_OPT_LOSS,now)
             # 16 Nov 2026 (t669u): booked today, FIFO from today's fills; Kite's realised=0 on a partly
@@ -527,11 +546,12 @@ def check_order(order,broker="upstox"):
             if ltp and avg and ltp>avg*1.20: block.append(f"R6: add-on after >20% run (LTP {ltp} > avg*1.2 {avg*1.2:.2f})")
             if qty>held_q: adj=min(adj,held_q); flags.append(f"R6: add-on qty capped at original {held_q}")
         # rule 7
-        _win7=_lim("WINDOW_MIN",WINDOW_MIN,now)
-        for o in filled:
-            t=_ts(o)
-            if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=_win7:
-                block.append(f"R7: {und} exit filled {t:%H:%M} (<{_win7} min ago) - cooldown"); break
+        if not (idx_opt and _skip_r1_r7):
+            _win7=_lim("WINDOW_MIN",WINDOW_MIN,now)
+            for o in filled:
+                t=_ts(o)
+                if o["transaction_type"]=="SELL" and underlying(sym_of(o))==und and t and timedelta_min(now,t)<=_win7:
+                    block.append(f"R7: {und} exit filled {t:%H:%M} (<{_win7} min ago) - cooldown"); break
         # ---- 16 Nov 2026 performance rules (user t669u "Improve code changes"), every bot option BUY ----
         # R4b 15m trend filter, R12 re-entry block, R13 lot cap, R14 index expiry >1 trading day.
         # MCX (crude, manage-only) keeps its own 1-lot crude_auto rule and is not covered here.

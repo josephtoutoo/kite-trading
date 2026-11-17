@@ -12,6 +12,12 @@ Switches (environment wins, then full_auto_flags.json beside this file; anything
   FULL_AUTO_R10_MTF_CAPITAL=0  trade_lock R10 no longer refuses an equity MTF stock buy for a
                            missing verified capital denominator (default ON; t713u/t714u 17 Nov
                            2026 turned it off). Futures and options are unchanged.
+  FULL_AUTO_INDEX_R1_R7_OFF=1  trade_lock skips R1 (daily index-option decision cap) and R7
+                           (post-exit cooldown) for NIFTY/BANKNIFTY/SENSEX option entries only,
+                           and only while today's IST date is on or before
+                           index_r1_r7_off_until / FULL_AUTO_INDEX_R1_R7_OFF_UNTIL
+                           (default OFF; t716u 17 Nov 2026 set until=2026-11-17). R12, lot cap,
+                           loss cap and all other rules stay. Env =0 turns it off immediately.
 
 Rules
   Add      at most one per broker position; open profit (LTP > average) and not past the
@@ -29,13 +35,15 @@ Rules
 import json
 import math
 import os
+from datetime import date
 
 D = os.path.dirname(os.path.abspath(__file__))
 FLAGS_FILE = os.path.join(D, "full_auto_flags.json")
 FLAG_NAMES = {"adds": "FULL_AUTO_ADDS", "trend_exit": "FULL_AUTO_TREND_EXIT", "crude_entry": "CRUDE_EXECUTE",
               "stop_ladder": "FULL_AUTO_STOP_LADDER",  # 12 Nov 09:00: ladder split from the 1h trend exit
               "capital_gate": "FULL_AUTO_CAPITAL_GATE",  # 12 Nov 10:38 (t598u): trade_lock R10 verified-capital gate for options
-              "r10_mtf_capital": "FULL_AUTO_R10_MTF_CAPITAL"}  # 17 Nov 11:40 (t713u/t714u): R10 capital check for MTF stock
+              "r10_mtf_capital": "FULL_AUTO_R10_MTF_CAPITAL",  # 17 Nov 11:40 (t713u/t714u): R10 capital check for MTF stock
+              "index_r1_r7_off": "FULL_AUTO_INDEX_R1_R7_OFF"}  # 17 Nov 12:27 (t716u): skip R1/R7 for index options, date-gated
 # Safety gates that are ON unless explicitly switched off ("0" in env, or false in the flags file).
 DEFAULT_ON = frozenset({"capital_gate", "r10_mtf_capital"})
 
@@ -69,6 +77,49 @@ def flag(name, env=None, flags_file=None):
     if default_on:
         return data.get(name) is not False
     return data.get(name) is True
+
+
+INDEX_R1_R7_UNTIL_ENV = "FULL_AUTO_INDEX_R1_R7_OFF_UNTIL"
+INDEX_R1_R7_UNTIL_KEY = "index_r1_r7_off_until"
+
+
+def index_r1_r7_until(env=None, flags_file=None):
+    """Inclusive IST calendar date the R1/R7 override lasts until, or None if unset/unreadable."""
+    env = os.environ if env is None else env
+    raw = env.get(INDEX_R1_R7_UNTIL_ENV)
+    if raw is None or str(raw).strip() == "":
+        try:
+            data = json.load(open(flags_file or FLAGS_FILE))
+        except Exception:
+            data = {}
+        raw = data.get(INDEX_R1_R7_UNTIL_KEY) if isinstance(data, dict) else None
+    try:
+        return date.fromisoformat(str(raw).strip()[:10])
+    except Exception:
+        return None
+
+
+def index_r1_r7_off(when, env=None, flags_file=None):
+    """True only when the dated override is on AND when's IST date is on or before the until date.
+
+    Defaults OFF. A missing/unreadable until date, a missing when, or a date after the until
+    date keeps R1 and R7 on. Env FULL_AUTO_INDEX_R1_R7_OFF=0 turns it off immediately; =1 still
+    needs an until date from FULL_AUTO_INDEX_R1_R7_OFF_UNTIL or the flags file.
+    """
+    if when is None:
+        return False
+    until = index_r1_r7_until(env=env, flags_file=flags_file)
+    if until is None:
+        return False
+    day = when.date() if hasattr(when, "date") and callable(getattr(when, "date")) else when
+    try:
+        if day > until:
+            return False
+    except TypeError:
+        return False
+    return flag("index_r1_r7_off", env=env, flags_file=flags_file)
+
+
 
 
 # ---------------- trend ----------------
