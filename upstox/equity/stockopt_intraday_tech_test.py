@@ -488,6 +488,117 @@ def test_import_is_idle():
     check("entry does not import auto_entry", "import auto_entry" not in src and "auto_entry import" not in src)
     check("entry does not import risk_manager", "import risk_manager" not in src and "risk_manager import" not in src)
     check("policy does not import auto_entry", "auto_entry" not in open(os.path.join(HERE, "stockopt_intraday_tech.py")).read())
+    check("entry no longer calls api.post", "_api.post" not in src and "api.post(" not in src, src[src.find("def place"):] if "api.post" in src else "")
+    check("entry places via api.call on the HFT endpoint",
+          "api-hft.upstox.com/v2/order/place" in src and "api_mod.call" in src)
+
+
+def test_send_pair_still_attempts_other_leg():
+    """A crash or reject on one broker must not skip the other leg."""
+    calls = []
+
+    def upstox_crashes(broker, order):
+        calls.append(broker)
+        if broker == "upstox":
+            raise AttributeError("'module' object has no attribute 'post'")
+        return "OID-kite"
+
+    sent, err = entry._send_pair(upstox_crashes, ({"quantity": 1000}, {"quantity": 400}))
+    check("after an Upstox AttributeError both brokers were attempted", calls == ["upstox", "kite"], calls)
+    check("Kite fill is kept after an Upstox crash",
+          sent == [{"broker": "kite", "order_id": "OID-kite", "quantity": 400}] and "AttributeError" in (err or "")
+          and "other leg still attempted" in (err or ""), (sent, err))
+
+    calls.clear()
+
+    def upstox_rejects(broker, order):
+        calls.append(broker)
+        if broker == "upstox":
+            return None
+        return "OID-kite"
+
+    sent, err = entry._send_pair(upstox_rejects, ({"quantity": 1000}, {"quantity": 400}))
+    check("after an Upstox reject Kite is still sent", calls == ["upstox", "kite"] and sent[0]["broker"] == "kite", (calls, sent, err))
+
+    calls.clear()
+
+    def kite_fails(broker, order):
+        calls.append(broker)
+        if broker == "kite":
+            raise RuntimeError("kite down")
+        return "OID-upstox"
+
+    sent, err = entry._send_pair(kite_fails, ({"quantity": 1000}, {"quantity": 400}))
+    check("after a Kite crash Upstox fill is kept",
+          calls == ["upstox", "kite"] and sent == [{"broker": "upstox", "order_id": "OID-upstox", "quantity": 1000}]
+          and "RuntimeError" in (err or ""), (calls, sent, err))
+
+    def both_ok(broker, order):
+        return "OID-%s" % broker
+
+    sent, err = entry._send_pair(both_ok, ({"quantity": 1000}, {"quantity": 400}))
+    check("both legs still succeed together", err is None and [s["broker"] for s in sent] == ["upstox", "kite"], (sent, err))
+
+    sent, err = entry._send_pair(None, ({"quantity": 1000}, {"quantity": 400}))
+    check("missing sender is still unverified", sent == [] and err == "sender unverified", (sent, err))
+
+
+def test_place_payloads_for_todays_candidates():
+    """The 17 Nov 10:30 IST candidates: confirm LIMIT bodies, no live order."""
+    lic = contract("LICHSGFIN", "CE", lot=1000, strike=600)
+    mfsl = contract("MFSL", "CE", lot=400, strike=1440)
+    lic_u, lic_k = it.mirror_orders(lic, 9.55, dt.time(15, 15))
+    mfsl_u, mfsl_k = it.mirror_orders(mfsl, 23.45, dt.time(15, 15))
+    check("LICHSGFIN Upstox is 1000 qty I LIMIT 9.55 BUY 600 CE 23 Nov",
+          lic_u and lic_u["quantity"] == 1000 and lic_u["product"] == "I" and lic_u["price"] == 9.55
+          and lic_u["transaction_type"] == "BUY" and lic_u["order_type"] == "LIMIT"
+          and lic_u["trading_symbol"] == "LICHSGFIN26NOV600CE"
+          and lic_u["instrument_token"] == lic["instrument_key"], lic_u)
+    check("LICHSGFIN Kite is 1000 qty MIS LIMIT 9.55",
+          lic_k and lic_k["quantity"] == 1000 and lic_k["product"] == "MIS" and lic_k["price"] == 9.55
+          and lic_k["trading_symbol"] == "LICHSGFIN26NOV600CE", lic_k)
+    check("MFSL Upstox is 400 qty I LIMIT 23.45 BUY 1440 CE 23 Nov",
+          mfsl_u and mfsl_u["quantity"] == 400 and mfsl_u["product"] == "I" and mfsl_u["price"] == 23.45
+          and mfsl_u["transaction_type"] == "BUY" and mfsl_u["order_type"] == "LIMIT"
+          and mfsl_u["trading_symbol"] == "MFSL26NOV1440CE"
+          and mfsl_u["instrument_token"] == mfsl["instrument_key"], mfsl_u)
+    check("MFSL Kite is 400 qty MIS LIMIT 23.45",
+          mfsl_k and mfsl_k["quantity"] == 400 and mfsl_k["product"] == "MIS" and mfsl_k["price"] == 23.45
+          and mfsl_k["trading_symbol"] == "MFSL26NOV1440CE", mfsl_k)
+
+    class FakeApi:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, url, body=None, method=None, proxy=None, timeout=None):
+            self.calls.append({"url": url, "body": body, "method": method, "proxy": proxy})
+            return {"status": "success", "data": {"order_id": "U-DRY"}}
+
+        def post(self, *a, **k):
+            raise AssertionError("api.post must not be used")
+
+    api = FakeApi()
+    oid = entry._place_upstox(api, lic_u)
+    check("mocked LICHSGFIN place returns an id and never calls api.post", oid == "U-DRY" and len(api.calls) == 1, api.calls)
+    call = api.calls[0]
+    body = call["body"]
+    check("LICHSGFIN goes to the HFT place endpoint via api.call POST proxy=True",
+          call["url"] == entry.UPSTOX_PLACE_URL == "https://api-hft.upstox.com/v2/order/place"
+          and call["method"] == "POST" and call["proxy"] is True, call)
+    check("LICHSGFIN HFT body has qty 1000, product I, limit 9.55",
+          body["quantity"] == 1000 and body["product"] == "I" and body["price"] == 9.55
+          and body["order_type"] == "LIMIT" and body["transaction_type"] == "BUY"
+          and body["validity"] == "DAY" and body["instrument_token"] == lic["instrument_key"]
+          and body["disclosed_quantity"] == 0 and body["trigger_price"] == 0 and body["is_amo"] is False
+          and body["tag"] == it.TAG, body)
+
+    api = FakeApi()
+    oid = entry._place_upstox(api, mfsl_u)
+    body = api.calls[0]["body"]
+    check("MFSL HFT body has qty 400, product I, limit 23.45",
+          oid == "U-DRY" and body["quantity"] == 400 and body["product"] == "I" and body["price"] == 23.45
+          and body["instrument_token"] == mfsl["instrument_key"]
+          and api.calls[0]["url"] == entry.UPSTOX_PLACE_URL, body)
 
 
 if __name__ == "__main__":
@@ -500,6 +611,8 @@ if __name__ == "__main__":
     test_report_preview_uses_saved_close()
     test_premium_cap()
     test_import_is_idle()
+    test_send_pair_still_attempts_other_leg()
+    test_place_payloads_for_todays_candidates()
     if FAILS:
         print("FAILED", len(FAILS), ":", ", ".join(FAILS))
         sys.exit(1)

@@ -68,19 +68,61 @@ def _check_pair(check_order, upstox, kite):
     return True, None
 
 
+UPSTOX_PLACE_URL = "https://api-hft.upstox.com/v2/order/place"
+
+
+def _upstox_place_body(order):
+    """LIMIT body for the HFT place endpoint, same fields as ST/EMA and index entries."""
+    return {
+        "quantity": order["quantity"],
+        "product": order.get("product") or it.UPSTOX_PRODUCT,
+        "validity": "DAY",
+        "price": order["price"],
+        "tag": order.get("tag") or TAG,
+        "instrument_token": order["instrument_token"],
+        "order_type": order.get("order_type") or "LIMIT",
+        "transaction_type": order["transaction_type"],
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False,
+    }
+
+
+def _place_upstox(api_mod, order):
+    """Place through api.call. api.post does not exist and used to crash this path."""
+    reply = api_mod.call(UPSTOX_PLACE_URL, _upstox_place_body(order), "POST", proxy=True)
+    if not isinstance(reply, dict):
+        return None
+    data = reply.get("data")
+    if not isinstance(data, dict):
+        return None
+    return data.get("order_id")
+
+
 def _send_pair(place, orders):
+    """Send both broker legs. A failure on one is logged and the other is still attempted."""
     if place is None:
         return [], "sender unverified"
     sent = []
+    errors = []
     for broker, order in (("upstox", orders[0]), ("kite", orders[1])):
         try:
             order_id = place(broker, order)
         except Exception as exc:
-            return sent, "send failed: %s" % type(exc).__name__
+            msg = "%s send failed: %s" % (broker, type(exc).__name__)
+            errors.append(msg)
+            print(msg, file=sys.stderr)
+            continue
         if not order_id:
-            return sent, "broker rejected; the other leg was not sent" if not sent else "Kite rejected after Upstox"
+            msg = "%s rejected" % broker
+            errors.append(msg)
+            print(msg, file=sys.stderr)
+            continue
         sent.append({"broker": broker, "order_id": order_id, "quantity": order["quantity"]})
-    return sent, None
+    if not errors:
+        return sent, None
+    suffix = "; other leg still attempted" if len(errors) == 1 else "; both legs attempted"
+    return sent, "; ".join(errors) + suffix
 
 
 def _position_row(positions, broker, symbol):
@@ -580,19 +622,7 @@ def _live_market(names, now):
 
     def place(broker, order):
         if broker == "upstox":
-            import api as _api
-            body = {
-                "quantity": order["quantity"],
-                "product": order.get("product") or it.UPSTOX_PRODUCT,
-                "validity": "DAY",
-                "price": order["price"],
-                "tag": order.get("tag") or TAG,
-                "instrument_token": order["instrument_token"],
-                "order_type": order.get("order_type") or "LIMIT",
-                "transaction_type": order["transaction_type"],
-            }
-            payload = _api.post("/v2/order/place", body)
-            return (payload or {}).get("data", {}).get("order_id")
+            return _place_upstox(api, order)
         return bk.place(order.get("kite_exchange") or "NFO", order["trading_symbol"], order["transaction_type"],
                         order["quantity"], order["price"], tag=TAG, product=order.get("product") or it.KITE_PRODUCT)
 
