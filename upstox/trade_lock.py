@@ -17,7 +17,7 @@ import api                     # pooled + timed transport (5 Nov 2026)
 D=os.path.dirname(os.path.abspath(__file__))
 LF=os.path.join(D,"trade_lock.json")
 IST=datetime.timezone(datetime.timedelta(hours=5,minutes=30))
-THRESHOLD=75000
+THRESHOLD = 30000
 INDEX_OPT_MAX=3; INDEX_OPT_LOSS=2000; WINDOW_MIN=30; EQ_STOP_CUTOFF=datetime.time(15,10)
 MTF_STOCK_CAP=0.10; MTF_TOTAL_CAP=0.50
 INDEX_KEYS={"NIFTY":"NSE_INDEX|Nifty 50","BANKNIFTY":"NSE_INDEX|Nifty Bank","FINNIFTY":"NSE_INDEX|Nifty Fin Service",
