@@ -9,6 +9,9 @@ Switches (environment wins, then full_auto_flags.json beside this file; anything
   CRUDE_EXECUTE=1          CRUDEOIL option entries on Kite (crude_auto.py)
   FULL_AUTO_CAPITAL_GATE=0 trade_lock R10 no longer refuses an OPTION buy for a missing
                            verified_capital.json (default ON; t598u 12 Nov 2026 turned it off)
+  FULL_AUTO_R10_MTF_CAPITAL=0  trade_lock R10 no longer refuses an equity MTF stock buy for a
+                           missing verified capital denominator (default ON; t713u/t714u 17 Nov
+                           2026 turned it off). Futures and options are unchanged.
 
 Rules
   Add      at most one per broker position; open profit (LTP > average) and not past the
@@ -31,9 +34,10 @@ D = os.path.dirname(os.path.abspath(__file__))
 FLAGS_FILE = os.path.join(D, "full_auto_flags.json")
 FLAG_NAMES = {"adds": "FULL_AUTO_ADDS", "trend_exit": "FULL_AUTO_TREND_EXIT", "crude_entry": "CRUDE_EXECUTE",
               "stop_ladder": "FULL_AUTO_STOP_LADDER",  # 12 Nov 09:00: ladder split from the 1h trend exit
-              "capital_gate": "FULL_AUTO_CAPITAL_GATE"}  # 12 Nov 10:38 (t598u): trade_lock R10 verified-capital gate
+              "capital_gate": "FULL_AUTO_CAPITAL_GATE",  # 12 Nov 10:38 (t598u): trade_lock R10 verified-capital gate for options
+              "r10_mtf_capital": "FULL_AUTO_R10_MTF_CAPITAL"}  # 17 Nov 11:40 (t713u/t714u): R10 capital check for MTF stock
 # Safety gates that are ON unless explicitly switched off ("0" in env, or false in the flags file).
-DEFAULT_ON = frozenset({"capital_gate"})
+DEFAULT_ON = frozenset({"capital_gate", "r10_mtf_capital"})
 
 DISASTER = 0.30          # option floor under entry, unchanged
 STEP = 0.20              # target step, unchanged
@@ -46,7 +50,7 @@ ADDS_PER_POSITION = 1
 def flag(name, env=None, flags_file=None):
     """True only when the env var is exactly '1', or the flags file says true and env is unset.
 
-    DEFAULT_ON gates (capital_gate) are the reverse: ON unless the env var is exactly '0' or the
+    DEFAULT_ON gates (capital_gate, r10_mtf_capital) are the reverse: ON unless the env var is exactly '0' or the
     flags file says exactly false. A missing/unreadable file or an odd env value keeps them ON."""
     env = os.environ if env is None else env
     var = FLAG_NAMES[name]

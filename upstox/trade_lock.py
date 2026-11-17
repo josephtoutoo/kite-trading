@@ -321,7 +321,15 @@ def _perf_rules():
     except Exception as e:
         print(f"trade_lock: perf_rules unavailable: {type(e).__name__}",file=sys.stderr)
         return None
+def _r10_capital_msg(msg):
+    """True when an R10 reason is a verified-capital or percentage-of-capital cap (not name/eligibility)."""
+    m=(msg or "").lower()
+    return any(s in m for s in (
+        "verified capital denominator","margin capacity, not a verified","verified-capital",
+        "shared 25% pool","per-stock margin would exceed","total mtf margin is already over",
+        "stricter 10% cap","mtf margin rs ","% cap rs "))
 def check_order(order,broker="upstox"):
+
     """-> (allowed: bool, reasons: list[str], adjusted_qty: int)
     broker: 'upstox' | 'kite'. Daily index-option limits (R1 count, R2a loss cutoff, R3, R7) use BOTH
     accounts but ONLY the order's own underlying: NIFTY, SENSEX and BANKNIFTY are separate books (t329u).
@@ -365,7 +373,7 @@ def check_order(order,broker="upstox"):
         # blind. Refuse the BUY instead of clearing it on a partial picture.
         if capital<=0: block.append("R0: capital unreadable (funds call returned nothing) - a BUY cannot be sized")
         for e in _kite_err: block.append(f"R0: {e} - a BUY needs the Kite book readable")
-        _cap_active=False; _cap_skip=False
+        _cap_active=False; _cap_skip=False; _mtf_cap_skip=False; _mtf_r10_on=True
         try:
             sys.path.insert(0, os.path.join(D, "equity"))
             import capital_policy as _cp
@@ -374,6 +382,21 @@ def check_order(order,broker="upstox"):
             _cp=None
             if now.date()>=datetime.date(2026,11,9):
                 block.append(f"R10: capital policy missing ({type(_ce).__name__}) - buy refused")
+        _gate_on=True
+        try:
+            if D not in sys.path: sys.path.insert(0, D)
+            import full_auto_policy as _fap
+            _gate_on=_fap.flag("capital_gate")
+            _mtf_r10_on=_fap.flag("r10_mtf_capital")
+        except Exception as _fe:
+            print(f"trade_lock: capital_gate/r10_mtf_capital flag unreadable, R10 stays on: {type(_fe).__name__}",file=sys.stderr)
+        # 17 Nov 2026 11:40 IST (t713u/t714u): r10_mtf_capital off skips R10 verified-capital
+        # and percentage-of-capital caps for equity MTF stock buys only. Futures and options
+        # are unchanged. No capital figure is invented. R0, R1-R9, R11, R13, the daily loss
+        # cap, the Rs 50k per-stock MTF sleeve, the MTF name cap and the broker's own margin
+        # checks still apply.
+        if (not _mtf_r10_on) and prod=="MTF" and not opt and not is_fut(sym):
+            _mtf_cap_skip=True
         if _cap_active and _cp is not None:
             _vo=_cp.verified_override(broker) if hasattr(_cp,"verified_override") else None
             _basis=_cp.basis_from_funds(_vo or (_kite_margin if broker=="kite" else eq))
@@ -382,18 +405,16 @@ def check_order(order,broker="upstox"):
                 # OPTION buy is not refused for a missing verified capital figure. No capital is invented:
                 # the percentage buckets are skipped and size stays the caller's lot rule (1 lot, 2 on
                 # ST/EMA, 3 on the index's own expiry day, by max). R0 funds, R1-R9, R11 and the daily
-                # loss cap still apply. MTF, BEEs, futures and MCX keep the fail-closed refusal.
-                _gate_on=True
-                try:
-                    if D not in sys.path: sys.path.insert(0, D)
-                    import full_auto_policy as _fap
-                    _gate_on=_fap.flag("capital_gate")
-                except Exception as _fe:
-                    print(f"trade_lock: capital_gate flag unreadable, R10 stays on: {type(_fe).__name__}",file=sys.stderr)
+                # loss cap still apply. BEEs, futures and MCX keep the fail-closed refusal.
+                # 17 Nov 2026 (t713u/t714u): equity MTF stock buys also skip this fail-closed
+                # refusal when r10_mtf_capital is off.
                 if not _gate_on and opt and prod!="MTF":
                     _cap_skip=True
                     flags.append(f"R10 skipped: capital_gate off ({_basis['reason']}); option sized by lots, not buckets")
                     print("trade_lock: R10 skipped: capital_gate off",file=sys.stderr)
+                elif _mtf_cap_skip:
+                    flags.append(f"R10 skipped: r10_mtf_capital off ({_basis['reason']}); MTF stock not sized on a verified-capital denominator")
+                    print("trade_lock: R10 skipped: r10_mtf_capital off",file=sys.stderr)
                 else:
                     block.append(f"R10: {_basis['reason']} - buy refused")
                     capital=0
@@ -692,8 +713,13 @@ def check_order(order,broker="upstox"):
                         block.extend(_mp.longterm_dst_blocks(_mp.longterm_dst_symbols(broker), und, _mnew,
                                                             already_held=und in _pos))
                 else:
-                    block.extend(_mp.order_blocks(_view, und, "add" if und in _pos else "new", _mnew,
-                                                  order.get("_trend_ok") is True, order.get("_in_loss") is True, _already))
+                    _ob=_mp.order_blocks(_view, und, "add" if und in _pos else "new", _mnew,
+                                         order.get("_trend_ok") is True, order.get("_in_loss") is True, _already)
+                    # t713u/t714u: when r10_mtf_capital is off, drop percentage-of-capital /
+                    # verified-denominator pool blocks only. Name cap, eligibility, add rules stay.
+                    if _mtf_cap_skip:
+                        _ob=[b for b in _ob if not _r10_capital_msg(b)]
+                    block.extend(_ob)
             if not _mon:
               # 4 Nov 2026 (t292u): R10 caps are measured on the MTF MARGIN the broker blocks, not on price x qty.
               # 5 Nov 2026 (t304u): only names THIS bot opened count toward the caps, and each holding is
@@ -741,8 +767,9 @@ def check_order(order,broker="upstox"):
               # t339u: 10% -> 12% per stock on 5-6 Nov; the 50% total is NOT raised (the override
               # table states it at 0.50, and this line reads it, so the cap cannot drift by accident).
               _per=_lim("MTF_PER_STOCK",MTF_STOCK_CAP,now); _tot=_lim("MTF_TOTAL",MTF_TOTAL_CAP,now)
-              if this_m+new_m>capital*_per: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > {_per*100:g}% cap Rs {capital*_per:,.0f}")
-              if total_m+new_m>capital*_tot: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > {_tot*100:g}% cap Rs {capital*_tot:,.0f}")
+              if not _mtf_cap_skip:
+                  if this_m+new_m>capital*_per: block.append(f"R10: {und} MTF margin Rs {this_m+new_m:,.0f} > {_per*100:g}% cap Rs {capital*_per:,.0f}")
+                  if total_m+new_m>capital*_tot: block.append(f"R10: total MTF margin (this bot's names) Rs {total_m+new_m:,.0f} > {_tot*100:g}% cap Rs {capital*_tot:,.0f}")
         elif opt or is_fut(sym) or (sym.replace("-EQ","") in (getattr(_cp, "BEE_SYMBOLS", ()) if _cp is not None else ())):
             if _cap_active and _cp is not None:
                 _kind=_cp.classify(sym, prod, k or "")
