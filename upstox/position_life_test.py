@@ -103,5 +103,32 @@ flat_orders = fills([
 fts4, foid4, flats4 = pl.current_open_fill(flat_orders, sym="CRUDEOIL26NOV8300CE")
 check("flat book has no opening fill", fts4 is None and foid4 is None, (fts4, foid4, flats4))
 
+
+# 17 Nov 2026 live case (Kite SENSEX26N1982200CE): a BUY LIMIT placed 11:09:21 filled at 13:08:06.
+# Kite keeps exchange_timestamp at 11:09:21 (registration); order_timestamp and
+# exchange_update_timestamp carry the 13:08:06 fill. The opening fill must be 13:08:06.
+def kfill(place_ts, fill_ts, side, qty, oid):
+    return {"order_timestamp": fill_ts, "exchange_timestamp": place_ts, "exchange_update_timestamp": fill_ts,
+            "transaction_type": side, "filled_quantity": qty, "quantity": qty, "order_id": oid,
+            "status": "complete", "tradingsymbol": "SENSEX26N1982200CE", "trading_symbol": "SENSEX26N1982200CE"}
+late = [
+    kfill("2026-11-17 09:31:47", "2026-11-17 09:31:48", "BUY", 40, "a"),
+    kfill("2026-11-17 09:40:51", "2026-11-17 09:40:51", "SELL", 40, "b"),
+    kfill("2026-11-17 11:09:21", "2026-11-17 13:08:06", "BUY", 20, "late"),
+    kfill("2026-11-17 11:26:01", "2026-11-17 11:26:01", "BUY", 40, "c"),
+    kfill("2026-11-17 11:35:17", "2026-11-17 11:35:17", "SELL", 40, "d"),
+    kfill("2026-11-17 11:45:14", "2026-11-17 11:45:14", "BUY", 80, "e"),
+    kfill("2026-11-17 12:08:14", "2026-11-17 12:08:14", "SELL", 80, "f"),
+]
+lts, loid, lfl = pl.current_open_fill(late, sym="SENSEX26N1982200CE")
+check("late-filled limit opens at its fill time, not its placement time",
+      lts == "2026-11-17 13:08:06" and loid == "late", (lts, loid, lfl))
+check("late fill is a re-entry after three flats", lfl == 3, lfl)
+# Upstox book rows carry only order_timestamp / exchange_timestamp (equal): unchanged behaviour.
+up = [{"order_timestamp": "2026-11-17 12:35:44", "exchange_timestamp": "2026-11-17 12:35:44", "transaction_type": "BUY",
+       "filled_quantity": 30, "quantity": 30, "order_id": "u1", "status": "complete", "trading_symbol": "BANKNIFTY26NOV62400CE"}]
+uts, uoid, _ = pl.current_open_fill(up, sym="BANKNIFTY26NOV62400CE")
+check("upstox row keeps its fill time", uts == "2026-11-17 12:35:44" and uoid == "u1", (uts, uoid))
+
 print("position_life_test: %d passed, %d failed" % (ok, bad))
 sys.exit(1 if bad else 0)

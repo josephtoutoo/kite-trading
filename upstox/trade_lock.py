@@ -132,7 +132,7 @@ def _ts(o):
 def _ltp(order,positions):
     k=order.get("instrument_token")
     for p in positions:
-        if (p.get("instrument_token")==k or sym_of(p)==sym_of(order)) and p.get("last_price"): return float(p["last_price"])
+        if ((k and p.get("instrument_token")==k) or (sym_of(order) and sym_of(p)==sym_of(order))) and p.get("last_price"): return float(p["last_price"])
     if k:
         d=_data("/v2/market-quote/ltp?instrument_key="+urllib.parse.quote(k,safe=""))
         if isinstance(d,dict):
@@ -328,6 +328,18 @@ def _r10_capital_msg(msg):
         "verified capital denominator","margin capacity, not a verified","verified-capital",
         "shared 25% pool","per-stock margin would exceed","total mtf margin is already over",
         "stricter 10% cap","mtf margin rs ","% cap rs "))
+def held_rows(pos,mtf,k,sym,broker="upstox"):
+    """-> (allpos, held). 17 Nov 2026: Kite MTF rows (_kite_mtf) carry no instrument_token and a
+    Kite MTF order from longterm_daily_st had none either, so None==None matched every tokenless
+    row: IGIL/PVRINOX/LTTS buys were "R6: add-on qty capped at original 6" (SRF's 6 shares).
+    Match on a real token only. On Kite, an MTF row whose symbol is already in pos (holdings or
+    day positions carry the same shares) is not added again; counting both doubled held_q."""
+    _ptoks={p.get("instrument_token") for p in pos if p.get("instrument_token")}
+    _psyms={sym_of(p) for p in pos if sym_of(p)} if broker=="kite" else set()
+    allpos=pos+[m for m in mtf if not ((m.get("instrument_token") and m.get("instrument_token") in _ptoks)
+                                       or (sym_of(m) and sym_of(m) in _psyms))]
+    held=[p for p in allpos if (k and p.get("instrument_token")==k) or (sym and sym_of(p)==sym)]
+    return allpos,held
 def check_order(order,broker="upstox"):
 
     """-> (allowed: bool, reasons: list[str], adjusted_qty: int)
@@ -420,8 +432,7 @@ def check_order(order,broker="upstox"):
                     capital=0
             else:
                 capital=_basis["capital"]
-    allpos=pos+[m for m in mtf if m.get("instrument_token") not in {p.get("instrument_token") for p in pos}]
-    held=[p for p in allpos if p.get("instrument_token")==k or (sym and sym_of(p)==sym)]
+    allpos,held=held_rows(pos,mtf,k,sym,broker)
     held_q=sum(int(p.get("quantity") or 0) for p in held)
     ltp=_ltp(order,allpos)
     if side=="BUY":

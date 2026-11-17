@@ -125,6 +125,54 @@ def _send_pair(place, orders):
     return sent, "; ".join(errors) + suffix
 
 
+ENTRY_FILL_WAIT_S = 120.0     # same 2-minute rule as auto_entry / full_auto_add
+_TERMINAL = ("complete", "rejected", "cancelled")
+
+
+def settle_entries(sent, status_fn, cancel_fn, budget=ENTRY_FILL_WAIT_S, step=5.0, sleep=None, clock=None):
+    """Wait up to `budget` seconds for each sent entry leg; cancel any leg still open.
+
+    17 Nov 2026: a DAY limit left working can fill hours later, after the signal and the
+    1h checks are stale (Kite SENSEX 82200 CE: an 11:09 limit filled 13:08 and was exited
+    at a loss a minute later). Entry limits on this path are 1 lot and marketable, so an
+    unfilled leg after 2 minutes is cancelled. A partly filled leg keeps its fill; only the
+    remainder is cancelled. Never raises. Returns one row per leg.
+    """
+    import time as _t
+    sleep = sleep or _t.sleep
+    clock = clock or _t.time
+    rows = []
+    for leg in sent or []:
+        if isinstance(leg, dict) and leg.get("order_id") and leg.get("broker"):
+            rows.append({"broker": leg["broker"], "order_id": leg["order_id"], "status": None, "cancelled": False})
+    end = clock() + float(budget)
+    while True:
+        open_rows = [r for r in rows if r["status"] not in _TERMINAL]
+        if not open_rows:
+            break
+        for r in open_rows:
+            try:
+                st = status_fn(r["broker"], r["order_id"])
+            except Exception:
+                st = None
+            if st:
+                r["status"] = str(st).lower()
+        if all(r["status"] in _TERMINAL for r in rows) or clock() >= end:
+            break
+        sleep(step)
+    for r in rows:
+        if r["status"] in _TERMINAL:
+            continue
+        try:
+            res = cancel_fn(r["broker"], r["order_id"])
+        except Exception as exc:
+            res = None
+            r["cancel_error"] = type(exc).__name__
+        r["cancelled"] = bool(res)
+        r["reason"] = "not filled in %ds - cancel %s" % (int(budget), "sent" if res else "FAILED, check the broker")
+    return rows
+
+
 def _position_row(positions, broker, symbol):
     want = (symbol or "").upper()
     for pos in (positions or {}).get(broker) or []:
@@ -485,6 +533,11 @@ def run(now, market=None, *, execute=False, dry=True, ledger_path=None,
             result["actions"].append(decision)
             continue
         sent, err = _send_pair(market.get("place"), (upstox, kite))
+        if sent and callable(market.get("settle")):
+            try:
+                decision["settle"] = market["settle"](sent)
+            except Exception as exc:
+                decision["settle"] = {"error": type(exc).__name__}
         if err or len(sent) != 2:
             decision["action"] = "skip" if not sent else "partial"
             decision["orders_placed"] = bool(sent)
@@ -620,6 +673,22 @@ def _live_market(names, now):
     def check_order(order, broker):
         return tl.check_order(order, broker=broker)
 
+    def _order_status(broker, oid):
+        if broker == "upstox":
+            d = (api.get("/v2/order/details?order_id=" + str(oid)) or {}).get("data") or {}
+            return d.get("status")
+        st = bk.order_status(oid)
+        return (st or {}).get("status")
+
+    def _order_cancel(broker, oid):
+        if broker == "upstox":
+            r = api.call("https://api-hft.upstox.com/v2/order/cancel?order_id=" + str(oid), None, "DELETE", proxy=True)
+            return isinstance(r, dict) and r.get("status") == "success"
+        return bk.cancel(oid)
+
+    def settle(sent):
+        return settle_entries(sent, _order_status, _order_cancel)
+
     def place(broker, order):
         if broker == "upstox":
             return _place_upstox(api, order)
@@ -628,7 +697,7 @@ def _live_market(names, now):
 
     return {"chains": chains, "equity_keys": equity_keys, "analyze_pair": analyze_pair,
             "quote": quote, "positions": positions(), "map_kite": map_kite,
-            "check_order": check_order, "place": place}
+            "check_order": check_order, "place": place, "settle": settle}
 
 
 def main(argv=None):

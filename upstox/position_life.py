@@ -38,8 +38,13 @@ def completed_fills(orders, sym=None, token=None):
             fq = int(o.get("quantity") or 0)
         if fq <= 0:
             continue
-        ts = str(o.get("exchange_timestamp") or o.get("order_timestamp")
-                 or o.get("order_time") or o.get("exchange_time") or "")
+        # 17 Nov 2026: the FILL time, not the placement time. Kite's exchange_timestamp is
+        # when the exchange registered the order, so a limit placed 11:09 that filled 13:08
+        # sorted as an 11:09 buy and the two-candle exit used 11:27/11:30 candles from
+        # before the fill (Kite SENSEX26N1982200CE). exchange_update_timestamp (Kite) and
+        # order_timestamp (Kite / Upstox book: last status change) carry the fill time.
+        ts = str(o.get("exchange_update_timestamp") or o.get("order_timestamp")
+                 or o.get("exchange_timestamp") or o.get("order_time") or o.get("exchange_time") or "")
         oid = str(o.get("order_id") or o.get("orderId") or "")
         out.append((ts, side, fq, oid))
     out.sort()

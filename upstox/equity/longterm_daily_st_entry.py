@@ -210,6 +210,9 @@ def _kite_place(symbol, qty, price, dry):
     ok, reasons, adj = trade_lock.check_order({
         "trading_symbol": symbol,
         "tradingsymbol": symbol,
+        # 17 Nov 2026: same token form as mtf_dual_entry / broker_kite holdings. Without it
+        # trade_lock matched every tokenless Kite MTF row and capped the buy at SRF's 6 shares.
+        "instrument_token": "KITE|%s|%s" % (exch, symbol),
         "transaction_type": "BUY",
         "order_type": "LIMIT",
         "product": "MTF",

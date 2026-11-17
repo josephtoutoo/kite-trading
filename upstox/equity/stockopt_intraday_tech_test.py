@@ -601,6 +601,63 @@ def test_place_payloads_for_todays_candidates():
           and api.calls[0]["url"] == entry.UPSTOX_PLACE_URL, body)
 
 
+def test_settle_cancels_unfilled_entry():
+    """17 Nov 2026: an entry leg still open after the wait is cancelled; filled/rejected legs are left alone."""
+    statuses = {("upstox", "U1"): ["open", "open", "open"], ("kite", "K1"): ["open", "complete"]}
+    cancels = []
+    t = [0.0]
+
+    def status_fn(broker, oid):
+        seq = statuses[(broker, oid)]
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    def cancel_fn(broker, oid):
+        cancels.append((broker, oid))
+        return True
+
+    def sleep(sec):
+        t[0] += sec
+
+    rows = entry.settle_entries([{"broker": "upstox", "order_id": "U1"}, {"broker": "kite", "order_id": "K1"}],
+                                status_fn, cancel_fn, budget=20, step=5, sleep=sleep, clock=lambda: t[0])
+    check("only the open Upstox leg is cancelled", cancels == [("upstox", "U1")], cancels)
+    check("kite leg seen complete", [r["status"] for r in rows if r["broker"] == "kite"] == ["complete"], rows)
+    check("upstox leg flagged cancelled", [r["cancelled"] for r in rows if r["broker"] == "upstox"] == [True], rows)
+    cancels.clear()
+    rows = entry.settle_entries([{"broker": "upstox", "order_id": "R"}], lambda b, o: "rejected", cancel_fn,
+                                budget=20, step=5, sleep=sleep, clock=lambda: t[0])
+    check("rejected leg is not cancelled", cancels == [] and rows[0]["status"] == "rejected", rows)
+    rows = entry.settle_entries([{"broker": "kite", "order_id": "E"}], lambda b, o: (_ for _ in ()).throw(RuntimeError()),
+                                cancel_fn, budget=10, step=5, sleep=sleep, clock=lambda: t[0])
+    check("unreadable status still ends in a cancel", cancels == [("kite", "E")], cancels)
+    # run() hands the sent legs to market['settle'] after a live send.
+    seen = []
+    shortlist = {"ok": True, "max_names": 2, "expiry": "2026-11-23",
+                 "candidates": [cand("LICHSGFIN", "CE", lot_size=1000, preferred_strike=605)]}
+    market = {
+        "chains": {"LICHSGFIN": [contract("LICHSGFIN", lot=1000, strike=605)]},
+        "hour_bars": {"LICHSGFIN": hour_ce()}, "daily_bars": {"LICHSGFIN": daily_ce()},
+        "positions": {"upstox": [], "kite": []}, "quote": lambda key: QUOTE,
+        "map_kite": lambda row: {"kite_symbol": row.get("kite_symbol"), "kite_lot_size": row.get("lot_size"),
+                                 "kite_exchange": "NFO"},
+        "check_order": lambda order, broker: (True, "ok", int(order["quantity"])),
+        "place": lambda broker, order: "OID-%s" % broker,
+        "settle": lambda sent: seen.append(list(sent)) or [{"broker": x["broker"], "status": "complete"} for x in sent],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["DAILY_LOSS_CAP_STATE"] = os.path.join(tmp, "dlc.json")
+        import daily_loss_cap as dlc
+        real_eval = dlc.evaluate
+        dlc.evaluate = lambda *a, **k: {"ok": True, "blocked": False, "reason": "ok"}
+        try:
+            res = entry.run(TUE, market, execute=True, dry=False, ledger_path=os.path.join(tmp, "l.json"),
+                            shortlist=shortlist, session_ok=True, results={"ok": True, "names": []})
+        finally:
+            dlc.evaluate = real_eval
+    check("run() settles both sent legs", len(seen) == 1 and sorted(x["broker"] for x in seen[0]) == ["kite", "upstox"],
+          (seen, [a.get("reason") for a in res["actions"]]))
+
+
 if __name__ == "__main__":
     test_signal_and_daily()
     test_window_and_flatten_time()
@@ -613,6 +670,7 @@ if __name__ == "__main__":
     test_import_is_idle()
     test_send_pair_still_attempts_other_leg()
     test_place_payloads_for_todays_candidates()
+    test_settle_cancels_unfilled_entry()
     if FAILS:
         print("FAILED", len(FAILS), ":", ", ".join(FAILS))
         sys.exit(1)
