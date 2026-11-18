@@ -435,6 +435,18 @@ def check_order(order,broker="upstox"):
     allpos,held=held_rows(pos,mtf,k,sym,broker)
     held_q=sum(int(p.get("quantity") or 0) for p in held)
     ltp=_ltp(order,allpos)
+    # R15 (18 Nov 2026 15:25 IST, t739u "Next one week don't trade in upstock"): while
+    # state/upstox_entry_block.json is unexpired (until 25 Nov 2026 23:59 IST), an Upstox BUY is
+    # refused unless it covers an existing short (held qty < 0). SELL exits/stops are untouched,
+    # and R8 already refuses a SELL that would open a short. Kite is never affected.
+    if broker=="upstox" and side=="BUY":
+        try:
+            import upstox_entry_block as _ueb
+            _ebs=_ueb.status(now)
+            if _ebs["active"] and held_q>=0: block.append(_ueb.message(_ebs))
+        except Exception as _ebe:
+            if os.path.exists(os.path.join(D,"state","upstox_entry_block.json")):
+                block.append(f"R15: entry-block check failed ({type(_ebe).__name__}) - Upstox buy refused")
     if side=="BUY":
         # rule 2b: account day loss breaker / reduced day
         # (5 Nov) Upstox MTF equity lives in /v3/portfolio/mtf-positions, NOT in short-term-positions,

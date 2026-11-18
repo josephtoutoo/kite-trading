@@ -191,6 +191,21 @@ def _transient(status, text):
 def request(url, body=None, method=None, proxy=None, timeout=DEFAULT_TIMEOUT, headers=None):
     """-> parsed JSON. Retries GETs on transient failures only. Raises ApiError on HTTP error."""
     method = (method or ('POST' if body is not None else 'GET')).upper()
+    if method == 'POST':
+        # 18 Nov 2026 (t739u): date-bounded block on NEW Upstox positions. Last guard before
+        # the order host, so a path that skips trade_lock still cannot open a position.
+        # Fails closed if the guard module itself is missing while a block file exists.
+        try:
+            if D not in sys.path:
+                sys.path.insert(0, D)
+            import upstox_entry_block as _ueb
+            _why = _ueb.api_refusal(url, body, method)
+        except Exception as _ge:
+            _why = None
+            if os.path.exists(os.path.join(D, 'state', 'upstox_entry_block.json')) and 'upstox.com' in url and '/order/' in url and 'place' in url:
+                _why = f'R15: entry-block guard failed ({type(_ge).__name__}) - Upstox order refused'
+        if _why:
+            raise ApiError(403, _why, url)
     use_proxy = _resolve_proxy(url, proxy)
     attempts = RETRIES + 1 if method == 'GET' else 1
     last = None
