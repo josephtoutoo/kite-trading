@@ -121,6 +121,27 @@ def test_wiring():
     assert '.get("route") == "3m"' in sq and '"--execute" in sys.argv' in sq
 
 
+def test_outcome_records():
+    ind = {"NIFTY": {"15m": {"signal_mode": "fresh_cross", "candle": "11:15", "trend_side": "CE", "signal": "CE",
+                             "action": "skip: NIFTY 15m route already holds X on upstox",
+                             "kite": {"action": "blocked by pre-trade rules", "check": {"reasons": ["R4b: x"]}},
+                             "check": {"reasons": ["R15: y"]}, "broker_eligibility": {"kite": {"ok": True}}},
+                     "3m": {"signal_mode": None, "signal": "NONE", "action": "none: no fresh signal"},
+                     "1h": {"signal_mode": "prev_day_continuation", "submission": {"kite": {"order_id": "1"}}}},
+           "SENSEX": {"3m": {"signal_mode": "prev_day_continuation", "signal": "NONE",
+                             "action": "no entry: daily loss cap"}}, "BAD": "x"}
+    rows = R.outcome_records(ind, "2026-11-19T11:34:00+05:30")
+    assert [(r["index"], r["route"]) for r in rows] == [("NIFTY", "15m"), ("SENSEX", "3m")]
+    n = rows[0]
+    assert n["phase"] == "outcome" and n["kite_action"] == "blocked by pre-trade rules"
+    assert n["upstox_check"] == ["R15: y"] and n["kite_check"] == ["R4b: x"] and n["dry_run"] is False
+    assert rows[1]["kite_action"] is None and rows[1]["action"] == "no entry: daily loss cap"
+    assert R.outcome_records(None, "t") == []
+    src = open(os.path.join(D, "auto_entry.py")).read()
+    i_done = src.index("def done():"); i_out = src.index("iroutes.outcome_records(", i_done); i_print = src.index("print(json.dumps(out", i_done)
+    assert i_out < i_print and "if not DRY and" in src[i_done:i_out]
+
+
 if __name__ == "__main__":
-    test_expiry(); test_window(); test_continuation(); test_tracking_and_dedupe(); test_refresh_opened(); test_wiring()
+    test_expiry(); test_window(); test_continuation(); test_tracking_and_dedupe(); test_refresh_opened(); test_wiring(); test_outcome_records()
     print("index_routes tests passed (synthetic, no broker, no orders)")

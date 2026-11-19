@@ -300,3 +300,30 @@ def dedupe_route(index, broker, name, occupied, decisions_today):
         if brokers is None or broker in brokers:
             return {"ok": False, "reason": f"{index} {name} route already decided today for {broker}"}
     return {"ok": True, "reason": None}
+
+
+def outcome_records(indices, ts, dry=False):
+    """19 Nov 2026 post-market review (audit only): one "outcome" row per routed index signal
+    that did not end in a submission, so a skipped signal keeps its reason (route busy, capital
+    gate, sender off, pre-trade block, loss cap, ...). Before this only the expiry and 15m-trend
+    blocks wrote a pretrade row. Pure; reads no broker, places no order, changes no decision.
+
+    indices: auto_entry's out["indices"] ({index: {route: result}}). Rows without a signal
+    (signal_mode unset) and rows that were submitted are skipped."""
+    rows = []
+    for name, by_route in (indices or {}).items():
+        if not isinstance(by_route, dict):
+            continue
+        for rt, r in by_route.items():
+            if not isinstance(r, dict) or not r.get("signal_mode") or r.get("submission"):
+                continue
+            k = r.get("kite")
+            rows.append({"phase": "outcome", "index": name, "route": rt, "ts": ts,
+                         "candle": r.get("candle"), "signal_mode": r.get("signal_mode"),
+                         "trend_side": r.get("trend_side"), "action": r.get("action"),
+                         "kite_action": (k.get("action") if isinstance(k, dict) else None),
+                         "upstox_check": (r.get("check") or {}).get("reasons"),
+                         "kite_check": ((k.get("check") or {}).get("reasons") if isinstance(k, dict) else None),
+                         "broker_eligibility": r.get("broker_eligibility"),
+                         "error": r.get("error"), "dry_run": bool(dry)})
+    return rows

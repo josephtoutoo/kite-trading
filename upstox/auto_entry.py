@@ -110,7 +110,16 @@ out["rule_set"]=_ruleset()
 _R=out["rule_set"]
 out["rules"]+=(" | "+("OVERRIDE ACTIVE ("+_R["rule_set"]+", "+out["now"][:10]+")" if _R["rule_set"]!="user rules"
                        else "rule set: user's own"))
-def done(): print(json.dumps(out,indent=1,default=str)); sys.exit(0)
+def done():
+    # 19 Nov 2026 post-market review: keep the reason for every routed signal that was not sent
+    # (audit only; no decision changes). Best effort, never blocks the run summary.
+    try:
+        if not DRY and isinstance(out.get("indices"), dict) and "iel" in globals():
+            for _row in iroutes.outcome_records(out["indices"], datetime.datetime.now(IST).isoformat(), DRY):
+                iel.append_jsonl(DECISIONS, _row)
+    except Exception as e:
+        print(f"auto_entry: outcome rows not logged: {type(e).__name__}: {e}", file=sys.stderr)
+    print(json.dumps(out,indent=1,default=str)); sys.exit(0)
 if ENTRY_SOURCE=="invalid":
     out["skipped"]="INDEX_ENTRY_SOURCE must be spot or futures; spot was not assumed"; done()
 if not DRY and not market_calendar.is_trading_day(now.date()):
