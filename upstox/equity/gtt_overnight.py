@@ -203,15 +203,27 @@ def upstox_targets():
 
 
 def kite_targets():
-    """MTF equity this bot opened, plus its option/future longs."""
+    """MTF equity this bot opened, plus its option/future longs.
+
+    Kite keeps MTF stock in holdings().mtf.quantity, not positions().net, so
+    holdings are merged in. mine_kite() only sees today's tagged MTF BUYs, so
+    a bot-opened name from a prior day would otherwise drop out of the
+    overnight book; live held MTF is covered unless it is listed in
+    mtf_managed.json excluded_existing (user names left untouched, t264u).
+    """
     import broker_kite as bk
     if not bk.valid():
         raise RuntimeError('Kite token invalid')
     mine = ms.mine_kite()            # fail-closed
     st = ms.state('kite')            # fail-closed on an unreadable book
     k = bk.client()
-    held_mtf = {s: v for s, v in st['held'].items() if v > 0 and s in mine}
+    try:
+        excl = set((json.load(open('/workspace/equity/mtf_managed.json')).get('excluded_existing') or []))
+    except Exception:
+        excl = set()
+    held_mtf = {s: v for s, v in st['held'].items() if v > 0 and (s in mine or s not in excl)}
     rows = []
+    seen_mtf = set()
     net = k.positions().get('net')
     if net is None:
         raise RuntimeError('Kite positions returned no data')
@@ -226,14 +238,30 @@ def kite_targets():
             rows.append(dict(broker='kite', book='MTF', sym=sym, key=sym, qty=q,
                              entry=float(p.get('average_price') or 0),
                              ltp=float(p.get('last_price') or 0), product='MTF', kind='eq'))
+            seen_mtf.add(sym)
         elif sym[-2:] in ('CE', 'PE', 'FUT'):
             rows.append(dict(broker='kite', book='Option', sym=sym, key=sym, qty=q,
                              entry=float(p.get('average_price') or 0),
                              ltp=float(p.get('last_price') or 0),
                              product=p.get('product') or 'NRML', kind='opt',
                              exchange=p.get('exchange') or ''))
+    holdings = k.holdings()
+    if holdings is None:
+        raise RuntimeError('Kite holdings returned no data')
+    for h in holdings:
+        mtf = h.get('mtf') or {}
+        q = int(mtf.get('quantity') or 0)
+        if q <= 0:
+            continue
+        sym = h.get('tradingsymbol') or ''
+        if not sym or sym in seen_mtf or sym not in held_mtf:
+            continue
+        rows.append(dict(broker='kite', book='MTF', sym=sym, key=sym, qty=q,
+                         entry=float(mtf.get('average_price') or h.get('average_price') or 0),
+                         ltp=float(h.get('last_price') or 0), product='MTF', kind='eq',
+                         exchange=h.get('exchange') or 'NSE'))
+        seen_mtf.add(sym)
     return rows
-
 
 # ---------------- existing GTTs ----------------
 def upstox_gtts():
