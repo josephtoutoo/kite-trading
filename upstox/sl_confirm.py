@@ -98,8 +98,35 @@ def get_orders(broker):
             "status":(o.get("status") or "").lower(),"quantity":int(o.get("quantity") or 0),
             "filled_quantity":int(o.get("filled_quantity") or 0),"price":float(o.get("price") or 0),
             "trigger_price":float(o.get("trigger_price") or 0),"status_message":o.get("status_message") or "",
-            "tag":o.get("tag")})
+            "tag":o.get("tag"),"instrument_token":o.get("instrument_token")})
     return out
+def upstox_book_symbol(instrument_key,entry_order=None,fallback=None):
+    """20 Nov 2026 post-market fix: auto_entry passes the option-master name ("SENSEX 83200 CE 26 NOV 26")
+    but Upstox's order book and positions use "SENSEX26NOV83200CE", so every symbol match here missed:
+    position_qty() read 0 ("entry not filled (no position)") and a live SL was never seen. Resolve the
+    order-book symbol from the entry order (or a position with the same instrument key). Read-only;
+    returns the fallback unchanged when nothing matches."""
+    try:
+        for o in get_orders("upstox"):
+            if (entry_order and o.get("order_id")==entry_order) or (instrument_key and o.get("instrument_token")==instrument_key):
+                if o.get("trading_symbol"): return o["trading_symbol"]
+        d=(_req("https://api.upstox.com/v2/portfolio/short-term-positions") or {}).get("data") or []
+        for p in d:
+            if instrument_key and p.get("instrument_token")==instrument_key and p.get("trading_symbol"): return p["trading_symbol"]
+    except Exception as e: log(f"upstox symbol lookup {type(e).__name__}: {e}")
+    return fallback
+def _fresh_trade_lock(tl):
+    """20 Nov 2026 post-market fix: trade_lock caches broker reads for the life of the process
+    ("one decision per run"). auto_entry runs the BUY check and then this SL check in the SAME
+    process, so R8 still saw the pre-entry positions (no long) and refused the protective SELL SL:
+    "R8: no live long ... SELL would open a short" (17 Nov and 20 Nov entries; the stop only arrived
+    ~2 min later from risk_manager). Drop the cached LIVE reads (positions/orders/holdings) so the
+    check re-reads the broker; instrument/lot-size caches are kept. Reads stay fail-closed."""
+    try:
+        c=getattr(tl,"_cache",None)
+        if isinstance(c,dict):
+            for k in [k for k in c if (isinstance(k,str) and (k.startswith("/") or k.startswith("_kite")))]: c.pop(k,None)
+    except Exception as e: log(f"trade_lock cache reset {type(e).__name__}: {e}")
 def position_qty(broker,symbol):
     try:
         if broker=="kite":
@@ -109,11 +136,12 @@ def position_qty(broker,symbol):
         d=(_req("https://api.upstox.com/v2/portfolio/short-term-positions") or {}).get("data") or []
         return sum(int(p.get("quantity") or 0) for p in d if (p.get("trading_symbol") or "")==symbol)
     except Exception: return 0
-def state_target(broker,exchange,symbol):
-    """Target level recorded in risk_state.json for this contract (Kite keys are KITE|EX|SYM)."""
+def state_target(broker,exchange,symbol,key=None):
+    """Target level recorded in risk_state.json for this contract (Kite keys are KITE|EX|SYM;
+    Upstox keys are the instrument key, passed as key=)."""
     try: s=json.load(open(STATE))
     except Exception: return None
-    keys=[f"KITE|{exchange}|{symbol}"] if broker=="kite" else []
+    keys=[f"KITE|{exchange}|{symbol}"] if broker=="kite" else ([key] if key else [])
     keys+= [k for k,v in s.items() if isinstance(v,dict) and v.get("sym")==symbol]
     for k in keys:
         v=s.get(k) or {}
@@ -121,7 +149,7 @@ def state_target(broker,exchange,symbol):
     return None
 # ---------------- confirmation ----------------
 def confirm(broker,symbol,qty,trigger=None,target=None,exchange=None,entry_order=None,tick=None,
-            target_mode="state",target_order=None,attempts=2,wait=2.5):
+            target_mode="state",target_order=None,attempts=2,wait=2.5,instrument_key=None):
     """Re-read the order book and verify entry + SL (+ target level). Read-only.
     -> dict(ok, entry, sl, sl_trigger, sl_status, target, target_live, reasons[])"""
     tol=max(float(tick or TICK),0.01)+1e-6
@@ -167,7 +195,7 @@ def confirm(broker,symbol,qty,trigger=None,target=None,exchange=None,entry_order
             res["target_live"]=bool(tt); res["target_order"]=tt[0]["order_id"] if tt else None
             if not tt: res["reasons"].append(f"target order not live at {target}")
         else:
-            r=state_target(broker,exchange,symbol)
+            r=state_target(broker,exchange,symbol,key=instrument_key)
             res["target_live"]=bool(r and abs(r["target"]-float(target))<=max(0.02,tol))
             res["target_state"]=r
             if not r: res["reasons"].append("target level not in risk_state.json")
@@ -196,6 +224,7 @@ def place_sl_upstox(instrument_key,symbol,qty,avg,product="I",stop=None,tick=Non
     stop=snap("upstox",None,symbol,stop,tick); lim=snap("upstox",None,symbol,stop*0.95,tick)
     try:
         import trade_lock
+        _fresh_trade_lock(trade_lock)
         ok,reasons,adj=trade_lock.check_order({"trading_symbol":symbol,"instrument_token":instrument_key,
             "transaction_type":"SELL","order_type":"SL","product":product,"quantity":qty})
     except Exception as e: ok,reasons,adj=False,[f"trade_lock error {e}"],0
@@ -217,15 +246,16 @@ def place_sl_kite(exchange,symbol,qty,avg,product="NRML",stop=None,tick=None,dry
     return oid,stop,(None if oid else "broker_kite.place returned no order id (see kite_broker.log)")
 def guard_upstox(symbol,instrument_key,qty,avg,product="I",target=None,tick=None,entry_order=None,dry=False):
     """Place SL if missing, confirm entry+SL+target, retry once with snapped prices, else record failure."""
+    if not dry: symbol=upstox_book_symbol(instrument_key,entry_order,symbol) or symbol   # 20 Nov 2026 fix
     stop=snap("upstox",None,symbol,float(avg)*_INIT_FRAC,tick)
     oid=None; why=""
     if not live_sl("upstox",symbol,qty,stop,tick):
         oid,stop,why=place_sl_upstox(instrument_key,symbol,qty,avg,product,stop,tick,dry)
-    r=confirm("upstox",symbol,qty,trigger=stop,target=target,entry_order=entry_order,tick=tick,attempts=2)
+    r=confirm("upstox",symbol,qty,trigger=stop,target=target,entry_order=entry_order,tick=tick,attempts=2,instrument_key=instrument_key)
     if not r["sl"] and not dry:
         stop=snap("upstox",None,symbol,float(avg)*_INIT_FRAC,tick)
         oid,stop,why=place_sl_upstox(instrument_key,symbol,qty,avg,product,stop,tick,dry)
-        r=confirm("upstox",symbol,qty,trigger=stop,target=target,entry_order=entry_order,tick=tick,attempts=2)
+        r=confirm("upstox",symbol,qty,trigger=stop,target=target,entry_order=entry_order,tick=tick,attempts=2,instrument_key=instrument_key)
     if r["ok"]: clear("upstox",symbol)
     elif not dry:
         record_failure("upstox",symbol,oid or entry_order,"; ".join(r["reasons"]),why,qty=qty,trigger=stop,target=target)
