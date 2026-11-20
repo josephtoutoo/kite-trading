@@ -259,8 +259,28 @@ CRUDE_STRIKE_STEP = 50
 CRUDE_MAX_ENTRIES_PER_DAY = 2
 
 
+def parse_crude_tf(raw=None, env=None):
+    """Return '15m' or '1h'. Unset/blank defaults to 1h; anything else is None (fail closed)."""
+    if raw is None:
+        env = os.environ if env is None else env
+        raw = env.get("CRUDE_TF") if hasattr(env, "get") else None
+    if raw is None or str(raw).strip() == "":
+        return "1h"
+    v = str(raw).strip().lower()
+    if v == "15m":
+        return "15m"
+    if v == "1h":
+        return "1h"
+    return None
+
+
+def crude_bar_used(today, ts, tf):
+    """True if this completed bar was already used on the same timeframe (legacy rows are 1h)."""
+    return any(x.get("bar") == ts and x.get("tf", "1h") == tf for x in (today or []))
+
+
 def crude_fresh_signal(cur, prev):
-    """Fresh 1h trigger on completed bars: CE/PE or None."""
+    """Fresh trigger on completed bars: CE/PE or None. Same rule on 1h or 15m."""
     a_ce, a_pe = aligned("CE", cur), aligned("PE", cur)
     if a_ce and not aligned("CE", prev):
         return "CE"
