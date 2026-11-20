@@ -701,8 +701,10 @@ try:
                 kacts.append({"sym":sym,"broker":"kite","action":"ROLL_TARGET","from":prev,"to":s["target"],
                               "trend":why,"stop_floor_moved":bool(fut)})
             if True:
+                _kts=bk.tick_for(ex,sym)
+                _ktick=lambda x,_t=_kts: tick_on(x,_t)  # contract grid (MCX crude options are 0.10, not 0.05)
                 if FA_LADDER and not fut: floor=max(floor,fap.ladder_floor(s.get("entry",avg),s["high"]))  # upward-only ladder
-                stop=tick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
+                stop=_ktick(max(avg*(1-TRAIL),seeds.get(sym,0),s.get("stop",0),floor))
                 if FA_LADDER and not fut and stop>=ltp and stop>avg*(1-TRAIL)+1e-6:
                     gok,gdet=_gtt_clear("kite",sym)
                     if not gok:
@@ -716,23 +718,42 @@ try:
                     kacts.append({"sym":sym,"broker":"kite","action":"STOP_BREACH_EXIT","qty":qx,"broker_qty":_live,"ladder_stop":stop,"ltp":ltp,"limit":lim,"resp":_kr})
                     if prules is not None and _kr and not DRY: prules.record_exit(kk,sym,trade_lock.underlying(sym),"kite","STOP_BREACH_EXIT",now,to_upstox=bk.to_upstox)
                     continue
-                if stop>=ltp: stop=tick(ltp*(0.995 if fut else 0.97))
-                else: s["stop"]=stop
-                lim=tick(stop*(0.99 if fut else 0.95))
+                if stop>=ltp: stop=_ktick(ltp*(0.995 if fut else 0.97))
+                lim=_ktick(stop*(0.99 if fut else 0.95))
                 info={"sym":sym,"broker":"kite","qty":q,"avg":round(avg,2),"ltp":ltp,"high":s["high"],"target":s["target"],"trigger":stop,"limit":lim}
                 _note_trend_policy(info, sym, fut, avg, ltp, stop, q)
                 if not sls:
                     gok,gdet=_gtt_clear("kite",sym)
                     if not gok:
                         kacts.append({**info,"action":"GTT_FAIL","broker":"kite","why":f"overnight GTT not cancelled, day SL not placed: {gdet}"}); continue
-                    kacts.append({**info,"action":"PLACE_SL","resp":bk.place(ex,sym,"SELL",q,lim,order_type="SL",trigger=stop,tag="trailsl",product=p["product"],dry=DRY)})
+                    _prsp=bk.place(ex,sym,"SELL",q,lim,order_type="SL",trigger=stop,tag="trailsl",product=p["product"],dry=DRY)
+                    kacts.append({**info,"action":"PLACE_SL","resp":_prsp})
+                    if _prsp and not DRY: s["stop"]=stop
                     if not DRY: sc.clear("kite",sym)
                 else:
                     o=sls[0]
                     t2=pl.sl_modify_trigger(stop,o["trigger_price"],qty_changed=o["quantity"]!=q,reset=_pr)
                     if t2 is not None:
-                        kacts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":bk.modify(o["order_id"],q,tick(t2*(0.99 if fut else 0.95)),t2,dry=DRY)})
-                    else: kacts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
+                        t2=_ktick(t2)
+                        _lim=_ktick(t2*(0.99 if fut else 0.95))
+                        info["trigger"]=t2; info["limit"]=_lim
+                        _mr=bk.modify(o["order_id"],q,_lim,t2,dry=DRY)
+                        if _mr:
+                            if not DRY: s["stop"]=stop
+                            kacts.append({**info,"action":"MODIFY_SL","from":o["trigger_price"],"to":t2,"resp":_mr})
+                        else:
+                            _live=o["trigger_price"]; _msg=""
+                            try:
+                                for _xo in (bk.orders() or []):
+                                    if str(_xo.get("order_id"))==str(o["order_id"]):
+                                        _live=_xo.get("trigger_price"); _msg=_xo.get("status_message") or ""
+                                        break
+                            except Exception:
+                                pass
+                            kacts.append({**info,"action":"MODIFY_SL_FAIL","from":o["trigger_price"],"to":t2,"live_trigger":_live,"err":_msg or "modify did not stick","resp":_mr})
+                    else:
+                        if not DRY: s["stop"]=stop
+                        kacts.append({**info,"action":"SL_OK","sl_trigger":o["trigger_price"]})
         for o in kord:
             if o["transaction_type"]=="SELL" and o["status"] in("trigger pending","open") and o["order_type"] in("SL","SL-M") and isopt(o["trading_symbol"]) and o["trading_symbol"] not in klongs:
                 kacts.append({"sym":o["trading_symbol"],"broker":"kite","action":"CANCEL_STRAY_SL","order":o["order_id"],"resp":bk.cancel(o["order_id"],dry=DRY)})

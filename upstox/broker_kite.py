@@ -224,11 +224,55 @@ def place(exch,tsym,side,qty,price,order_type="LIMIT",trigger=None,tag="auto_ent
         oid=client().place_order(**body); forget(); log(f"placed {oid} {json.dumps(body)}"); return oid
     except Exception as e: log(f"place fail {tsym}: {e}"); return None
 def modify(oid,qty,price,trigger=None,order_type="SL",dry=False):
+    """Modify a regular order. Prices are snapped to the contract tick.
+    Returns the order id only if a post-modify readback shows the live trigger
+    actually moved (or no trigger was sent); otherwise None. Exchange rejects
+    are written to kite_broker.log."""
     if dry: return "DRY"
     if not valid(): return None
     try:
-        r=client().modify_order(variety="regular",order_id=oid,quantity=int(qty),price=round(price,2),trigger_price=round(trigger,2) if trigger else None,order_type=order_type)
-        forget(); return r
+        exch=tsym=None
+        for o in (orders() or []):
+            if str(o.get("order_id"))==str(oid):
+                exch=o.get("exchange"); tsym=o.get("trading_symbol") or o.get("tradingsymbol")
+                break
+        if not (exch and tsym):
+            try:
+                h=(client().order_history(str(oid)) or [{}])[-1]
+                exch=exch or h.get("exchange"); tsym=tsym or h.get("tradingsymbol")
+            except Exception as e:
+                log(f"history fail {oid} {e}")
+        ts=tick_for(exch,tsym) if (exch and tsym) else 0.05
+        price=round(float(snap(price,ts)),2)
+        trig=round(float(snap(trigger,ts)),2) if trigger is not None else None
+        r=client().modify_order(variety="regular",order_id=oid,quantity=int(qty),price=price,trigger_price=trig,order_type=order_type)
+        forget()
+        import time
+        h={}
+        for _try in range(5):
+            time.sleep(0.5)
+            try:
+                hist=client().order_history(str(oid)) or []
+                h=hist[-1] if hist else {}
+            except Exception as e:
+                log(f"history fail {oid} {e}"); h={}
+            st=(h.get("status") or "").upper().replace("-"," ")
+            if st not in ("MODIFY PENDING","OPEN PENDING","PUT ORDER REQ RECEIVED","AMO REQ RECEIVED","VALIDATION PENDING"):
+                break
+        live=float(h.get("trigger_price") or 0)
+        live_px=h.get("price")
+        st=h.get("status") or ""
+        msg=(h.get("status_message") or h.get("status_message_raw") or "") or ""
+        st_u=st.upper()
+        pending=st_u.replace("-"," ") in ("MODIFY PENDING","OPEN PENDING","PUT ORDER REQ RECEIVED","AMO REQ RECEIVED","VALIDATION PENDING")
+        rejected=st_u in ("REJECTED","CANCELLED","CANCELED")
+        moved=trig is None or abs(live-float(trig))<=max(float(ts),0.01)*0.51+1e-9
+        if pending or rejected or (trig is not None and not moved):
+            why=msg or ("still "+st if pending else ("trigger did not move" if not moved else st))
+            log(f"modify reject {oid} {tsym or ''} wanted trig {trig} px {price} live trig {live} px {live_px} status {st}: {why}")
+            return None
+        log(f"modified {oid} {tsym or ''} trig {trig} px {price} live trig {live} px {live_px} status {st}")
+        return r
     except Exception as e: log(f"modify fail {oid}: {e}"); return None
 def cancel(oid,dry=False):
     if dry: return "DRY"
