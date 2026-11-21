@@ -72,10 +72,18 @@ def main(argv=None):
             with open(p) as f: return json.load(f)
         except (OSError, ValueError): return {}
     orders = api.get('/v2/order/retrieve-all').get('data') or []
-    korders = bk.orders(strict=True)
+    try:
+        import kite_disabled as _kd
+        _kite_on = not _kd.active()
+    except Exception:
+        _kite_on = not os.path.exists(os.path.join(ROOT, 'kite_disabled.json'))
+    if _kite_on:
+        korders = bk.orders(strict=True)
+        kpos = bk.positions(strict=True)
+    else:
+        korders, kpos = [], []
     marked = sources(read('risk_state.json'), read('risk_seeds.json'), orders, korders)
     upos = api.get('/v2/portfolio/short-term-positions').get('data') or []
-    kpos = bk.positions(strict=True)
     out = {'now': now.isoformat(), 'dry_run': args.dry_run,
            'calendar': {u: {k: d.isoformat() for k, d in v.items()} for u, v in cal.items()}, 'actions': []}
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -88,7 +96,10 @@ def main(argv=None):
         return now.date() == due and now.time() >= dt.time(15, 10)
     # Close debit-spread pairs first (short then long) when the underlying is due.
     all_rows = []
-    for broker, positions in (('upstox', upos), ('kite', kpos)):
+    if not _kite_on:
+        out['kite'] = 'kite disabled by user 21 Nov'
+    _books = [('upstox', upos)] + ([('kite', kpos)] if _kite_on else [])
+    for broker, positions in _books:
         for p in positions:
             sym = tl.sym_of(p)
             if not tl.is_opt(sym) or tl.is_index(sym):
@@ -149,7 +160,8 @@ def main(argv=None):
                 item['action'] = 'COVER' if side == 'BUY' else 'SELL'
                 out['actions'].append(item)
             closed_syms.add((broker, (sym or '').upper()))
-    for broker, positions, all_orders in (('upstox', upos, orders), ('kite', kpos, korders)):
+    _books2 = [('upstox', upos, orders)] + ([('kite', kpos, korders)] if _kite_on else [])
+    for broker, positions, all_orders in _books2:
         for p in positions:
             sym = tl.sym_of(p); qty = int(p.get('quantity') or 0); u = tl.underlying(sym)
             if (broker, (sym or '').upper()) in closed_syms:

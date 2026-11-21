@@ -68,7 +68,10 @@ if upos is None: out["upstox"] = "positions unreadable; nothing done on Upstox"
 import broker_kite as bk
 kpos = kord = None
 try:
-    if bk.valid(): kpos = bk.positions(strict=True); kord = bk.orders(strict=True)
+    import kite_disabled as _kd
+    if _kd.active():
+        out["kite"] = "kite disabled by user 21 Nov"; kpos = None
+    elif bk.valid(): kpos = bk.positions(strict=True); kord = bk.orders(strict=True)
     else: out["kite"] = "token invalid; nothing done on Kite"
 except Exception as e:
     out["kite"] = "book unreadable (%s); nothing done on Kite" % type(e).__name__; kpos = None

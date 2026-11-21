@@ -447,6 +447,17 @@ def check_order(order,broker="upstox"):
         except Exception as _ebe:
             if os.path.exists(os.path.join(D,"state","upstox_entry_block.json")):
                 block.append(f"R15: entry-block check failed ({type(_ebe).__name__}) - Upstox buy refused")
+    # R16 (21 Nov 2026, t783u/t784u): from Monday 23 Nov, no Kite writes at all
+    # (entries, adds, stops, trails, GTTs, exits). Existing Kite positions stay as they are.
+    # Upstox is never refused by this rule.
+    if broker=="kite":
+        try:
+            import kite_disabled as _kd
+            if _kd.active(now):
+                block.append(_kd.message())
+        except Exception as _kde:
+            if os.path.exists(os.path.join(D,"kite_disabled.json")):
+                block.append(f"R16: kite-disabled check failed ({type(_kde).__name__}) - Kite order refused")
     if side=="BUY":
         # rule 2b: account day loss breaker / reduced day
         # (5 Nov) Upstox MTF equity lives in /v3/portfolio/mtf-positions, NOT in short-term-positions,
@@ -652,6 +663,18 @@ def check_order(order,broker="upstox"):
                 _other=_sp.book_view(kpos, kord) if broker=="upstox" else _sp.book_view(upos, orders)
                 if broker=="upstox" and _kite_err:
                     _other=None
+                # t783u/t784u: Kite is disabled, so an Upstox stock-option entry must not
+                # wait for a Kite vacancy or a mirrored Kite name.
+                if broker=="upstox":
+                    try:
+                        import kite_disabled as _kd
+                        if _kd.active(now):
+                            _other={"names":set(),"count":0,"pending":set(),"held":set(),
+                                    "uncertain":set(),"held_qty":{},"pending_qty":{}}
+                    except Exception:
+                        if os.path.exists(os.path.join(D,"kite_disabled.json")):
+                            _other={"names":set(),"count":0,"pending":set(),"held":set(),
+                                    "uncertain":set(),"held_qty":{},"pending_qty":{}}
                 if _view is None:
                     block.append("R11: this broker's stock-option book is unreadable - buy refused")
                 else:

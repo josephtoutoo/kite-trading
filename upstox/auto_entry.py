@@ -689,7 +689,10 @@ for name,cfg,ROUTE in _LOOP:
         # ---- Kite leg plan (checked BEFORE any order so the pair is one decision; never blocks Upstox) ----
         kleg=None
         try:
-            if not bk.valid(): r["kite"]={"action":"skipped: Kite token invalid ("+bk.why()[:80]+")"}; bk.log(f"auto_entry {name}: kite skipped, invalid token")
+            import kite_disabled as _kd
+            if _kd.active():
+                r["kite"]={"action":"kite disabled by user 21 Nov"}; kleg=None
+            elif not bk.valid(): r["kite"]={"action":"skipped: Kite token invalid ("+bk.why()[:80]+")"}; bk.log(f"auto_entry {name}: kite skipped, invalid token")
             else:
                 m=bk.from_upstox(best["instrument_key"])
                 kopen=[p for p in bk.positions() if p["quantity"]>0 and trade_lock.underlying(p["trading_symbol"])==name and trade_lock.is_opt(p["trading_symbol"])]

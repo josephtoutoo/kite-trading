@@ -47,11 +47,26 @@ def tick(price, size=0.05):
     return it.tick(price, size)
 
 
+
+def _kite_writes_allowed():
+    """False when the user has disabled Kite (t783u/t784u). Fail closed if the switch cannot be read."""
+    try:
+        import kite_disabled as _kd
+        return not _kd.active()
+    except Exception:
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return not os.path.exists(os.path.join(root, "kite_disabled.json"))
+
+
 def _check_pair(check_order, upstox, kite):
     """Both brokers must clear the full 1-lot quantity. Anything else sends nothing."""
     if check_order is None:
         return False, "order check unverified"
-    for broker, order in (("upstox", upstox), ("kite", kite)):
+    legs = [("upstox", upstox)]
+    if _kite_writes_allowed():
+        legs.append(("kite", kite))
+    for broker, order in legs:
         try:
             result = check_order(order, broker)
         except Exception as exc:
@@ -105,7 +120,10 @@ def _send_pair(place, orders):
         return [], "sender unverified"
     sent = []
     errors = []
-    for broker, order in (("upstox", orders[0]), ("kite", orders[1])):
+    legs = [("upstox", orders[0])]
+    if len(orders) > 1 and _kite_writes_allowed():
+        legs.append(("kite", orders[1]))
+    for broker, order in legs:
         try:
             order_id = place(broker, order)
         except Exception as exc:
@@ -313,6 +331,9 @@ def run(now, market=None, *, execute=False, dry=True, ledger_path=None,
             else:
                 sent, skipped = [], []
                 for order in book["orders"]:
+                    if (order.get("broker") or "").lower() == "kite" and not _kite_writes_allowed():
+                        skipped.append(dict(order, reason="kite disabled by user 21 Nov"))
+                        continue
                     price = _exit_limit(market, order, positions)
                     token = order.get("instrument_token") or _position_row(positions, order.get("broker"), order.get("trading_symbol")).get("instrument_token")
                     if price is None or not token:

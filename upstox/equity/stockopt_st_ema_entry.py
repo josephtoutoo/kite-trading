@@ -73,13 +73,25 @@ def pick_atm(rows, side, close):
     return min(same, key=lambda row: abs(float(row.get("strike_price") or 0) - close))
 
 
+def _position_brokers():
+    try:
+        import kite_disabled as _kd
+        if _kd.active():
+            return ("upstox",)
+    except Exception:
+        if os.path.exists(os.path.join(ROOT, "kite_disabled.json")):
+            return ("upstox",)
+    return ("upstox", "kite")
+
+
 def _reserved_count(positions):
     """Distinct stock-option underlyings on the fuller broker, or None if unreadable."""
-    if not isinstance(positions, dict) or positions.get("upstox") is None or positions.get("kite") is None:
+    brokers = _position_brokers()
+    if not isinstance(positions, dict) or any(positions.get(b) is None for b in brokers):
         return None
     import stockopt_policy as pol
     counts = []
-    for broker in ("upstox", "kite"):
+    for broker in brokers:
         names = set()
         for pos in positions[broker] or []:
             if not isinstance(pos, dict):
@@ -96,13 +108,15 @@ def _reserved_count(positions):
 
 
 def _held(positions, underlying):
-    """True / False, or None when either book cannot be read."""
+    """True / False, or None when a required book cannot be read."""
     if not isinstance(positions, dict):
         return None
-    if positions.get("upstox") is None or positions.get("kite") is None:
+    brokers = _position_brokers()
+    if any(positions.get(b) is None for b in brokers):
         return None
     import stockopt_policy as pol
-    for rows in (positions["upstox"], positions["kite"]):
+    for broker in brokers:
+        rows = positions[broker]
         for pos in rows:
             if not isinstance(pos, dict):
                 return None
@@ -141,12 +155,27 @@ def _mirror_orders(decision, contract, price, flatten_by):
     return upstox, kite
 
 
+
+def _kite_writes_allowed():
+    """False when the user has disabled Kite (t783u/t784u). Fail closed if the switch cannot be read."""
+    try:
+        import kite_disabled as _kd
+        return not _kd.active()
+    except Exception:
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return not os.path.exists(os.path.join(root, "kite_disabled.json"))
+
+
 def _check_pair(check_order, upstox, kite):
     """Both brokers must clear the full 1-lot quantity. Anything else sends nothing."""
     if check_order is None:
         return False, "order check unverified"
     cleared = []
-    for broker, order in (("upstox", upstox), ("kite", kite)):
+    legs = [("upstox", upstox)]
+    if _kite_writes_allowed():
+        legs.append(("kite", kite))
+    for broker, order in legs:
         try:
             result = check_order(order, broker)
         except Exception as exc:
@@ -168,7 +197,10 @@ def _send_pair(place, orders):
     if place is None:
         return [], "sender unverified"
     sent = []
-    for broker, order in (("upstox", orders[0]), ("kite", orders[1])):
+    legs = [("upstox", orders[0])]
+    if len(orders) > 1 and _kite_writes_allowed():
+        legs.append(("kite", orders[1]))
+    for broker, order in legs:
         try:
             order_id = place(broker, order)
         except Exception as exc:
@@ -234,7 +266,10 @@ def _quote(market, contract):
 def _send_debit_spreads(place, wait_fill, buy_upstox, sell_upstox, buy_kite, sell_kite, alert=None, cancel=None):
     """One broker at a time: BUY long, wait for fill, SELL short (one retry)."""
     results = []
-    for broker, buy, sell in (("upstox", buy_upstox, sell_upstox), ("kite", buy_kite, sell_kite)):
+    legs = [("upstox", buy_upstox, sell_upstox)]
+    if _kite_writes_allowed():
+        legs.append(("kite", buy_kite, sell_kite))
+    for broker, buy, sell in legs:
         def _place(order, _b=broker):
             return place(_b, order)
         def _wait(oid, order, _b=broker):
@@ -470,9 +505,10 @@ def run(scope, now, market=None, *, execute=False, dry=True, ledger_path=None,
     books_closed = any(row.get("reason") == "broker book unverified" for row in drafts)
     open_count = None if books_closed else _reserved_count(positions)
     reserved = set(entered)
-    if isinstance(positions, dict) and positions.get("upstox") is not None and positions.get("kite") is not None:
+    if isinstance(positions, dict) and all(positions.get(b) is not None for b in _position_brokers()):
         import stockopt_policy as pol
-        for rows in (positions["upstox"], positions["kite"]):
+        for broker in _position_brokers():
+            rows = positions[broker]
             for pos in rows or []:
                 if not isinstance(pos, dict):
                     continue

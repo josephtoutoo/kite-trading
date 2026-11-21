@@ -43,6 +43,17 @@ if ROOT not in sys.path:
 
 import stockopt_policy as pol
 
+def _position_brokers():
+    try:
+        import kite_disabled as _kd
+        if _kd.active():
+            return ("upstox",)
+    except Exception:
+        if os.path.exists(os.path.join(ROOT, "kite_disabled.json")):
+            return ("upstox",)
+    return ("upstox", "kite")
+
+
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 TAG = "stockopt_intraday"
 SOURCE = "intraday_tech"
@@ -649,10 +660,11 @@ def is_path_position(pos, ledger=None):
 
 def path_premium_deployed(positions, ledger=None):
     """Per-broker premium already deployed on this path. None if unverified."""
-    if not isinstance(positions, dict) or positions.get("upstox") is None or positions.get("kite") is None:
+    brokers = _position_brokers()
+    if not isinstance(positions, dict) or any(positions.get(b) is None for b in brokers):
         return None
     out = {"upstox": 0.0, "kite": 0.0}
-    for broker in ("upstox", "kite"):
+    for broker in brokers:
         for pos in positions[broker] or []:
             flag = is_path_position(pos, ledger)
             if flag is None:
@@ -674,12 +686,15 @@ def decision_premiums(decision):
     if isinstance(per, dict):
         try:
             upstox = float(per.get("upstox"))
-            kite = float(per.get("kite"))
+            kite = per.get("kite")
+            kite = float(kite) if kite is not None and len(_position_brokers()) > 1 else (float(kite) if kite not in (None, "") else 0.0)
         except (TypeError, ValueError):
             return None
-        if upstox <= 0 or kite <= 0:
+        if upstox <= 0:
             return None
-        return {"upstox": round(upstox, 2), "kite": round(kite, 2)}
+        if len(_position_brokers()) > 1 and kite <= 0:
+            return None
+        return {"upstox": round(upstox, 2), "kite": round(kite, 2) if kite else 0.0}
     raw = decision.get("premium")
     if raw is None or raw == "":
         return None
@@ -954,11 +969,12 @@ def select_entries(decisions, *, max_names=MAX_NAMES, reserved=None,
 
 
 def held_underlyings(positions):
-    """Distinct stock-option underlyings, or None if either book is unreadable."""
-    if not isinstance(positions, dict) or positions.get("upstox") is None or positions.get("kite") is None:
+    """Distinct stock-option underlyings, or None if a required book is unreadable."""
+    brokers = _position_brokers()
+    if not isinstance(positions, dict) or any(positions.get(b) is None for b in brokers):
         return None
     names = set()
-    for broker in ("upstox", "kite"):
+    for broker in brokers:
         for pos in positions[broker] or []:
             if not isinstance(pos, dict):
                 return None
@@ -1059,7 +1075,13 @@ def flatten_orders(now, ledger, positions, session_ok=None):
     if ledger is None or not isinstance(positions, dict):
         return {"due": True, "send": False, "orders": [], "reason": "flatten book unverified",
                 "flatten_at": plan.get("flatten_at")}
-    if positions.get("upstox") is None or positions.get("kite") is None:
+    kite_needed = True
+    try:
+        import kite_disabled as _kd
+        kite_needed = not _kd.active()
+    except Exception:
+        kite_needed = not os.path.exists(os.path.join(ROOT, "kite_disabled.json"))
+    if positions.get("upstox") is None or (kite_needed and positions.get("kite") is None):
         return {"due": True, "send": False, "orders": [], "reason": "flatten book unverified",
                 "flatten_at": plan.get("flatten_at")}
     clock = _as_ist(now)
@@ -1076,7 +1098,8 @@ def flatten_orders(now, ledger, positions, session_ok=None):
         return {"due": True, "send": False, "orders": [], "reason": "no same-day intraday stock-option ledger names",
                 "flatten_at": plan.get("flatten_at")}
     orders = []
-    for broker in ("upstox", "kite"):
+    brokers = ("upstox", "kite") if kite_needed else ("upstox",)
+    for broker in brokers:
         for pos in positions.get(broker) or []:
             if not isinstance(pos, dict):
                 return {"due": True, "send": False, "orders": [], "reason": "position row unverified",

@@ -400,6 +400,25 @@ def _buy(symbol, price, mode='new', qty=None):
     p['legs']['upstox']['order_id'] = oid
     p['legs']['upstox']['response'] = how if oid else {'code': r.get('code'), 'body': r.get('body')}
     # --- Kite leg ---
+    kite_skipped = False
+    try:
+        import kite_disabled as _kd
+        kite_skipped = _kd.active()
+    except Exception:
+        kite_skipped = os.path.exists('/workspace/upstox/kite_disabled.json')
+    if kite_skipped and oid:
+        p['legs']['kite']['error'] = 'kite disabled by user 21 Nov'
+        p['action'] = f'PLACED Upstox only: {uq} @ {price} (kite disabled by user 21 Nov)'
+        # Arm the Upstox stop only; leave any existing Kite book untouched.
+        p['fills'], d, ks, settled = _settle(oid, None, price)
+        ufill = int(d.get('filled_quantity') or 0); uavg = float(d.get('average_price') or price)
+        st, _ = sl_level(key, uavg, uavg)
+        prior_u = int(((p.get('legs') or {}).get('upstox') or {}).get('size', {}).get('position_qty') or 0)
+        p['stop_plan'] = {'upstox': st, 'kite': None, 'upstox_qty': prior_u + ufill, 'kite_qty': 0}
+        if ufill:
+            p['stop_order_upstox'] = _arm_full_stop('upstox', symbol, key, prior_u + ufill, st, uavg)
+        save({**load(), f"{symbol}:{datetime.datetime.now(IST).date().isoformat()}": p})
+        return p
     if oid:
         import broker_kite as bk
         try:

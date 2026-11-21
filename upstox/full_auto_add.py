@@ -90,7 +90,10 @@ else:
 import broker_kite as bk
 kpos = None
 try:
-    if bk.valid():
+    import kite_disabled as _kd
+    if _kd.active():
+        out["kite"] = "kite disabled by user 21 Nov"
+    elif bk.valid():
         kpos = bk.positions(strict=True); kord = bk.orders(strict=True)
         for p in kpos:
             if p["quantity"] > 0 and p["exchange"] in ("NFO", "BFO") and trade_lock.is_opt(p["trading_symbol"]) and trade_lock.underlying(p["trading_symbol"]) in INDEX:

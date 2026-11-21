@@ -543,8 +543,11 @@ for o in orders:
 # ---------------- Kite positions (4 Nov): Upstox prices/trend, Kite orders, same stop/roll rules ----------------
 kacts=[]
 try:
+    import kite_disabled as _kd
     import broker_kite as bk
-    if not bk.valid(): kacts.append({"action":"KITE_SKIPPED","why":"Kite token invalid - no-op"}); bk.log("risk_manager: kite skipped, invalid token")
+    if _kd.active():
+        kacts.append({"action":"KITE_SKIPPED","why":"kite disabled by user 21 Nov"})
+    elif not bk.valid(): kacts.append({"action":"KITE_SKIPPED","why":"Kite token invalid - no-op"}); bk.log("risk_manager: kite skipped, invalid token")
     else:
         # strict reads: a failed book read here used to come back as [], and the stray-SL sweep at
         # the end of this block then cancelled every live Kite option stop on the account. Refuse

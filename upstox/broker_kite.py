@@ -25,8 +25,15 @@ _reads={}          # ('orders'|'positions'|'holdings') -> (expires_at, value)
 # indexes are keyed on (path, mtime, size) and keep the FIRST row per key, exactly the row the
 # linear scan returned, so every mapping result is unchanged.
 _idx={}
+import kite_disabled as _kd
 def log(msg):
     with open(os.path.join(D,"kite_broker.log"),"a") as f: f.write(f"{datetime.datetime.now(IST):%Y-%m-%d %H:%M:%S} {msg}\n")
+def _blocked(what):
+    """Logged no-op when the user has disabled Kite writes (t783u/t784u)."""
+    if not _kd.active():
+        return False
+    log(_kd.skip_reason(what))
+    return True
 def api_key():
     """KITE_API_KEY, or the api_key param in login_url.txt. Populates the env var for this process only. Never logged."""
     k=(os.environ.get("KITE_API_KEY") or "").strip()
@@ -49,7 +56,7 @@ def client():
         px=os.environ.get("UPSTOX_PROXY_URL")
         _k=KiteConnect(api_key=key,proxies={"https":px,"http":px} if px else None,timeout=20)
         _k.set_access_token(json.load(open(TOKF))["access_token"])
-    return _k
+    return _kd.wrap_client(_k)
 def valid():
     """True only if a live profile call succeeds. Cached per process."""
     global _valid,_why
@@ -218,6 +225,7 @@ def place(exch,tsym,side,qty,price,order_type="LIMIT",trigger=None,tag="auto_ent
     body=dict(variety="regular",exchange=exch,tradingsymbol=tsym,transaction_type=side,quantity=int(qty),product=product,
               order_type=order_type,price=price,validity="DAY",tag=tag[:20])
     if order_type=="SL": body["trigger_price"]=trigger
+    if _blocked(f"place {side} {qty} {tsym}"): return None
     if dry: log("DRY place "+json.dumps(body)); return "DRY"
     if not valid(): log("skip place (kite invalid) "+tsym); return None
     try:
@@ -228,6 +236,7 @@ def modify(oid,qty,price,trigger=None,order_type="SL",dry=False):
     Returns the order id only if a post-modify readback shows the live trigger
     actually moved (or no trigger was sent); otherwise None. Exchange rejects
     are written to kite_broker.log."""
+    if _blocked(f"modify {oid}"): return None
     if dry: return "DRY"
     if not valid(): return None
     try:
@@ -275,6 +284,7 @@ def modify(oid,qty,price,trigger=None,order_type="SL",dry=False):
         return r
     except Exception as e: log(f"modify fail {oid}: {e}"); return None
 def cancel(oid,dry=False):
+    if _blocked(f"cancel {oid}"): return None
     if dry: return "DRY"
     if not valid(): return None
     try:

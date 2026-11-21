@@ -48,6 +48,14 @@ SF = os.path.join(D, 'gtt_state.json')
 _SPREAD_LEGS = []  # filled while reading targets; used to infer debit-spread pairs
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 DRY = '--dry-run' in sys.argv
+
+def _kite_writes_allowed():
+    try:
+        import kite_disabled as _kd
+        return not _kd.active()
+    except Exception:
+        return not os.path.exists('/workspace/upstox/kite_disabled.json') and not os.path.exists(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'kite_disabled.json'))
+
 COVER_OPEN = '--cover-open-session' in sys.argv
 PCT = 5.0                 # MTF equity: stop under LTP
 OPT_STOP = 0.30           # fallback only if perf_rules / state are unreadable
@@ -437,6 +445,9 @@ def place_one(row, trig, rec):
         rec[_k('upstox', row['sym'])] = dict(broker='upstox', gtt_id=gid, trigger=trig, qty=row['qty'],
                                placed=datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M'))
         return dict(sym=row['sym'], broker='upstox', action='PLACE', gtt=gid, trig=trig, qty=row['qty'])
+    if not _kite_writes_allowed():
+        return dict(sym=row['sym'], broker='kite', action='SKIP', why='kite disabled by user 21 Nov',
+                    trig=trig, qty=row['qty'])
     import broker_kite as bk
     limit = snap(max(trig - max(t, trig * 0.005), 0.05), t)
     if DRY:
@@ -472,6 +483,8 @@ def cancel_sym(broker, sym, rec, key=None):
             return False, str(r.get('body') or r)[:160]
         rec.pop(_k('upstox', sym), None)
         return True, gid
+    if not _kite_writes_allowed():
+        return True, 'kite disabled by user 21 Nov - existing GTT left as-is'
     import broker_kite as bk
     gid = (rec.get(_k('kite', sym)) or {}).get('gtt_id') or (kite_gtts().get(sym) or {}).get('id')
     if not gid:
@@ -546,6 +559,9 @@ def place_gtt(row, trig, rec, *, side='SELL', trigger_type='BELOW', limit=None, 
                                side=side, role=role, placed=datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M'))
         return dict(sym=row['sym'], broker='upstox', action='PLACE', gtt=gid, trig=trig,
                     qty=row['qty'], side=side, trigger_type=trigger_type, role=role)
+    if not _kite_writes_allowed():
+        return dict(sym=row['sym'], broker='kite', action='SKIP', why='kite disabled by user 21 Nov',
+                    trig=trig, qty=row['qty'])
     import broker_kite as bk
     if DRY:
         return dict(sym=row['sym'], broker='kite', action='PLACE(dry)', trig=trig, qty=row['qty'],
@@ -592,6 +608,8 @@ def cover_short_now(order, dry=None):
         oid = (r.get('data') or {}).get('order_id')
         return dict(sym=sym, broker='upstox', action='COVER_NAKED_SHORT' if oid else 'FAIL',
                     qty=qty, limit=px, order=oid or r)
+    if not _kite_writes_allowed():
+        return dict(sym=sym, broker='kite', action='SKIP', why='kite disabled by user 21 Nov', qty=qty)
     import broker_kite as bk
     oid = bk.place(order.get('exchange') or 'NFO', sym, 'BUY', qty, px, tag='spread_cover',
                    product=order.get('product') or 'NRML')

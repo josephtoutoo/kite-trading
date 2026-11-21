@@ -565,8 +565,11 @@ def main():
 
     # ---- Kite ----
     try:
+        import kite_disabled as _kd
         import broker_kite as bk
-        if bk.valid():
+        if _kd.active():
+            out['kite'] = 'kite disabled by user 21 Nov'
+        elif bk.valid():
             k = bk.client()
             try:
                 kite_orders = bk.orders()

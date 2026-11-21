@@ -73,6 +73,15 @@ def past_cutoff():
 def main():
     import broker_kite as bk
     import mtf_sizing as ms
+    try:
+        import kite_disabled as _kd
+        if _kd.active():
+            print(json.dumps({'kite': 'kite disabled by user 21 Nov', 'actions': []}))
+            return
+    except Exception as e:
+        if os.path.exists('/workspace/upstox/kite_disabled.json'):
+            print(json.dumps({'kite': 'kite disabled by user 21 Nov', 'error': type(e).__name__, 'actions': []}))
+            return
     if not bk.valid():
         print('kite invalid:', bk.why()); return
     k = bk.client()
